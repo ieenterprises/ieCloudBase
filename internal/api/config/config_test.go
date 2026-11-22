@@ -1,0 +1,1029 @@
+package config
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+func setRequiredGRPCMTLS(t *testing.T) {
+	t.Helper()
+	t.Setenv("SANDBOX_API_GRPC_TLS_CERT_FILE", "/tmp/api-grpc.crt")
+	t.Setenv("SANDBOX_API_GRPC_TLS_KEY_FILE", "/tmp/api-grpc.key")
+	t.Setenv("SANDBOX_API_GRPC_TLS_CLIENT_CA_FILE", "/tmp/api-grpc-ca.crt")
+	t.Setenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CA_FILE", "/tmp/control-ca.crt")
+	t.Setenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CERT_FILE", "/tmp/control-client.crt")
+	t.Setenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_KEY_FILE", "/tmp/control-client.key")
+}
+
+func TestLoadAPIParsesDefaults(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+
+	if cfg.ListenAddr != ":8080" {
+		t.Errorf("expected ListenAddr :8080, got %s", cfg.ListenAddr)
+	}
+
+	if cfg.MaxFileBytes != 10*1024*1024 {
+		t.Errorf("expected MaxFileBytes 10MB, got %d", cfg.MaxFileBytes)
+	}
+
+	if cfg.DefaultMaxSandboxes != 50 {
+		t.Errorf("expected DefaultMaxSandboxes 50, got %d", cfg.DefaultMaxSandboxes)
+	}
+
+	if cfg.GRPCListenAddr != ":9090" {
+		t.Errorf("expected GRPCListenAddr :9090, got %s", cfg.GRPCListenAddr)
+	}
+
+	if cfg.RegistrationToken != "reg-token" {
+		t.Errorf("expected RegistrationToken reg-token, got %q", cfg.RegistrationToken)
+	}
+
+	if cfg.DataDir != "/var/lib/n8n-sandbox-api" {
+		t.Errorf("expected DataDir /var/lib/n8n-sandbox-api, got %s", cfg.DataDir)
+	}
+
+	if !cfg.SQLiteWAL {
+		t.Error("expected SQLiteWAL true by default")
+	}
+
+	if _, exists := cfg.APIKeys["test-key"]; !exists {
+		t.Error("expected test-key in APIKeys")
+	}
+
+	if cfg.HeartbeatGrace != 45*time.Second {
+		t.Errorf("expected HeartbeatGrace 45s, got %s", cfg.HeartbeatGrace)
+	}
+
+	if cfg.IdleStopAfter != time.Hour {
+		t.Errorf("expected IdleStopAfter 1h, got %s", cfg.IdleStopAfter)
+	}
+
+	if cfg.IdleDeleteAfter != 24*time.Hour {
+		t.Errorf("expected IdleDeleteAfter 24h, got %s", cfg.IdleDeleteAfter)
+	}
+
+	if cfg.IdleDeleteSafetyBuffer != time.Minute {
+		t.Errorf("expected IdleDeleteSafetyBuffer 1m, got %s", cfg.IdleDeleteSafetyBuffer)
+	}
+
+	if cfg.OrphanReapBuffer != 5*time.Minute {
+		t.Errorf("expected OrphanReapBuffer 5m, got %s", cfg.OrphanReapBuffer)
+	}
+
+	if cfg.IdleSweepConcurrency != 8 {
+		t.Errorf("expected IdleSweepConcurrency 8, got %d", cfg.IdleSweepConcurrency)
+	}
+
+	if cfg.Postgres.LockPoolSize != 13 {
+		t.Errorf("expected Postgres.LockPoolSize 13 (concurrency 8 + 5 request-path connections), got %d", cfg.Postgres.LockPoolSize)
+	}
+
+	if cfg.LogLevel != slog.LevelInfo {
+		t.Errorf("expected LogLevel info, got %v", cfg.LogLevel)
+	}
+
+	if cfg.MetricsListenAddr != "" {
+		t.Errorf("expected empty MetricsListenAddr, got %s", cfg.MetricsListenAddr)
+	}
+
+	if !cfg.MetricsOnMainListener() {
+		t.Error("expected /metrics on the API listener by default")
+	}
+
+	if cfg.ResolvedMetricsListenAddr() != ":8080" {
+		t.Errorf("expected ResolvedMetricsListenAddr :8080, got %s", cfg.ResolvedMetricsListenAddr())
+	}
+}
+
+func TestLoadAPIHeartbeatGraceFromEnv(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_RUNNER_HEARTBEAT_GRACE", "90s")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.HeartbeatGrace != 90*time.Second {
+		t.Fatalf("HeartbeatGrace: want 90s, got %s", cfg.HeartbeatGrace)
+	}
+}
+
+func TestLoadAPIScalerURLTrimsTrailingSlash(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_SCALER_URL", " http://scaler.internal:8090// ")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.ScalerURL != "http://scaler.internal:8090" {
+		t.Fatalf("ScalerURL: want http://scaler.internal:8090, got %q", cfg.ScalerURL)
+	}
+}
+
+func TestLoadAPIDefaultMaxSandboxesFromEnv(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_DEFAULT_MAX_SANDBOXES", "10")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.DefaultMaxSandboxes != 10 {
+		t.Fatalf("DefaultMaxSandboxes: want 10, got %d", cfg.DefaultMaxSandboxes)
+	}
+}
+
+func TestLoadAPIRejectsInvalidDefaultMaxSandboxes(t *testing.T) {
+	for _, v := range []string{"-1", "abc", "2147483648", "1.5"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("SANDBOX_API_KEYS", "test-key")
+			t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+			t.Setenv("SANDBOX_API_DEFAULT_MAX_SANDBOXES", v)
+			setRequiredGRPCMTLS(t)
+
+			if _, err := LoadAPI(); err == nil {
+				t.Fatalf("expected LoadAPI to reject SANDBOX_API_DEFAULT_MAX_SANDBOXES=%q", v)
+			}
+		})
+	}
+}
+
+func TestLoadAPIRejectsInvalidHeartbeatGrace(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_RUNNER_HEARTBEAT_GRACE", "0s")
+	setRequiredGRPCMTLS(t)
+
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected LoadAPI to reject SANDBOX_API_RUNNER_HEARTBEAT_GRACE=0s")
+	}
+}
+
+func TestLoadAPIParsesLogLevel(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_LOG_LEVEL", "debug")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.LogLevel != slog.LevelDebug {
+		t.Errorf("expected LogLevel debug, got %v", cfg.LogLevel)
+	}
+}
+
+func TestLoadAPIRejectsInvalidLogLevel(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_LOG_LEVEL", "trace")
+	setRequiredGRPCMTLS(t)
+
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected LoadAPI to reject invalid SANDBOX_API_LOG_LEVEL")
+	}
+}
+
+func TestLoadAPIParsesProvisionerKeys(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "admin-a, admin-b")
+	t.Setenv("SANDBOX_API_PROVISIONER_KEYS", " prov-a,,prov-b ")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if len(cfg.ProvisionerKeys) != 2 {
+		t.Fatalf("expected 2 provisioner keys, got %v", cfg.ProvisionerKeys)
+	}
+	for _, k := range []string{"prov-a", "prov-b"} {
+		if _, ok := cfg.ProvisionerKeys[k]; !ok {
+			t.Errorf("expected %q in ProvisionerKeys", k)
+		}
+	}
+}
+
+func TestLoadAPIProvisionerKeysOptional(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_PROVISIONER_KEYS", "")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if len(cfg.ProvisionerKeys) != 0 {
+		t.Fatalf("expected no provisioner keys, got %v", cfg.ProvisionerKeys)
+	}
+}
+
+func TestLoadAPIRejectsProvisionerKeyThatIsAlsoAdmin(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "shared,admin-only")
+	t.Setenv("SANDBOX_API_PROVISIONER_KEYS", "prov-only,shared")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	setRequiredGRPCMTLS(t)
+
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected LoadAPI() to fail when a key is both admin and provisioner")
+	}
+}
+
+func TestLoadAPIRejectsProvisionerKeysWithUnlimitedDefaultQuota(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "admin-key")
+	t.Setenv("SANDBOX_API_PROVISIONER_KEYS", "prov-key")
+	t.Setenv("SANDBOX_API_DEFAULT_MAX_SANDBOXES", "0")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	setRequiredGRPCMTLS(t)
+
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected LoadAPI() to fail when provisioner keys are set and the default quota is unlimited")
+	}
+
+	// Without provisioner keys, unlimited stays allowed.
+	t.Setenv("SANDBOX_API_PROVISIONER_KEYS", "")
+	if _, err := LoadAPI(); err != nil {
+		t.Fatalf("LoadAPI() without provisioner keys: %v", err)
+	}
+}
+
+func TestLoadAPIParsesScalerKeys(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "admin-key")
+	t.Setenv("SANDBOX_API_SCALER_KEYS", " scaler-a,,scaler-b ")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if len(cfg.ScalerKeys) != 2 {
+		t.Fatalf("expected 2 scaler keys, got %v", cfg.ScalerKeys)
+	}
+	for _, k := range []string{"scaler-a", "scaler-b"} {
+		if _, ok := cfg.ScalerKeys[k]; !ok {
+			t.Errorf("expected %q in ScalerKeys", k)
+		}
+	}
+}
+
+func TestLoadAPIScalerKeysOptional(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_SCALER_KEYS", "")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if len(cfg.ScalerKeys) != 0 {
+		t.Fatalf("expected no scaler keys, got %v", cfg.ScalerKeys)
+	}
+}
+
+func TestLoadAPIRejectsScalerKeyInAnotherSet(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "admin-key")
+	t.Setenv("SANDBOX_API_PROVISIONER_KEYS", "prov-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	setRequiredGRPCMTLS(t)
+
+	for _, shared := range []string{"admin-key", "prov-key"} {
+		t.Setenv("SANDBOX_API_SCALER_KEYS", "scaler-only,"+shared)
+		if _, err := LoadAPI(); err == nil {
+			t.Errorf("expected LoadAPI() to fail when scaler key %q is also in another set", shared)
+		}
+	}
+}
+
+func TestLoadAPIRequiresAPIKeys(t *testing.T) {
+	os.Unsetenv("SANDBOX_API_KEYS")
+	os.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "x")
+	defer os.Unsetenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN")
+
+	if _, err := LoadAPI(); err == nil {
+		t.Error("expected LoadAPI() to fail without SANDBOX_API_KEYS")
+	}
+}
+
+func TestLoadAPIRejectsPartialGRPCTLS(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_GRPC_TLS_CERT_FILE", "/tmp/x.crt")
+	t.Setenv("SANDBOX_API_GRPC_TLS_KEY_FILE", "")
+	t.Setenv("SANDBOX_API_GRPC_TLS_CLIENT_CA_FILE", "")
+	t.Setenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CA_FILE", "/tmp/control-ca.crt")
+	t.Setenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CERT_FILE", "/tmp/control-client.crt")
+	t.Setenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_KEY_FILE", "/tmp/control-client.key")
+
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected LoadAPI to reject partial SANDBOX_API_GRPC_TLS_*")
+	}
+}
+
+func TestLoadAPIRejectsPartialRunnerControlGRPCTLS(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_GRPC_TLS_CERT_FILE", "/tmp/api-grpc.crt")
+	t.Setenv("SANDBOX_API_GRPC_TLS_KEY_FILE", "/tmp/api-grpc.key")
+	t.Setenv("SANDBOX_API_GRPC_TLS_CLIENT_CA_FILE", "/tmp/api-grpc-ca.crt")
+	t.Setenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CA_FILE", "/tmp/ca.crt")
+	t.Setenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CERT_FILE", "")
+	t.Setenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_KEY_FILE", "")
+
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected LoadAPI to reject partial SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_*")
+	}
+}
+
+func TestLoadAPIRequiresRegistrationToken(t *testing.T) {
+	os.Setenv("SANDBOX_API_KEYS", "test-key")
+	os.Unsetenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN")
+	defer os.Unsetenv("SANDBOX_API_KEYS")
+
+	if _, err := LoadAPI(); err == nil {
+		t.Error("expected LoadAPI() to fail without SANDBOX_API_RUNNER_REGISTRATION_TOKEN")
+	}
+}
+
+func TestLoadAPIIdleDeleteAfterZeroDisablesDelete(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_IDLE_STOP_AFTER", "1h")
+	t.Setenv("SANDBOX_API_IDLE_DELETE_AFTER", "0")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.IdleStopAfter != time.Hour {
+		t.Fatalf("IdleStopAfter: want 1h, got %s", cfg.IdleStopAfter)
+	}
+	if cfg.IdleDeleteAfter != 0 {
+		t.Fatalf("IdleDeleteAfter: want 0, got %s", cfg.IdleDeleteAfter)
+	}
+	// Ephemeral sandboxes are still deleted at the idle-stop window, so the
+	// buffer that keeps the request-path fence ahead of that delete must apply.
+	if cfg.IdleDeleteSafetyBuffer != time.Minute {
+		t.Fatalf("IdleDeleteSafetyBuffer: want 1m, got %s", cfg.IdleDeleteSafetyBuffer)
+	}
+}
+
+func TestLoadAPIIdleTTLZeroDisablesDefaults(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_IDLE_STOP_AFTER", "0")
+	t.Setenv("SANDBOX_API_IDLE_DELETE_AFTER", "0")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.IdleStopAfter != 0 {
+		t.Fatalf("IdleStopAfter: want 0, got %s", cfg.IdleStopAfter)
+	}
+	if cfg.IdleDeleteAfter != 0 {
+		t.Fatalf("IdleDeleteAfter: want 0, got %s", cfg.IdleDeleteAfter)
+	}
+	if cfg.IdleDeleteSafetyBuffer != 0 {
+		t.Fatalf("IdleDeleteSafetyBuffer: want 0, got %s", cfg.IdleDeleteSafetyBuffer)
+	}
+}
+
+func TestLoadAPIRejectsNegativeIdleDeleteAfter(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_IDLE_DELETE_AFTER", "-1s")
+	setRequiredGRPCMTLS(t)
+
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected LoadAPI to reject negative SANDBOX_API_IDLE_DELETE_AFTER")
+	}
+}
+
+// The lock pool follows the configured concurrency plus five connections the
+// sweeper's workers can never take from the request path.
+func TestLoadAPIIdleSweepConcurrencyKeepsLockPoolAboveIt(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_IDLE_SWEEP_CONCURRENCY", "16")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.IdleSweepConcurrency != 16 {
+		t.Fatalf("IdleSweepConcurrency: want 16, got %d", cfg.IdleSweepConcurrency)
+	}
+	if cfg.Postgres.LockPoolSize != 21 {
+		t.Fatalf("Postgres.LockPoolSize: want 21 (16 + 5 request-path connections), got %d", cfg.Postgres.LockPoolSize)
+	}
+}
+
+func TestLoadAPIRejectsOutOfRangeIdleSweepConcurrency(t *testing.T) {
+	for _, v := range []string{"0", "-1", "two", "17", "9223372036854775807"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("SANDBOX_API_KEYS", "test-key")
+			t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+			t.Setenv("SANDBOX_API_IDLE_SWEEP_CONCURRENCY", v)
+			setRequiredGRPCMTLS(t)
+
+			if _, err := LoadAPI(); err == nil {
+				t.Fatalf("expected LoadAPI to reject SANDBOX_API_IDLE_SWEEP_CONCURRENCY=%q", v)
+			}
+		})
+	}
+}
+
+func TestLoadAPIActivityWriteIntervalAndMaxResponseActivity(t *testing.T) {
+	setBase := func(t *testing.T) {
+		t.Helper()
+		t.Setenv("SANDBOX_API_KEYS", "test-key")
+		t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+		setRequiredGRPCMTLS(t)
+	}
+
+	t.Run("defaults", func(t *testing.T) {
+		setBase(t)
+		cfg, err := LoadAPI()
+		if err != nil {
+			t.Fatalf("LoadAPI() failed: %v", err)
+		}
+		if cfg.ActivityWriteInterval != 5*time.Second {
+			t.Errorf("ActivityWriteInterval = %s, want 5s", cfg.ActivityWriteInterval)
+		}
+		if cfg.MaxResponseActivity != 30*time.Minute {
+			t.Errorf("MaxResponseActivity = %s, want 30m", cfg.MaxResponseActivity)
+		}
+	})
+
+	t.Run("set", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("SANDBOX_API_ACTIVITY_WRITE_INTERVAL", "1m")
+		t.Setenv("SANDBOX_API_MAX_RESPONSE_ACTIVITY", "8h")
+		cfg, err := LoadAPI()
+		if err != nil {
+			t.Fatalf("LoadAPI() failed: %v", err)
+		}
+		if cfg.ActivityWriteInterval != time.Minute {
+			t.Errorf("ActivityWriteInterval = %s, want 1m", cfg.ActivityWriteInterval)
+		}
+		if cfg.MaxResponseActivity != 8*time.Hour {
+			t.Errorf("MaxResponseActivity = %s, want 8h", cfg.MaxResponseActivity)
+		}
+	})
+
+	t.Run("accepts the lowest interval", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("SANDBOX_API_ACTIVITY_WRITE_INTERVAL", "1s")
+		if cfg, err := LoadAPI(); err != nil || cfg.ActivityWriteInterval != time.Second {
+			t.Fatalf("LoadAPI() = %v, %v; want a 1s interval", cfg, err)
+		}
+	})
+
+	for _, v := range []string{"0", "999ms", "61s", "-1s", "soon"} {
+		t.Run("rejects interval "+v, func(t *testing.T) {
+			setBase(t)
+			t.Setenv("SANDBOX_API_ACTIVITY_WRITE_INTERVAL", v)
+			if _, err := LoadAPI(); err == nil {
+				t.Fatalf("expected LoadAPI to reject SANDBOX_API_ACTIVITY_WRITE_INTERVAL=%q", v)
+			}
+		})
+	}
+	for _, v := range []string{"0", "30s", "-1h", "soon"} {
+		t.Run("rejects max response activity "+v, func(t *testing.T) {
+			setBase(t)
+			t.Setenv("SANDBOX_API_MAX_RESPONSE_ACTIVITY", v)
+			if _, err := LoadAPI(); err == nil {
+				t.Fatalf("expected LoadAPI to reject SANDBOX_API_MAX_RESPONSE_ACTIVITY=%q", v)
+			}
+		})
+	}
+}
+
+func TestLoadAPIKeyCacheTTL(t *testing.T) {
+	setBase := func(t *testing.T) {
+		t.Helper()
+		t.Setenv("SANDBOX_API_KEYS", "test-key")
+		t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+		setRequiredGRPCMTLS(t)
+	}
+
+	t.Run("default", func(t *testing.T) {
+		setBase(t)
+		cfg, err := LoadAPI()
+		if err != nil {
+			t.Fatalf("LoadAPI() failed: %v", err)
+		}
+		if cfg.APIKeyCacheTTL != 15*time.Second {
+			t.Errorf("APIKeyCacheTTL = %s, want 15s", cfg.APIKeyCacheTTL)
+		}
+	})
+
+	t.Run("off", func(t *testing.T) {
+		setBase(t)
+		t.Setenv("SANDBOX_API_KEY_CACHE_TTL", "0")
+		cfg, err := LoadAPI()
+		if err != nil {
+			t.Fatalf("LoadAPI() failed: %v", err)
+		}
+		if cfg.APIKeyCacheTTL != 0 {
+			t.Errorf("APIKeyCacheTTL = %s, want 0", cfg.APIKeyCacheTTL)
+		}
+	})
+
+	for _, v := range []string{"-1s", "61s", "soon"} {
+		t.Run("rejects "+v, func(t *testing.T) {
+			setBase(t)
+			t.Setenv("SANDBOX_API_KEY_CACHE_TTL", v)
+			if _, err := LoadAPI(); err == nil {
+				t.Fatalf("expected LoadAPI to reject SANDBOX_API_KEY_CACHE_TTL=%q", v)
+			}
+		})
+	}
+}
+
+func TestLoadAPIDefaultStoreIsSQLite(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.Store != StoreSQLite {
+		t.Fatalf("Store = %q, want sqlite", cfg.Store)
+	}
+}
+
+func TestLoadAPIPostgresStoreRequiresFields(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_STORE", "postgres")
+	setRequiredGRPCMTLS(t)
+
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected error when postgres env vars missing")
+	}
+
+	t.Setenv("SANDBOX_API_POSTGRES_HOST", "db.example.com")
+	t.Setenv("SANDBOX_API_POSTGRES_USER", "sandbox")
+	t.Setenv("SANDBOX_API_POSTGRES_PASSWORD", "secret")
+	t.Setenv("SANDBOX_API_POSTGRES_DB", "sandbox")
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.Store != StorePostgres {
+		t.Fatalf("Store = %q, want postgres", cfg.Store)
+	}
+	if cfg.Postgres.Host != "db.example.com" || cfg.Postgres.Database != "sandbox" {
+		t.Fatalf("unexpected postgres config: %+v", cfg.Postgres)
+	}
+}
+
+func TestLoadAPIMetricsListenAddrFromEnv(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_METRICS_LISTEN_ADDR", ":9100")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.MetricsListenAddr != ":9100" {
+		t.Fatalf("MetricsListenAddr: want :9100, got %s", cfg.MetricsListenAddr)
+	}
+	if cfg.MetricsOnMainListener() {
+		t.Fatal("expected a dedicated metrics listener for :9100")
+	}
+	if cfg.ResolvedMetricsListenAddr() != ":9100" {
+		t.Fatalf("ResolvedMetricsListenAddr: want :9100, got %s", cfg.ResolvedMetricsListenAddr())
+	}
+}
+
+func TestLoadAPIMetricsListenAddrSamePortStaysOnMainListener(t *testing.T) {
+	// One port is one socket, however the two addresses spell it.
+	cases := []struct{ listen, metrics string }{
+		{":8080", ":8080"},
+		{":8080", "0.0.0.0:8080"},
+		{"0.0.0.0:8080", ":8080"},
+		{"[::]:8080", ":8080"},
+		{"127.0.0.1:8081", "127.0.0.1:8081"},
+		// net.Listen resolves a zero-padded port to the same socket, so
+		// splitting the listener here would just fail to bind.
+		{":8080", ":08080"},
+		{":08080", ":8080"},
+		// Same for a service name on the API address.
+		{":http", ":80"},
+		{"127.0.0.1:http", "127.0.0.1:80"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.listen+"_"+tc.metrics, func(t *testing.T) {
+			t.Setenv("SANDBOX_API_KEYS", "test-key")
+			t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+			t.Setenv("SANDBOX_API_LISTEN_ADDR", tc.listen)
+			t.Setenv("SANDBOX_API_METRICS_LISTEN_ADDR", tc.metrics)
+			setRequiredGRPCMTLS(t)
+
+			cfg, err := LoadAPI()
+			if err != nil {
+				t.Fatalf("LoadAPI() failed: %v", err)
+			}
+			if !cfg.MetricsOnMainListener() {
+				t.Fatalf("expected /metrics on the API listener for listen=%q metrics=%q", tc.listen, tc.metrics)
+			}
+			if cfg.ResolvedMetricsListenAddr() != tc.listen {
+				t.Fatalf("ResolvedMetricsListenAddr: want %s, got %s", tc.listen, cfg.ResolvedMetricsListenAddr())
+			}
+		})
+	}
+}
+
+func TestLoadAPIMetricsListenAddrFollowsCustomListenAddr(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_LISTEN_ADDR", "127.0.0.1:8080")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if !cfg.MetricsOnMainListener() {
+		t.Fatal("expected /metrics on the API listener when only the API addr is set")
+	}
+	if cfg.ResolvedMetricsListenAddr() != "127.0.0.1:8080" {
+		t.Fatalf("ResolvedMetricsListenAddr: want 127.0.0.1:8080, got %s", cfg.ResolvedMetricsListenAddr())
+	}
+}
+
+func TestLoadAPIRejectsMetricsListenAddrHostMismatchOnSamePort(t *testing.T) {
+	cases := []struct{ listen, metrics string }{
+		{"127.0.0.1:8080", "0.0.0.0:8080"},
+		{"0.0.0.0:8080", "127.0.0.1:8080"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.listen+"_"+tc.metrics, func(t *testing.T) {
+			t.Setenv("SANDBOX_API_KEYS", "test-key")
+			t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+			t.Setenv("SANDBOX_API_LISTEN_ADDR", tc.listen)
+			t.Setenv("SANDBOX_API_METRICS_LISTEN_ADDR", tc.metrics)
+			setRequiredGRPCMTLS(t)
+
+			if _, err := LoadAPI(); err == nil {
+				t.Fatalf("expected LoadAPI to reject listen=%q with metrics=%q", tc.listen, tc.metrics)
+			}
+		})
+	}
+}
+
+func TestLoadAPIRejectsMetricsListenAddrOnGRPCPort(t *testing.T) {
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_METRICS_LISTEN_ADDR", ":9090")
+	setRequiredGRPCMTLS(t)
+
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected LoadAPI to reject a metrics addr on the runner-registry gRPC port")
+	}
+}
+
+func TestLoadAPIRejectsMetricsListenAddrOnNamedGRPCPort(t *testing.T) {
+	// The gRPC address is not port-validated, so a service name there must still
+	// be recognized as the socket it resolves to.
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_GRPC_LISTEN_ADDR", ":https")
+	t.Setenv("SANDBOX_API_METRICS_LISTEN_ADDR", ":443")
+	setRequiredGRPCMTLS(t)
+
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected LoadAPI to reject a metrics addr on the resolved gRPC port")
+	}
+}
+
+func TestLoadAPIRejectsInvalidMetricsListenAddr(t *testing.T) {
+	for _, v := range []string{"9100", ":0", ":99999", "localhost", ":abc"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("SANDBOX_API_KEYS", "test-key")
+			t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+			t.Setenv("SANDBOX_API_METRICS_LISTEN_ADDR", v)
+			setRequiredGRPCMTLS(t)
+
+			if _, err := LoadAPI(); err == nil {
+				t.Fatalf("expected LoadAPI to reject SANDBOX_API_METRICS_LISTEN_ADDR=%q", v)
+			}
+		})
+	}
+}
+
+func TestLoadAPIMetricsListenAddrLoadsWhenMetricsDisabled(t *testing.T) {
+	// The chart derives METRICS_ENABLED from the ServiceMonitor values and the
+	// addr from api.config, so the combination must load and only warn.
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	t.Setenv("SANDBOX_API_METRICS_LISTEN_ADDR", ":9100")
+	t.Setenv("SANDBOX_API_METRICS_ENABLED", "false")
+	setRequiredGRPCMTLS(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.MetricsEnabled {
+		t.Fatal("expected MetricsEnabled false")
+	}
+	if cfg.MetricsListenAddr != ":9100" {
+		t.Fatalf("MetricsListenAddr: want :9100, got %s", cfg.MetricsListenAddr)
+	}
+}
+
+func TestLoadAPISQLiteWALFromEnv(t *testing.T) {
+	setRequiredAPIEnv(t)
+	t.Setenv("SANDBOX_API_SQLITE_WAL", "false")
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.SQLiteWAL {
+		t.Fatal("expected SQLiteWAL false")
+	}
+}
+
+func TestLoadAPIRejectsInvalidSQLiteWAL(t *testing.T) {
+	setRequiredAPIEnv(t)
+	t.Setenv("SANDBOX_API_SQLITE_WAL", "maybe")
+
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected error for invalid SANDBOX_API_SQLITE_WAL")
+	}
+}
+
+func setRequiredAPIEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("SANDBOX_API_KEYS", "test-key")
+	t.Setenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN", "reg-token")
+	setRequiredGRPCMTLS(t)
+}
+
+func TestLoadAPIRequestLimitDefault(t *testing.T) {
+	setRequiredAPIEnv(t)
+
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.MaxInflightPerTenant != 512 {
+		t.Errorf("MaxInflightPerTenant = %d, want 512", cfg.MaxInflightPerTenant)
+	}
+}
+
+func TestLoadAPIRequestLimitParsesAndAllowsZero(t *testing.T) {
+	for value, want := range map[string]int{"0": 0, "7": 7} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredAPIEnv(t)
+			t.Setenv("SANDBOX_API_MAX_INFLIGHT_PER_TENANT", value)
+
+			cfg, err := LoadAPI()
+			if err != nil {
+				t.Fatalf("LoadAPI() failed: %v", err)
+			}
+			if cfg.MaxInflightPerTenant != want {
+				t.Errorf("MaxInflightPerTenant = %d, want %d", cfg.MaxInflightPerTenant, want)
+			}
+		})
+	}
+}
+
+func TestLoadAPIRejectsInvalidRequestLimit(t *testing.T) {
+	for _, value := range []string{"-1", "lots", "2147483648"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredAPIEnv(t)
+			t.Setenv("SANDBOX_API_MAX_INFLIGHT_PER_TENANT", value)
+			if _, err := LoadAPI(); err == nil {
+				t.Fatalf("expected LoadAPI() to reject SANDBOX_API_MAX_INFLIGHT_PER_TENANT=%s", value)
+			}
+		})
+	}
+}
+
+// setRequiredVolumeEnv clears the volume variables, so a value set where the
+// tests run cannot change their outcome.
+func setRequiredVolumeEnv(t *testing.T) {
+	t.Helper()
+	setRequiredAPIEnv(t)
+	for _, name := range []string{
+		"SANDBOX_API_VOLUME_STORE",
+		"SANDBOX_API_VOLUME_LOCAL_URL",
+		"SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR",
+		"SANDBOX_API_VOLUME_REMOTE_SOCKET",
+	} {
+		t.Setenv(name, "")
+	}
+}
+
+// The local settings are read only with local: without it they start no
+// listener, so not even a value that local would refuse stops the API.
+func TestLoadAPIVolumeStoreDefaultsToNone(t *testing.T) {
+	for name, store := range map[string]string{"no store": "", "remote": "remote"} {
+		t.Run(name, func(t *testing.T) {
+			setRequiredVolumeEnv(t)
+			t.Setenv("SANDBOX_API_VOLUME_STORE", store)
+			t.Setenv("SANDBOX_API_VOLUME_REMOTE_SOCKET", "/run/volume-store/helper.sock")
+			t.Setenv("SANDBOX_API_VOLUME_LOCAL_URL", "http://ignored")
+			t.Setenv("SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR", ":8080")
+
+			cfg, err := LoadAPI()
+			if err != nil {
+				t.Fatalf("LoadAPI() failed: %v", err)
+			}
+			if cfg.VolumeStore != VolumeStoreBackend(store) || cfg.VolumeLocalURL != "" || cfg.VolumeLocalListenAddr != "" {
+				t.Errorf("VolumeStore = %q, VolumeLocalURL = %q, VolumeLocalListenAddr = %q; want %q and no local settings",
+					cfg.VolumeStore, cfg.VolumeLocalURL, cfg.VolumeLocalListenAddr, store)
+			}
+		})
+	}
+}
+
+func TestLoadAPIVolumeStoreLocal(t *testing.T) {
+	setRequiredVolumeEnv(t)
+	t.Setenv("SANDBOX_API_VOLUME_STORE", "local")
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected local to require SANDBOX_API_VOLUME_LOCAL_URL")
+	}
+
+	t.Setenv("SANDBOX_API_VOLUME_LOCAL_URL", " https://sandbox-api:8443/ ")
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.VolumeStore != VolumeStoreLocal || cfg.VolumeLocalURL != "https://sandbox-api:8443" {
+		t.Errorf("VolumeStore = %q, VolumeLocalURL = %q", cfg.VolumeStore, cfg.VolumeLocalURL)
+	}
+	if cfg.VolumeLocalListenAddr != ":8443" {
+		t.Errorf("VolumeLocalListenAddr = %q, want the default :8443", cfg.VolumeLocalListenAddr)
+	}
+
+	t.Setenv("SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR", " 127.0.0.1:9443 ")
+	cfg, err = LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.VolumeLocalListenAddr != "127.0.0.1:9443" {
+		t.Errorf("VolumeLocalListenAddr = %q, want 127.0.0.1:9443", cfg.VolumeLocalListenAddr)
+	}
+}
+
+// Volume objects are served over mutual TLS only, so an http URL could never
+// work; the error has to say where they are served instead.
+func TestLoadAPIRejectsPlainHTTPVolumeLocalURL(t *testing.T) {
+	setRequiredVolumeEnv(t)
+	t.Setenv("SANDBOX_API_VOLUME_STORE", "local")
+	t.Setenv("SANDBOX_API_VOLUME_LOCAL_URL", "http://sandbox-api:8443")
+
+	_, err := LoadAPI()
+	if err == nil {
+		t.Fatal("expected LoadAPI() to refuse an http SANDBOX_API_VOLUME_LOCAL_URL")
+	}
+	for _, want := range []string{"https", "SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
+	}
+}
+
+func TestLoadAPIRejectsInvalidVolumeLocalListenAddr(t *testing.T) {
+	for _, value := range []string{"8443", ":0", ":99999", "localhost", ":abc", ":https"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredVolumeEnv(t)
+			t.Setenv("SANDBOX_API_VOLUME_STORE", "local")
+			t.Setenv("SANDBOX_API_VOLUME_LOCAL_URL", "https://sandbox-api:8443")
+			t.Setenv("SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR", value)
+
+			if _, err := LoadAPI(); err == nil {
+				t.Fatalf("expected LoadAPI to reject SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR=%q", value)
+			}
+		})
+	}
+}
+
+func TestLoadAPIRejectsVolumeLocalListenAddrOnAnotherListenersPort(t *testing.T) {
+	cases := []struct {
+		name  string
+		env   map[string]string
+		clash string
+	}{
+		{"the default against the API port", map[string]string{"SANDBOX_API_LISTEN_ADDR": ":8443"}, "SANDBOX_API_LISTEN_ADDR"},
+		{"the API port", map[string]string{"SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR": ":8080"}, "SANDBOX_API_LISTEN_ADDR"},
+		{"the gRPC port", map[string]string{"SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR": ":9090"}, "SANDBOX_API_GRPC_LISTEN_ADDR"},
+		{"the metrics port", map[string]string{
+			"SANDBOX_API_METRICS_LISTEN_ADDR":      ":9100",
+			"SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR": ":9100",
+		}, "SANDBOX_API_METRICS_LISTEN_ADDR"},
+		// One port is one socket, whatever the host and however it is spelled.
+		{"another host on the API port", map[string]string{"SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR": "127.0.0.1:8080"}, "SANDBOX_API_LISTEN_ADDR"},
+		{"a padded port", map[string]string{"SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR": ":08080"}, "SANDBOX_API_LISTEN_ADDR"},
+		{"a named gRPC port", map[string]string{
+			"SANDBOX_API_GRPC_LISTEN_ADDR":         ":https",
+			"SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR": ":443",
+		}, "SANDBOX_API_GRPC_LISTEN_ADDR"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			setRequiredVolumeEnv(t)
+			t.Setenv("SANDBOX_API_VOLUME_STORE", "local")
+			t.Setenv("SANDBOX_API_VOLUME_LOCAL_URL", "https://sandbox-api:8443")
+			for name, value := range testCase.env {
+				t.Setenv(name, value)
+			}
+
+			_, err := LoadAPI()
+			if err == nil {
+				t.Fatal("expected LoadAPI() to refuse a port another listener uses")
+			}
+			for _, want := range []string{"SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR", testCase.clash} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name %s", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestLoadAPIVolumeStoreRemote(t *testing.T) {
+	setRequiredVolumeEnv(t)
+	t.Setenv("SANDBOX_API_VOLUME_STORE", "REMOTE")
+	if _, err := LoadAPI(); err == nil {
+		t.Fatal("expected remote to require SANDBOX_API_VOLUME_REMOTE_SOCKET")
+	}
+
+	t.Setenv("SANDBOX_API_VOLUME_REMOTE_SOCKET", " /run/volume-store/helper.sock ")
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() failed: %v", err)
+	}
+	if cfg.VolumeStore != VolumeStoreRemote || cfg.VolumeRemoteSocket != "/run/volume-store/helper.sock" {
+		t.Errorf("VolumeStore = %q, VolumeRemoteSocket = %q", cfg.VolumeStore, cfg.VolumeRemoteSocket)
+	}
+}
+
+func TestLoadAPIRejectsInvalidVolumeStoreConfig(t *testing.T) {
+	cases := []map[string]string{
+		{"SANDBOX_API_VOLUME_STORE": "s3"},
+		{"SANDBOX_API_VOLUME_STORE": "local", "SANDBOX_API_VOLUME_LOCAL_URL": "sandbox-api:8443"},
+		{"SANDBOX_API_VOLUME_STORE": "local", "SANDBOX_API_VOLUME_LOCAL_URL": "ftp://sandbox-api"},
+		{"SANDBOX_API_VOLUME_STORE": "local", "SANDBOX_API_VOLUME_LOCAL_URL": "http://sandbox-api:8443"},
+		{"SANDBOX_API_VOLUME_STORE": "local", "SANDBOX_API_VOLUME_LOCAL_URL": "http://user:pass@sandbox-api"},
+		{"SANDBOX_API_VOLUME_STORE": "local", "SANDBOX_API_VOLUME_LOCAL_URL": "https://user:pass@sandbox-api"},
+		{"SANDBOX_API_VOLUME_STORE": "local", "SANDBOX_API_VOLUME_LOCAL_URL": "https://sandbox-api/?x=1"},
+		{"SANDBOX_API_VOLUME_STORE": "local", "SANDBOX_API_VOLUME_LOCAL_URL": "https://sandbox-api/#x"},
+		{"SANDBOX_API_VOLUME_STORE": "local", "SANDBOX_API_VOLUME_LOCAL_URL": "https://:8443"},
+		{"SANDBOX_API_VOLUME_STORE": "local", "SANDBOX_API_VOLUME_LOCAL_URL": "https://sandbox.example.com/api"},
+		{"SANDBOX_API_VOLUME_STORE": "azblob"},
+		{"SANDBOX_API_VOLUME_STORE": "remote", "SANDBOX_API_VOLUME_REMOTE_SOCKET": "helper.sock"},
+		{"SANDBOX_API_VOLUME_STORE": "remote", "SANDBOX_API_VOLUME_REMOTE_SOCKET": "/" + strings.Repeat("a", 107)},
+	}
+	for _, env := range cases {
+		t.Run(fmt.Sprint(env), func(t *testing.T) {
+			setRequiredVolumeEnv(t)
+			for name, value := range env {
+				t.Setenv(name, value)
+			}
+			_, err := LoadAPI()
+			if err == nil {
+				t.Fatal("expected LoadAPI() to fail")
+			}
+			if strings.Contains(err.Error(), "pass") || strings.Contains(err.Error(), "sig=") {
+				t.Errorf("error repeats a secret: %v", err)
+			}
+		})
+	}
+}

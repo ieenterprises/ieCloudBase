@@ -1,0 +1,123 @@
+// Package network sets up the per-sandbox network namespace, veth pair and
+// egress rules for Firecracker sandboxes.
+package network
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/n8n-io/sandbox-service/internal/shellquote"
+)
+
+const (
+	uplinkIfaceName = "fc-uplink"
+	defaultTapIface = "fc-tap-0"
+	guestSubnetCIDR = "172.16.0.0/24"
+)
+
+// NetnsName returns the network namespace for a runner slot.
+func NetnsName(slot int) string {
+	return fmt.Sprintf("fc-sb-%d", slot)
+}
+
+// HostVethName returns the host-side veth for a runner slot.
+func HostVethName(slot int) string {
+	return fmt.Sprintf("fc-veth-%d", slot)
+}
+
+// MaxSlots is how many slots the uplink addressing covers: 10.200.0.0/16 carved
+// into /30 links, one per slot. Config validation caps capacity at it.
+const MaxSlots = 64 * 256
+
+// uplinkSubnet is the /30 link between the host and the slot's namespace: 64 per
+// third octet, host on the first usable address, namespace on the second.
+func uplinkSubnet(slot int) (hostIP, netnsIP, prefix string) {
+	octet, base := slot/64, (slot%64)*4
+	return fmt.Sprintf("10.200.%d.%d", octet, base+1), fmt.Sprintf("10.200.%d.%d", octet, base+2), "30"
+}
+
+// EnsureHostNAT enables IPv4 forwarding and idempotent host NAT/forward rules
+// needed for sandbox netns uplinks to reach the public internet.
+func EnsureHostNAT(ctx context.Context, run func(context.Context, string, ...string) error) error {
+	script := `
+set -eu
+sysctl -w net.ipv4.ip_forward=1
+default_iface="$(ip route show default | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)"
+if [ -z "$default_iface" ]; then
+  echo "no default route interface" >&2
+  exit 1
+fi
+iptables -t nat -C POSTROUTING -o "$default_iface" -j MASQUERADE 2>/dev/null \
+  || iptables -t nat -A POSTROUTING -o "$default_iface" -j MASQUERADE
+iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+  || iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -C FORWARD -i fc-veth+ -j ACCEPT 2>/dev/null \
+  || iptables -A FORWARD -i fc-veth+ -j ACCEPT
+`
+	return run(ctx, "sudo", "/bin/sh", "-c", script)
+}
+
+// SetupScript builds a shell script that creates a per-slot netns, TAP, veth
+// uplink, routing, NAT, and egress policy.
+//
+// It clears the slot before building it, which is what lets a slot be handed back
+// for reuse even when the teardown that released it failed. Both names it creates
+// on the host are per-slot, so both have to be cleared: a leftover veth would
+// otherwise fail `ip link add` under `set -eu`, and the leftover survives precisely
+// when cleanup never ran at all — a cleanup budget that expired before its script
+// started, say. Deleting the netns by name also succeeds while a stale microVM is
+// still running inside it, because the kernel keeps that namespace alive for the
+// process while the name is freed, so the new sandbox gets an empty namespace and
+// the stale guest is left isolated in an unnamed one.
+//
+// The netns iptables calls wait for the xtables lock (-w 5): the background slot
+// wirer builds namespaces concurrently with inline builds, and without it a
+// contended /run/xtables.lock fails the script outright. The wait is bounded so
+// a lock held by something stuck fails the build rather than stalling it.
+func SetupScript(slot int, tapDevice, tapCIDR string) string {
+	q := shellquote.Quote
+	if tapDevice == "" {
+		tapDevice = defaultTapIface
+	}
+	netnsName := NetnsName(slot)
+	hostVeth := HostVethName(slot)
+	hostIP, netnsIP, prefix := uplinkSubnet(slot)
+
+	var b strings.Builder
+	b.WriteString("set -eu\n")
+	fmt.Fprintf(&b, "ip link delete %s 2>/dev/null || true\n", q(hostVeth))
+	fmt.Fprintf(&b, "ip netns delete %s 2>/dev/null || true\n", q(netnsName))
+	fmt.Fprintf(&b, "ip netns add %s\n", q(netnsName))
+	fmt.Fprintf(&b, "ip link add %s type veth peer name %s netns %s\n",
+		q(hostVeth), q(uplinkIfaceName), q(netnsName))
+	fmt.Fprintf(&b, "ip addr add %s/%s dev %s\n", q(hostIP), prefix, q(hostVeth))
+	fmt.Fprintf(&b, "ip link set %s up\n", q(hostVeth))
+	fmt.Fprintf(&b, "ip netns exec %s ip addr add %s/%s dev %s\n",
+		q(netnsName), q(netnsIP), prefix, q(uplinkIfaceName))
+	fmt.Fprintf(&b, "ip netns exec %s ip link set %s up\n", q(netnsName), q(uplinkIfaceName))
+	fmt.Fprintf(&b, "ip netns exec %s ip link set lo up\n", q(netnsName))
+	fmt.Fprintf(&b, "ip netns exec %s ip tuntap add name %s mode tap\n", q(netnsName), q(tapDevice))
+	fmt.Fprintf(&b, "ip netns exec %s ip addr add %s dev %s\n", q(netnsName), q(tapCIDR), q(tapDevice))
+	fmt.Fprintf(&b, "ip netns exec %s ip link set %s up\n", q(netnsName), q(tapDevice))
+	fmt.Fprintf(&b, "ip netns exec %s ip route add default via %s dev %s\n",
+		q(netnsName), q(hostIP), q(uplinkIfaceName))
+	fmt.Fprintf(&b, "ip netns exec %s sysctl -w net.ipv4.ip_forward=1\n", q(netnsName))
+	fmt.Fprintf(&b, "ip netns exec %s iptables -w 5 -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE\n",
+		q(netnsName), guestSubnetCIDR, q(uplinkIfaceName))
+	for _, line := range forwardEgressRules(netnsName, tapDevice) {
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// CleanupScript removes the slot's host veth and netns.
+func CleanupScript(slot int) string {
+	q := shellquote.Quote
+	return fmt.Sprintf(`
+set -eu
+ip link delete %s 2>/dev/null || true
+ip netns delete %s 2>/dev/null || true
+`, q(HostVethName(slot)), q(NetnsName(slot)))
+}

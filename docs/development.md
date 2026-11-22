@@ -1,0 +1,186 @@
+# Development
+
+## Contents
+
+- [Building from source](#building-from-source)
+- [Building Docker images](#building-docker-images)
+- [Running locally](#running-locally)
+- [Tests](#tests)
+- [Playground](#playground)
+- [SDK](#sdk)
+- [Code formatting and linting](#code-formatting-and-linting)
+
+## Building from source
+
+Build all four service binaries (compiled for Linux):
+
+```bash
+make all
+```
+
+Or build individually:
+
+```bash
+make api                 # Public API gateway
+make runner-docker       # Docker/sysbox runner
+make runner-firecracker  # Firecracker runner (make runner builds both)
+make daemon              # In-container HTTP daemon (static, CGO_ENABLED=0)
+```
+
+Binaries are written to `bin/`.
+
+`make proto-volumestore` regenerates the volume store helper's gRPC code in `internal/api/volumestore/storepb` (protoc 35.1, protoc-gen-go v1.36.11, protoc-gen-go-grpc v1.6.2 on `PATH`).
+
+The Go version is the `go` line in `go.mod`. GitHub workflows and the e2e VM setup scripts install exactly that version, so it also builds the golden-build `sandbox-daemon`; an older local Go fetches it automatically. The Dockerfiles use the same minor (`golang:1.27-bookworm`), so a minor bump changes them too.
+
+## Building Docker images
+
+Build all images for the current architecture:
+
+```bash
+make docker-local
+```
+
+Cross-compile for a specific architecture:
+
+```bash
+make docker-amd64    # API + runner + sandbox for linux/amd64
+make docker-arm64    # API + runner + sandbox for linux/arm64
+```
+
+Individual image targets are also available (e.g. `make docker-api-amd64`, `make docker-runner-arm64`, `make docker-sandbox-amd64`). The Firecracker runner is amd64-only and can be built with `make docker-firecracker-runner-amd64`.
+
+## Running locally
+
+Start the full stack (API + two runners) with Docker Compose. This bootstraps local mTLS certificates, builds images, and starts services with the correct platform overlay:
+
+```bash
+make up
+```
+
+Stop all services:
+
+```bash
+make down
+```
+
+Quick smoke test (create, exec, resolv.conf, DNS, HTTPS, file write/read, delete, then a sandbox with `egress: public` and one with `egress: none` whose outbound traffic must be blocked):
+
+```bash
+make smoke
+```
+
+Against a deployed environment, copy `scripts/smoke-sandbox.env.example` to
+`scripts/smoke-sandbox.<env>.env` (gitignored) and run:
+
+```bash
+SMOKE_ENV=<env> sh scripts/smoke-sandbox.sh
+SMOKE_ENV=<env> SMOKE_EXTENDED=1 sh scripts/smoke-sandbox.sh   # Firecracker: also a second create (snapshot restore path)
+```
+
+## Tests
+
+Run Go unit tests:
+
+```bash
+make test
+```
+
+`make test` runs each `Fuzz...` test on its seed inputs only. To fuzz one:
+
+```bash
+go test ./internal/daemon -run '^$' -fuzz '^FuzzStreamLines$' -fuzztime 20s
+```
+
+The [Fuzz](../.github/workflows/fuzz.yml) workflow fuzzes every one for five minutes each night and uploads a failing input as an artifact. Put that file into the package's `testdata/fuzz/<test name>/` together with the fix, and `make test` checks it from then on.
+
+The Postgres store and registry tests are behind the `integration` build tag and need a database. `make test-integration` runs them and fails when `SANDBOX_TEST_POSTGRES_HOST` is unset (`SANDBOX_TEST_POSTGRES_{PORT,USER,PASSWORD,DB,SSLMODE}` are optional). Use a throwaway database: the tests run the migrations and write runners and sandboxes that a running API would act on. CI runs them against `postgres:16-alpine`:
+
+```bash
+docker run -d --rm --name sandbox-test-postgres -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:5432:5432 postgres:16-alpine
+# -h: on first start the image runs a temporary server on the Unix socket only.
+for i in $(seq 30); do docker exec sandbox-test-postgres pg_isready -h 127.0.0.1 -U postgres -q && break; sleep 1; done
+SANDBOX_TEST_POSTGRES_HOST=127.0.0.1 SANDBOX_TEST_POSTGRES_PASSWORD=postgres make test-integration
+```
+
+Run the full end-to-end suite (all topologies sequentially):
+
+```bash
+./e2e/run-all.sh
+```
+
+Run a single topology:
+
+```bash
+./e2e/run.sh              # Single runner + full Playwright suite
+./e2e/run-no-runner.sh    # API only — expects POST /sandboxes to return 503
+./e2e/run-two-runners.sh  # Two runners — placement routing per sandbox
+```
+
+Extra Playwright arguments can be appended (e.g. `./e2e/run-all.sh --grep pattern`).
+
+`run-all.sh` runs `make docker-local` once. Per-topology scripts skip rebuilding when invoked from it (`E2E_SKIP_BUILD=1`). To rebuild before each phase, run topology scripts individually.
+
+Idle-TTL, Postgres, multi-pod and Firecracker lanes: [e2e/README.md](../e2e/README.md).
+
+## Playground
+
+Start the browser-based testing UI at `http://localhost:5173`:
+
+```bash
+make playground
+```
+
+The playground lets you create sandboxes, execute commands, and browse files interactively. It requires the service to be running (`make up`).
+
+## SDK
+
+The TypeScript/JavaScript client library lives in `sdk/`. Run the full SDK pipeline:
+
+```bash
+make sdk    # install + build + typecheck + test
+```
+
+Individual targets:
+
+```bash
+make sdk-install      # pnpm install
+make sdk-build        # pnpm build
+make sdk-typecheck    # pnpm typecheck
+make sdk-test         # pnpm test
+make sdk-fmt          # Format with oxfmt
+make sdk-fmt-check    # Check formatting
+make sdk-lint         # Lint with oxlint
+```
+
+## Code formatting and linting
+
+After modifying Go files, always run:
+
+```bash
+make fmt-check    # Check that all Go files are gofmt-formatted
+make vet          # Run go vet on all packages
+```
+
+To auto-format:
+
+```bash
+make fmt
+```
+
+After modifying shell scripts, always run:
+
+```bash
+make shell-fmt-check    # Check that all shell scripts are shfmt-formatted
+make shell-lint         # Run shellcheck on all shell scripts
+```
+
+To auto-format:
+
+```bash
+make shell-fmt
+```
+
+These need `shfmt` and `shellcheck` (`brew install shfmt shellcheck`). CI pins
+shfmt v3.13.1 and shellcheck v0.11.0; older shellcheck releases report findings
+that v0.11.0 has since dropped, so match the pinned version locally.

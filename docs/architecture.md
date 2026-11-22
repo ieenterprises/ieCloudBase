@@ -1,0 +1,234 @@
+# Architecture
+
+The n8n Sandbox Service provides isolated, on-demand execution environments via a REST API. Each sandbox is a Debian-based container (Docker/Sysbox runner) or microVM (Firecracker runner) with an HTTP daemon inside that handles command execution and file operations. The service is designed for horizontal scalability: runners register dynamically with a central API gateway, which routes client requests to the appropriate runner and sandbox.
+
+## System Overview
+
+```text
+                    ┌────────────────────────────────────────────────────────────┐
+                    │              API Gateway (Go app in a container)           │
+                    │                                                            │
+  Client ── REST ─▶ │  ┌──────────┐                                              │
+  (SDK)  (X-Api-Key)│  │ HTTP     │    ┌──────────────────┐                      │
+                    │  │ Server   │    │  Idle Sweeper    │                      │
+                    │  │ (:8080)  │    └──────────────────┘                      │
+                    │  └────┬─────┘                                              │
+                    │       │         ┌──────────────────┐  ┌─────────────────┐  │
+                    │  ┌────▼─────┐   │ Registration     │  │ Control         │  │
+                    │  │  Store   │   │ gRPC Server      │  │ gRPC Client     │  │
+                    │  │ (SQLite) │   │ (:9090)          │  │                 │  │
+                    │  └──────────┘   └────────▲─────────┘  └────────┬────────┘  │
+                    └───────┬──────────────────┼─────────────────────┼───────────┘
+                            │                  │                     │
+              HTTP reverse  │                  │ gRPC mTLS           │ gRPC mTLS
+              proxy         │                  │ (Registration)      │ (SandboxControl)
+                            │                  │ register runner     │ create / delete sandbox
+               ┌────────────▼──────────────────┼─────────────────────┼──────────────┐
+               │  Runner (DinD container)      │                     │              │
+               │                               │                     │              │
+               │  ┌────────────────────────────┼─────────────────────┼───────────┐  │
+               │  │ Runner (Go app)            │                     │           │  │
+               │  │                            │                     │           │  │
+               │  │  ┌────────────────┐ ┌───────────────────┐ ┌──────▼────────┐  │  │
+               │  │  │ Sandbox HTTP   │ │ Registration      │ │ Control       │  │  │
+               │  │  │ Proxy (:8080)  │ │ gRPC Client       │ │               │  │  │
+               │  │  │                │ │                   │ │ gRPC Server   │  │  │
+               │  │  │                │ │                   │ │ (:9091)       │  │  │
+               │  │  └───────┬────────┘ └───────────────────┘ └───────┬───────┘  │  │
+               │  └──────────┼────────────────────────────────────────┼──────────┘  │
+               │             │                                        │             │
+               │  ┌──────────▼────────────────────────────────────────▼──────────┐  │
+               │  │                    Container Manager                         │  │
+               │  │               (Docker-in-Docker daemon)                      │  │
+               │  └──────┬─────────────────┬─────────────────┬───────────────────┘  │
+               │         │                 │                 │                      │
+               │  ┌──────▼───────┐  ┌──────▼───────┐  ┌─────▼────────┐              │
+               │  │ Sandbox      │  │ Sandbox      │  │ Sandbox      │              │
+               │  │ container    │  │ container    │  │ container    │              │
+               │  │ ┌──────────┐ │  │ ┌──────────┐ │  │ ┌──────────┐ │              │
+               │  │ │  Daemon  │ │  │ │  Daemon  │ │  │ │  Daemon  │ │              │
+               │  │ │ (:8081)  │ │  │ │ (:8081)  │ │  │ │ (:8081)  │ │              │
+               │  │ └──────────┘ │  │ └──────────┘ │  │ └──────────┘ │              │
+               │  └──────────────┘  └──────────────┘  └──────────────┘              │
+               └────────────────────────────────────────────────────────────────────┘
+```
+
+The diagram shows the Docker runner. The Firecracker runner replaces the Docker-in-Docker daemon and containers with one jailer-launched microVM per sandbox; the store is SQLite or Postgres.
+
+The system has three tiers:
+
+1. **API Gateway** — public entry point; routes requests, manages state, coordinates runners
+2. **Runner** — manages sandbox lifecycle (containers or microVMs); proxies exec/file operations to daemons
+3. **Daemon** — lightweight HTTP server running inside each sandbox; executes commands and manages files
+
+Multiple runners can register with a single API gateway for horizontal scaling. The API distributes sandbox creation across eligible runners using load-aware placement (lowest `capacity_used`).
+
+### Multi-pod API (Postgres)
+
+For multiple API replicas (e.g. n8n Cloud), set `SANDBOX_API_STORE=postgres`. All pods share:
+
+- **Sandbox metadata** (`sandboxes` table) — any pod can proxy, get, or delete any sandbox using stored runner routing info
+- **Runner registry** (`runners` table) — heartbeats from gRPC streams on any pod are visible cluster-wide
+- **Sweeper leadership** — a Postgres session advisory lock ensures only one pod runs the idle stop/delete sweeper per tick
+
+SQLite remains the default for single-pod deployments (`SANDBOX_API_STORE=sqlite` or unset).
+
+## Components
+
+### API Gateway
+
+**Source:** `cmd/api/`, `internal/api/`
+
+The API gateway is the single public-facing service. It exposes a REST API for sandbox lifecycle management and proxies exec/file operations to the correct runner.
+
+| Subcomponent | Location | Responsibility |
+| --- | --- | --- |
+| HTTP handlers | `internal/api/handlers.go` | Sandbox CRUD, reverse proxy to runners |
+| Gateway setup | `internal/api/gateway.go` | Route registration, middleware chain |
+| Runner registry | `internal/api/registry/` | Runner heartbeats and placement (in-memory for SQLite; Postgres for multi-pod) |
+| gRPC server | `internal/api/grpc/` | `RunnerRegistry` service — accepts runner heartbeat streams |
+| Store | `internal/api/store/` | Sandbox metadata (`sqlite` default, `postgres` for multi-pod) |
+| Sweeper lock | `internal/api/store/postgres.go` | Postgres advisory lock for idle sweeper leadership |
+| Idle sweeper | `internal/api/ttl.go` | Periodic scan to stop/delete idle sandboxes (ephemeral ones are deleted, never stopped), bounded concurrency with per-call runner deadlines |
+| Activity recorder | `internal/api/activity.go` | Writes `last_active_at` in the background ([Sandbox activity](#sandbox-activity)) |
+| Key cache | `internal/api/apikey_cache.go` | Per-replica cache of tenant key lookups ([Tenant key cache](#tenant-key-cache)) |
+| Config | `internal/api/config/` | Environment variable parsing and validation |
+
+**Middleware chain:** Recovery → CORS (optional) → Logging → Auth (API key) → Metrics (optional)
+
+### Runner
+
+**Source:** `cmd/runner-docker/`, `cmd/runner-firecracker.ee/`, `internal/runner/`
+
+Each runner hosts sandboxes through the shared `runtime.Runtime` contract. The Docker runner manages containers via an inner Docker daemon (Docker-in-Docker), while the Firecracker runner manages microVM sandboxes. Runners are stateless — persistent sandbox metadata lives in the API store (SQLite or Postgres).
+
+| Subcomponent | Location | Responsibility |
+| --- | --- | --- |
+| Runtime contract | `internal/runner/runtime/` | Shared runner backend interface for Docker and Firecracker implementations |
+| Docker runtime | `internal/runner/runtime/docker/` | Create, stop, delete containers; reconcile on startup; manage Docker network |
+| Firecracker runtime | `internal/runner/runtime/firecracker.ee/` | Create, stop, delete microVM sandboxes; manage jailer, snapshot restore, and host networking |
+| Docker client | `internal/runner/runtime/docker/docker_client.go` | Thin wrapper around the `docker` CLI |
+| Registration client | `internal/runner/register/` | gRPC heartbeat stream to API; sends capacity, health and cordon state every 10s, and at once when cordon changes |
+| gRPC control server | `internal/runner/grpc_control.go` | `SandboxControl` service — accepts create/stop/delete RPCs from API, and cordon RPCs |
+| HTTP proxy | `internal/runner/proxy.go` | Reverse proxy from runner HTTP to sandbox daemon |
+| Network rules | `internal/runner/runtime/docker/netrules/` | iptables rules for Docker sandbox network isolation |
+| Resource limits | `internal/runner/runtime/docker/resource_limits.go` | Memory, CPU, PID, and disk quota enforcement |
+
+**Middleware chain:** Recovery → Logging → Auth (client certificate + API key) → Metrics (optional)
+
+### Daemon
+
+**Source:** `cmd/daemon/`, `internal/daemon/`
+
+A lightweight HTTP server embedded in every sandbox container. It is the only process that runs commands and touches files inside the sandbox.
+
+Docker containers are created with `--init`, so Docker's init (`docker-init`, which the Docker daemon's host must have) is PID 1 and reaps orphaned processes. In a Firecracker guest the daemon itself is PID 1 and does not reap them.
+
+| Subcomponent | Location | Responsibility |
+| --- | --- | --- |
+| HTTP server | `internal/daemon/daemon.go` | Route registration, request handling |
+| Exec manager | `internal/daemon/exec_manager.go` | Track active and completed executions |
+| Execution | `internal/daemon/exec.go`, `execution.go` | Fork processes, capture stdout/stderr, stream NDJSON events |
+| File operations | `internal/daemon/files.go` | Read, write, append, copy, move, delete, list, stat |
+| Protocol | `internal/daemon/protocol.go` | NDJSON event format with sequence numbers |
+
+## Communication Patterns
+
+### Client → API (REST + API Key)
+
+All client requests go through the API gateway over HTTP. Authentication uses an `X-Api-Key` header. Keys in `SANDBOX_API_KEYS` are admin keys (full access). Keys in `SANDBOX_API_PROVISIONER_KEYS` are provisioner keys (see [security-model.md](security-model.md#provisioner-keys)). Keys in `SANDBOX_API_SCALER_KEYS` are scaler keys (see [security-model.md](security-model.md#scaler-keys)). Admin-minted tenant keys (stored hashed in the API database) are scoped to that tenant's sandboxes.
+
+Per-tenant `max_sandboxes` is checked before the runner call and again when the sandbox is saved. The first check counts the tenant's saved sandboxes plus the creates in progress on this API pod (`internal/api/tenant_quota.go`), so on one pod no create past the quota reaches a runner while the quota stays the same. No lock is held over the store read or the runner call. The save counts and inserts under the tenant's row lock (Postgres) or `BEGIN IMMEDIATE` (SQLite), so concurrent creates on several pods, or a quota lowered during a create, cannot take a tenant past its quota. A create refused there is deleted from its runner again; if that delete fails, the sandbox stays on the runner untracked and the API logs it.
+
+### API ↔ Runner Registration (gRPC Bidirectional Streaming + mTLS)
+
+Runners register with the API by opening a long-lived gRPC stream (`RunnerRegistry.Connect`). The runner sends periodic heartbeats containing its ID, HTTP base URL, health status, cordon state, and capacity metrics. The API uses these to maintain a live registry and route requests. The gRPC channel is secured with mutual TLS and an additional bearer token.
+
+**Proto definition:** `proto/runner/v1/runner.proto`
+
+### API → Runner Control (gRPC Unary + mTLS)
+
+When a client creates or deletes a sandbox, the API calls the runner's `SandboxControl` gRPC service (`CreateSandbox`, `StopSandbox`, `DeleteSandbox`). A delete the runner has received runs to its end on the runtime's own budget, even if the API stops waiting. This channel also uses mTLS with API key authentication in gRPC metadata.
+
+The runner's HTTP listener uses the same certificate and the same client CA, so both channels to a runner share one identity. It negotiates with `VerifyClientCertIfGiven` so that health probes, which cannot present a certificate, still reach `/livez` and `/readyz`; the auth middleware requires a verified certificate on every other route.
+
+### Runner → API Volume Objects (HTTPS + mTLS)
+
+With `SANDBOX_API_VOLUME_STORE=local`, the API serves volume objects on a listener of its own (`SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR`, default `:8443`), at URLs it signs for one object each. The listener presents the registration listener's certificate and requires a client certificate from the same CA. The public listener has no such route.
+
+### API/Runner → Daemon (HTTP Reverse Proxy)
+
+Exec and file operation requests are proxied through two hops:
+
+```text
+Client → API (HTTP) → Runner (HTTP reverse proxy) → Daemon (HTTP on :8081)
+```
+
+Each hop uses `httputil.ReverseProxy` with URL rewriting. The runner can wake a stopped container before proxying. On a route that can wake the sandbox (every one but execution `DELETE`), if the API's row says stopped and the registry says the runner is cordoned, the API doesn't proxy: it deletes the sandbox and answers `404`, so the client creates it again on another runner. For a runner that can't be reached, it deletes only the row. A delete the runner fails answers `503` and keeps the row.
+
+## Key Data Flows
+
+### Creating a Sandbox
+
+1. Client sends `POST /sandboxes` with API key
+2. API picks the eligible runner with the lowest reported `capacity_used`
+3. API calls `SandboxControl.CreateSandbox` on the selected runner (gRPC). A Firecracker runner with no free slot or under 5% free space on its data volume, or a runner of either kind with no room in its volume cache for a required volume, refuses before creating anything, with `ResourceExhausted` and an `ErrorInfo` detail (`sandbox-runner`/`CAPACITY_EXHAUSTED`) that tells the refusal from gRPC's own uses of that code. Only that refusal makes the API repeat steps 2–3 without the runner, up to three runners; it answers `503` when every runner tried refused or none is eligible. Any other runner error ends the create with `500`
+4. Runner creates the sandbox: a container from the sandbox image with resource limits and labels, or a microVM restored from the golden snapshot
+5. Runner waits for the daemon inside it to become healthy
+6. API stores the sandbox record (ID, tenant, status, runner assignment)
+7. API returns the sandbox ID and status to the client
+
+### Executing a Command
+
+1. Client sends `POST /sandboxes/{id}/executions` with command, env, and working directory
+2. API looks up the sandbox in the store, proxies the request to the runner's HTTP endpoint
+3. Runner proxies to the sandbox daemon's `/executions` (container IP on Docker, a host-local per-slot port on Firecracker) using a retry-aware exec proxy
+4. Daemon forks the process, streams stdout/stderr as NDJSON events
+5. Events stream back through the proxy chain to the client. If the runner→daemon connection drops mid-stream, the runner automatically resumes via `GET /executions/{exec_id}?follow=true&after=<seq>` (up to 3 retries)
+6. Client can poll `GET /sandboxes/{id}/executions/{exec_id}` or cancel with `DELETE`
+
+### File Operations
+
+File read, write, list, stat, copy, move, and delete follow the same two-hop reverse proxy path. The daemon performs all file system operations inside the container. Request body size is capped (default 10 MB).
+
+### Recovering a Crashed Guest
+
+A sandbox can lose its guest (daemon exit, kernel panic, OOM) without losing its files. Both backends bring it back on the next request and answer that request with `409 sandbox_restarted` instead of proxying it, because memory — running processes, execution history — is gone; the retry succeeds ([API.md](API.md#http-409-sandbox_restarted--the-sandbox-came-back-without-its-memory)). Each recovery increments `sandbox_recoveries_total`.
+
+**Firecracker.** The guest daemon is PID 1 with `panic=1 reboot=k`, and jailer execs Firecracker in place, so the process the runner waits on exits when the guest dies. A generation counter bumped before every deliberate kill tells that apart from a runner-initiated stop. The dead sandbox is torn down and releases its slot immediately (stopped, files intact, no usable snapshot), so an untouched crashed sandbox costs only disk. The next request wakes it by cold booting its own rootfs with the boot parameters recorded at create. Its stale snapshot is never restored: a memory image whose cached filesystem metadata predates later disk writes would corrupt the rootfs silently. A sandbox is pinned to cold boot from the moment its snapshot is restored, and only a clean stop (pause, then snapshot) lifts the pin. Cold boot keeps the files and skips the rootfs/snapshot clones that dominate a create.
+
+**Docker.** Containers run with `--restart unless-stopped`, so Docker restarts the container itself. The runner learns of the death from a `docker events` stream filtered to `die`; deliberate stops and removes are recorded before the call and matched against events, and exit codes are ignored (an exit `0` still lost everything running). The sandbox is reported not running until the wake path reapplies network policy to the possibly new container IP, waits for the daemon, and reports the restart. If the event stream drops, the watcher reconnects; a death missed meanwhile is served without its `409`.
+
+The report is spent by the first request that wakes the sandbox, so `DELETE /sandboxes/{id}/executions/{exec_id}` — which the SDK sends in the background after every command — returns `204` without waking a stopped sandbox, leaving the `409` for the next request a client reads.
+
+### Sandbox activity
+
+The idle sweeper stops and deletes sandboxes by `last_active_at`. Writing it on every request would put a database write on every response, and a burst to one sandbox would queue on its row. So each API replica collects the sandboxes it serves in memory and writes them in the background (`internal/api/activity.go`), all in one statement.
+
+**What counts:** an exec or file response from the sandbox, from when it starts until it ends. `GET /sandboxes/{id}`, `5xx` responses, runner redirects and runner "sandbox gone" answers do not.
+
+**When `last_active_at` is written**, with `T` = `SANDBOX_API_ACTIVITY_WRITE_INTERVAL` (5 s): every `T`, one statement per replica writes each sandbox it served since the last write. The time written is when its latest response started or ended or, while a response is still open, the time of the write; a response counts as open for at most `SANDBOX_API_MAX_RESPONSE_ACTIVITY` (30 min). A burst to one sandbox therefore costs one row per replica. The statement never moves `last_active_at` back, and it sets `status` to `running`. A request that wakes a stopped sandbox, or comes after a quiet spell, asks for the write at once instead of at the next `T`, so `GET` shows the sandbox running about one database round trip later. A failed write is retried at the next `T`. Writes never delay a response, and each gets up to `T`.
+
+**Why the idle windows grow by `2T` (10 s):** a request waits up to `T` for the next write, which takes up to `T`. So `last_active_at` trails the last use by at most `2T`, and the stop sweep and the `404` fence wait that much longer. Deletes wait `2T` twice, so that a request let through just before the fence is written before the sweeper looks. Two limits remain: the sweeper does not see a request until its write lands, which for a request after a quiet spell is usually one database round trip later; and while writes fail, nothing is written.
+
+### Tenant key cache
+
+Each API replica remembers tenant key lookups, unknown keys included, for `SANDBOX_API_KEY_CACHE_TTL` (15 s), keyed by the key's SHA-256 hash. Revoking a key or deleting its tenant clears it on that replica at once, also when another replica already deleted the tenant; other replicas accept it until their entry expires. Concurrent lookups of one key share one query, and errors are not cached. At 10,000 entries the cache drops the expired ones, or all of them when that frees less than a quarter. `SANDBOX_API_KEY_CACHE_TTL=0` turns all of this off: every request reads the store.
+
+## Security Model
+
+Trust boundaries, the mechanism enforcing each, and the non-guarantees are in [security-model.md](security-model.md). Certificates are bootstrapped locally with `scripts/bootstrap-mtls.sh` or managed in Kubernetes with cert-manager ([cert-manager-k8s.md](cert-manager-k8s.md)).
+
+## Data Storage
+
+### API store
+
+SQLite at `SANDBOX_API_DATA_DIR/api.db` (default) or Postgres. Tables: `sandboxes` (ID, tenant, status, timestamps, runner routing), `tenants`, `api_keys` (hashed), and on Postgres `runners` (heartbeats; SQLite keeps the runner registry in memory). Migrations run automatically on startup. The SQLite file uses WAL with `synchronous=NORMAL` unless `SANDBOX_API_SQLITE_WAL=false`.
+
+### Runner stateless
+
+Runners hold no persistent state. On startup each runtime removes every sandbox left over from a previous run and starts empty; sandboxes do not survive a runner restart.
+
+### Daemon In-Memory
+
+Execution results are held in memory as circular event buffers (default max 16 MiB per execution, retained for 10 minutes). No disk persistence.

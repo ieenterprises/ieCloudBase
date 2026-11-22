@@ -1,0 +1,1123 @@
+# Sandbox Service API
+
+All endpoints except `/healthz` and `/metrics` require the `X-Api-Key` header for authentication. `/metrics` is only exposed when `SANDBOX_API_METRICS_ENABLED=true` and is intended to be scraped over a private network; `SANDBOX_API_METRICS_LISTEN_ADDR` can move it to a port of its own, off the port that serves this API.
+
+Every limit — requests in progress, quotas, sizes, timeouts, idle windows — is in [limits.md](limits.md).
+
+### API keys and tenants
+
+There are four key classes:
+
+- `SANDBOX_API_KEYS` are admin keys. An admin key can create/list/delete any sandbox, manage tenants and mint tenant API keys via the admin API.
+- `SANDBOX_API_PROVISIONER_KEYS` are provisioner keys: `POST /admin/tenants`, `PATCH /admin/tenants/{id}` and `DELETE /admin/tenants/{id}` only, `403` everywhere else. Why the class exists and what it does not protect: [security-model.md](security-model.md#provisioner-keys).
+- `SANDBOX_API_SCALER_KEYS` are scaler keys: `GET /admin/runners` and `PUT`/`DELETE /admin/runners/{id}/cordon` only, `403` on every other path ([security-model.md](security-model.md#scaler-keys)).
+- Tenant keys are minted by an admin (or returned when a tenant is created). A tenant key may only create sandboxes for that tenant and may only list/get/delete/proxy its own sandboxes. Self-hosted operators can ignore tenant APIs entirely and keep using the admin key.
+
+Tenant keys are returned in plaintext once on create; only a hash is stored. Each API replica remembers a tenant key lookup for `SANDBOX_API_KEY_CACHE_TTL` (default `15s`), so a revoked key, or the key of a deleted tenant, can still be accepted by other replicas for up to that long.
+
+### Request tracing
+
+Every request carries a trace id through the API, the runner, and the runner's
+sandbox lifecycle events. Clients may send a [W3C `traceparent`](https://www.w3.org/TR/trace-context/#traceparent-header)
+header to join their own trace:
+
+```
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+```
+
+The header is optional. A missing or malformed value is replaced with a freshly
+generated trace context, and a value from a later spec version is reduced to the
+fields above, so a caller cannot make the service log or relay content of their
+choosing. The trace id is not returned in responses; it appears in the service's
+log events. See [observability.md](observability.md).
+
+---
+
+## Error Response Format
+
+```json
+{
+  "error": "string",
+  "code": 400
+}
+```
+
+### HTTP 503 (transient) vs 502 (not retryable)
+
+The API and runner use two buckets so clients (including the SDK) can decide **when to retry the same request** vs **when to change strategy** (e.g. create a new sandbox, fix routing, surface an error to the user).
+
+- **503 Service Unavailable** — **Transient / retry**: overload, no capacity yet, network or upstream not ready, or the sandbox daemon is not reachable *for the moment* while the container is otherwise expected to be usable. Safe to back off and retry the same operation.
+- **502 Bad Gateway** — **Not retryable as “wait and retry”**: the request does not make sense to repeat unchanged; fix state first (new sandbox, repair registry/routing, or handle the reported error). Examples: stored sandbox has **no runner HTTP base URL** or **delete** failed on the runner control plane.
+
+### HTTP 429 — too many requests in progress
+
+Two limits cap how many requests can be in progress at the same time. Neither is a rate.
+
+- **Per tenant**, in the API: all of a tenant's keys together, counted on each API replica. Admin keys are not counted.
+- **Per sandbox**, in the runner: exec and file requests, from all API replicas together.
+
+Their sizes are `SANDBOX_API_MAX_INFLIGHT_PER_TENANT` and `SANDBOX_RUNNER_MAX_INFLIGHT_PER_SANDBOX` in [configuration.md](configuration.md). A request over either is refused before it reaches the sandbox:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 1
+
+{"error":"too many requests in progress for this tenant","code":429,"reason":"tenant_request_limit"}
+```
+
+`reason` is `tenant_request_limit` or `sandbox_request_limit`; the per-sandbox body has no `code`. A stream counts until it ends, a create until the runner has finished it. Execution `DELETE`s have limits of their own, counted the same way: 16 per tenant and 4 per sandbox, so work can be cancelled while the others are full. Safe to retry after the delay.
+
+### HTTP 409 `sandbox_restarted` — the sandbox came back without its memory
+
+A sandbox whose guest crashed is recovered automatically by booting its existing filesystem. Files survive; everything that was in memory does not. The request that triggered the recovery waits for it, then fails with `409`, so the loss is reported once instead of silently:
+
+```
+HTTP/1.1 409 Conflict
+X-Sandbox-Restarted: 1
+
+{"error":"sandbox restarted after guest crash; state in memory was lost","reason":"sandbox_restarted"}
+```
+
+Retry once. The sandbox is already running when this arrives, so there is no `Retry-After` and nothing to wait for. Do not retry it silently: the point of the status is that the client learns its sandbox is not the one it left behind.
+
+Match on `X-Sandbox-Restarted: 1`, which survives both proxy hops and is listed in `Access-Control-Expose-Headers` so browser clients can read it, or on the body's `reason`, the only field that tells this `409` from any other. Do not look for a `code` in it: the runner writes this body and the API proxies it through untouched, so unlike the shape above it carries `error` and `reason` only, and the integer status appears in the status line alone. Every request the crash stranded sees it, since one recovery serves them all. Later requests are ordinary `200`s, and `status` in `GET /sandboxes/{id}` stays `running` throughout.
+
+What the client loses:
+
+- Running processes. A dev server or worker started by an earlier execution is dead and nothing restarts it; its files remain, so relaunch it.
+- Completed executions. History is in memory only, so `GET /sandboxes/{id}/executions/{exec_id}` returns `404 execution not found` even for a command that finished before the crash. `DELETE` of one returns `204` instead, since the crash already did what the delete asks for.
+- Idempotency of a caller-supplied `exec_id`. Re-posting an id that ran before the restart runs the command again instead of returning the earlier result.
+- Writes that had not reached the disk. On Firecracker the crash is a guest kernel panic, so it takes the guest page cache with it, and neither a shell redirect nor a write through the file routes flushes. A file written seconds before the crash can be missing or truncated where an older one is intact. Run `sync` in the sandbox if a write has to survive a crash it is racing.
+
+An ordinary wake from an idle stop stays transparent: no `409`, no header. On the Sysbox runtime that wake costs the same three things, because a stopped container is started again rather than resumed; on Firecracker an idle stop snapshots the paused guest, so memory does survive it. The `409` is not what tells them apart — `status` is. An idle stop sets `status` to `stopped`, so a client can see it in `GET /sandboxes/{id}` and know what it lost, whereas a crash leaves `status` at `running`. The `409` exists for the case that has no other signal. An ephemeral sandbox never reaches `stopped`; it is deleted instead (see `ephemeral` under `POST /sandboxes`).
+
+**404** `sandbox not found` — Unknown id, the sandbox is past its idle delete-after wake window (`SANDBOX_API_IDLE_DELETE_AFTER`, default `24h`; the idle-stop window for an ephemeral sandbox, see `POST /sandboxes`), the sandbox was stopped on a [cordoned](#put-adminrunnersidcordon--delete-adminrunnersidcordon) runner and the request would have woken it, or the runner no longer tracks the sandbox (delete or runner restart). On exec/file proxy routes, when the runner signals sandbox gone (`X-Sandbox-Gone: 1`), the API removes the store row so subsequent `GET /sandboxes/{id}` also returns 404. Other runner **404** responses (for example `execution not found` or missing file paths) do **not** delete the sandbox. Exec and file routes may return **503** or **502** from the runner after the API successfully reaches the runner; the API may return **503** `runner unavailable` before the runner is contacted.
+
+---
+
+## Endpoints
+
+### GET /healthz
+
+Health check. No authentication required.
+
+**Response:** `200 OK`
+
+```json
+{"status": "ok"}
+```
+
+**Example:**
+
+```bash
+curl http://localhost:8080/healthz
+```
+
+---
+
+### GET /metrics
+
+Prometheus exposition of the API's metrics. Only mounted when `SANDBOX_API_METRICS_ENABLED=true`; bypasses `X-Api-Key` so a scraper can reach it. Firewall the listener or front it with a private LB.
+
+Served on the port that serves this API unless `SANDBOX_API_METRICS_LISTEN_ADDR` names another one, in which case a dedicated listener serves it and this path is a `404` here. See [configuration.md](configuration.md#metrics).
+
+Metric families include:
+
+- `sandbox_http_requests_total{role,route,method,status}` — request counter; `route` is the matched route pattern (e.g. `/sandboxes/{id}`), not the raw path.
+- `sandbox_http_request_duration_seconds{role,route,method}` — request latency histogram.
+- `sandbox_sandbox_operations_total{role="api",operation,result}` — sandbox lifecycle ops (`create`, `delete`, `cordon_delete`).
+- `sandbox_create_placements_total{role="api",result}` — how each create found a runner that did not refuse it for capacity: `first_choice`, or `retried` after a refusal; or found none: `exhausted` (every runner tried refused) or `no_runner` (none eligible). Whether the create then succeeded is in `sandbox_sandbox_operations_total`.
+- `sandbox_sandboxes_active{role="api"}` — current sandbox count from the store.
+- `sandbox_runners_registered{role="api"}` — runners registered with the API.
+- `sandbox_tls_certificate_expiry_timestamp_seconds{role="api",path}` — expiry of each TLS certificate the API presents, by file.
+- `go_*` and `process_*` — Go runtime and process collectors.
+
+**Response:** `200 OK` with `Content-Type: text/plain; version=0.0.4`.
+
+**Example:**
+
+```bash
+curl http://localhost:8080/metrics
+# with SANDBOX_API_METRICS_LISTEN_ADDR=127.0.0.1:9100
+curl http://127.0.0.1:9100/metrics
+```
+
+---
+
+### GET /sandboxes
+
+List sandboxes, ordered by creation time (newest first).
+
+- Admin key: all sandboxes, or one owner's with `?tenant_id=`
+- Tenant key: only sandboxes owned by that tenant
+
+Sandboxes past their idle-delete window stay listed until the sweeper removes them, even though `GET /sandboxes/{id}` already returns `404` for them.
+
+**Query parameters:**
+
+- `tenant_id` (admin only) — a tenant UUID, or `__admin__` for sandboxes created with an admin key. An unknown tenant yields `[]`.
+
+**Response:** `200 OK`
+
+```json
+[
+  {
+    "id": "uuid",
+    "status": "string",
+    "created_at": 1700000000,
+    "last_active_at": 1700000000,
+    "ephemeral": false,
+    "egress": "public",
+    "tenant_id": "uuid"
+  }
+]
+```
+
+`tenant_id` is the owning tenant, or `__admin__` for an admin-owned sandbox. A tenant key only ever sees its own id.
+
+**Errors:** `400` `tenant_id` is neither a UUID nor `__admin__`, or is given more than once, `403` `tenant_id` sent with a tenant key
+
+**Examples:**
+
+```bash
+curl http://localhost:8080/sandboxes \
+  -H "X-Api-Key: YOUR_API_KEY"
+
+# One tenant's sandboxes (admin key)
+curl "http://localhost:8080/sandboxes?tenant_id=0f0e0d0c-0000-4000-8000-000000000001" \
+  -H "X-Api-Key: ADMIN_KEY"
+```
+
+---
+
+### POST /sandboxes
+
+Create a sandbox. With no request body, the service generates a UUID. Callers may instead supply a lowercase UUID to create or reconnect to a deterministic sandbox:
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+If that ID still belongs to the caller and is within its idle-delete window, the existing sandbox is returned, or `409` if the request names an `egress` that differs from the sandbox's. If it has passed the window, the stale sandbox is deleted before the ID is reused. If the ID belongs to another tenant (or to admin when the caller is a tenant), the request fails with `409`.
+
+Disconnecting before the response does not cancel a create a runner has accepted: if it succeeds, the sandbox is still created and tracked, and can be found by listing or by repeating the request with the same `id`. A disconnect after a runner refused it (below) ends the create with nothing created.
+
+The sandbox goes to the eligible runner with the lowest reported `capacity_used`. A full runner refuses before creating anything, and the API tries the next one: up to three runners, none started more than 5 seconds after the first. Any other runner error ends the create with `500`. When every runner tried refuses, the answer is:
+
+```
+HTTP/1.1 503 Service Unavailable
+Retry-After: 1
+
+{"error":"sandbox runners are at capacity","code":503,"reason":"no_capacity"}
+```
+
+When no runner is eligible, it is the same except for `error`: `no sandbox runners are registered or available`. Either way nothing was created, so the request is safe to repeat even without an `id`. Match on `reason`.
+
+**Request body fields** (all optional):
+
+- `id` — lowercase UUID to create or reconnect to, as above.
+- `ephemeral` (boolean, default `false`) — delete the sandbox, instead of stopping it, once it has been idle for `SANDBOX_API_IDLE_STOP_AFTER` (default `1h`; `SANDBOX_API_IDLE_DELETE_AFTER` when idle stop is disabled, never when both are `0`). It never reports `status: "stopped"`; once the window has passed, `GET`, exec and file requests return `404` and the sweeper removes it. Fixed at creation: reconnecting to an existing `id` keeps the value it was created with.
+
+```json
+{
+  "ephemeral": true
+}
+```
+
+- `egress` (string, default `"public"`) — outbound network policy. `"public"`: the internet, minus the [blocked destinations](security-model.md#guest-to-host-and-network). `"none"`: nothing leaves the sandbox, DNS included; the API still reaches it. Fixed at creation: a reconnect to an existing `id` that names a different mode is refused with `409`, so a caller asking for `"none"` never gets an open sandbox back.
+
+Unknown fields return `400`.
+
+With a tenant key, the sandbox is owned by that tenant and counts toward the tenant's `max_sandboxes` quota (`403` when exceeded). With an admin key, the sandbox is stored with `tenant_id` `__admin__` (admin-owned; not visible to tenant keys; admins see all sandboxes in list).
+
+The quota holds under concurrent creates. Before the runner call, each API pod counts the tenant's saved sandboxes plus its own creates still in progress, so on one pod no create past the quota reaches a runner while the quota stays the same. The quota is checked again when the sandbox is saved, where a tenant's creates are counted one at a time. That check catches a burst spread over several API pods and a quota lowered during a create. A create refused there was already made on a runner; the API deletes it there before the `403`, and if that delete fails, the sandbox stays on the runner untracked. Either way the tenant can briefly hold more sandboxes on runners than its quota.
+
+Resource limits (memory, CPU, process count) are configured on the runner via environment variables.
+
+**Response:** `201 Created` for a new sandbox, or `200 OK` when returning an existing caller-supplied sandbox
+
+```json
+{
+  "id": "uuid",
+  "status": "string",
+  "created_at": 1700000000,
+  "last_active_at": 1700000000,
+  "ephemeral": false,
+  "egress": "public",
+  "tenant_id": "uuid"
+}
+```
+
+**Errors:** `400` invalid request body, supplied id or `egress` value, `403` tenant sandbox quota exceeded (when creates on other API pods filled it first, the runner create is rolled back), `409` if the supplied id is owned by another tenant/admin, exists with a different `egress` than requested, or the tenant was deleted before the sandbox row could be stored (runner create is rolled back), `429` [too many requests in progress](#http-429--too-many-requests-in-progress), `502` stale sandbox cleanup failed, or the runner did not confirm the requested `egress` (runner create is rolled back; a runner from before egress modes only serves `public`), `503` `no_capacity`: no runner is eligible or has room (see above)
+
+**Examples:**
+
+```bash
+# Server-generated ID
+curl -X POST http://localhost:8080/sandboxes \
+  -H "X-Api-Key: YOUR_API_KEY"
+
+# Caller-supplied deterministic ID
+curl -X POST http://localhost:8080/sandboxes \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"550e8400-e29b-41d4-a716-446655440000"}'
+
+# Ephemeral
+curl -X POST http://localhost:8080/sandboxes \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"ephemeral":true}'
+
+# No egress
+curl -X POST http://localhost:8080/sandboxes \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"egress":"none"}'
+```
+
+---
+
+### GET /sandboxes/{id}
+
+Get sandbox details.
+
+This is a read-only status check: it does not update `last_active_at` or extend idle timers. Only proxied traffic (exec, files, etc.) counts as activity, and only when the sandbox actually serves it — a request that fails with **502** or **503** leaves `last_active_at` and `status` untouched, so retrying against a broken sandbox cannot hold it open past its idle timers. A **4xx** still counts, since the sandbox was reachable and rejected the request — except a runner sandbox-gone **404**, which never counts as activity even if removing the store row fails. A response counts until it ends, for at most `SANDBOX_API_MAX_RESPONSE_ACTIVITY` (default `30m`), so, while the API can write to its database, a sandbox is not stopped under an exec stream that is open for less than that, once the stream's first write has landed.
+
+Each API replica writes `last_active_at` every `SANDBOX_API_ACTIVITY_WRITE_INTERVAL` (default `5s`), so it can trail the last request by up to twice that; the idle stop window and the `404` fence are extended by that much, deletes by twice that ([how](architecture.md#sandbox-activity)). A wake asks for a write at once rather than at the next interval, so `status` reads `running` as soon as that write lands.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Response:** `200 OK`
+
+```json
+{
+  "id": "uuid",
+  "status": "string",
+  "created_at": 1700000000,
+  "last_active_at": 1700000000,
+  "ephemeral": false,
+  "egress": "public",
+  "tenant_id": "uuid"
+}
+```
+
+`status` is `running` or `stopped`; an ephemeral sandbox is only ever `running`. `egress` is the mode the sandbox was created with. `tenant_id` is the owner, `__admin__` for an admin-owned sandbox.
+
+**Errors:** `400` invalid id, `404` not found
+
+**Example:**
+
+```bash
+curl http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000 \
+  -H "X-Api-Key: YOUR_API_KEY"
+```
+
+---
+
+### DELETE /sandboxes/{id}
+
+Delete a sandbox.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Response:** `204 No Content`
+
+**Errors:** `400` invalid id, `404` sandbox not found (unknown id, already deleted, or not owned by the caller — same status as `GET` so tenants cannot probe cross-tenant existence)
+
+**Example:**
+
+```bash
+curl -X DELETE http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000 \
+  -H "X-Api-Key: YOUR_API_KEY"
+```
+
+---
+
+### POST /sandboxes/{id}/executions
+
+Execute a command in a sandbox. The command runs in a **daemon-side execution** whose
+lifetime is independent of the HTTP stream — disconnecting only stops the event stream,
+it does not kill the process; cancel with `DELETE /sandboxes/{id}/executions/{exec_id}`
+(the SDK does this when `abortSignal` fires). Response is streamed as newline-delimited JSON.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Request Body:**
+
+```json
+{
+  "command": "echo hello",
+  "env": {"KEY": "value"},
+  "workdir": "/home",
+  "timeout_ms": 300000,
+  "exec_id": "client-generated-uuid"
+}
+```
+
+| Field              | Type              | Required | Default        |
+|--------------------|-------------------|----------|----------------|
+| `command`          | string            | yes      |                |
+| `env`              | map[string]string | no       | `{}`           |
+| `workdir`          | string            | no       | `""`           |
+| `timeout_ms`       | int64             | no       | `300000` (5m)  |
+| `exec_id`          | string            | no       | generated UUID |
+
+`timeout_ms` may not exceed `SANDBOX_RUNNER_MAX_EXEC_TIMEOUT` ([configuration.md](configuration.md#shared-runner-config)); a larger value gets `400` naming the maximum.
+
+The command is always executed via `/bin/sh -c` so that shell features (tilde expansion,
+pipes, redirects, etc.) work consistently.
+
+`env` accepts an object of key-value pairs: `{"KEY": "VALUE"}`.
+
+**Sandbox environment.** A command starts with `HOME=/home/user` and this `PATH`:
+
+```
+/home/user/venv/bin:/home/user/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+```
+
+`env` layers on top, so a supplied `PATH` replaces this one.
+
+A sandbox has no root and no `sudo`, so `apt-get` does not work. Install packages
+unprivileged instead. Each command below writes only under `/home/user`:
+
+| To install | Run |
+| --- | --- |
+| A PyPI package | `pip install <name>` — `python3` and `pip` come from the virtual environment at `/home/user/venv` |
+| A global npm package | `npm install -g <name>` — writes to `/home/user/.npm-global`, whose `bin` is on `PATH` |
+| A project npm package | `npm install <name>` in the project directory |
+
+The image carries a C and C++ compiler, `make` and the Python headers, so a
+source build works too. It carries no other library's development headers, and a
+sandbox cannot add them.
+
+`exec_id`, when provided, sets the execution identifier. If an execution with that ID
+already exists, the response follows it instead of starting a new command. This lets the
+client define the ID upfront and resume even if the initial connection drops before any
+events are received. If omitted, the server generates a UUID.
+
+**Response:** `200 OK` — `Content-Type: application/x-ndjson`
+
+**Response Headers:**
+- `X-Exec-Id` — The execution identifier (either the client-supplied `exec_id` or the server-generated UUID). Useful for resuming via the GET endpoint if the stream disconnects before the `started` event arrives.
+
+Stream of JSON objects, one per line. The first event is always a `started` event:
+
+```jsonl
+{"seq": 0, "type": "started", "exec_id": "a1b2c3d4-..."}
+{"seq": 1, "type": "stdout", "data": "hello\n"}
+{"seq": 2, "type": "stderr", "data": "warning: ..."}
+{"seq": 3, "type": "exit", "exit_code": 0, "success": true, "execution_time_ms": 42, "timed_out": false, "killed": false}
+```
+
+All events include a monotonically increasing `seq` number. The `started` event provides
+the `exec_id` needed for the resume and cancel endpoints.
+
+Each `stdout` and `stderr` event usually holds one line. An output line longer than 64 KiB
+is sent as several events, and only the last one ends with `\n`. `stdout` and `stderr`
+events can interleave, so append the `data` of each event to a separate buffer for its
+`type`.
+
+The `exit` event includes:
+- `success` — `true` when `exit_code == 0`
+- `execution_time_ms` — wall-clock execution time in milliseconds
+- `timed_out` — `true` if the process was killed due to timeout
+- `killed` — `true` if the process was terminated by a signal
+
+The runner retries mid-stream disconnects from the daemon transparently (resume via the
+daemon's `GET /executions/{exec_id}?follow=true&after=<seq>`, up to 3 retries with
+exponential backoff from 50 ms). If those retries are exhausted the response body simply
+ends; the status line was already `200 OK`, so **a stream that ends without an `exit` or
+`error` event has not completed** — treat it as a failure, not an empty result. The same
+applies when the client↔API connection drops.
+
+Recovery is the client's job: the execution outlives the stream, so reconnect with
+`GET /sandboxes/{id}/executions/{exec_id}?after=<last seq>&follow=true`. The SDK does this
+automatically (up to 10 attempts, 250 ms apart) and throws `SandboxServiceError` if the
+execution still has not produced an `exit` event.
+
+Events are kept in a bounded buffer (16 MiB per execution; completed executions are
+retained for 10 minutes — see `SANDBOX_EXEC_*` in [configuration.md](configuration.md#sandbox-daemon)).
+When the buffer is exhausted, old events are discarded and stale resume requests return `410 Gone`.
+
+**Errors:** `400` invalid id, missing command or `timeout_ms` above the maximum, `404` sandbox not found, `410` if execution exists but history is no longer retained, `429` too many requests in progress (see [HTTP 429](#http-429--too-many-requests-in-progress)). Transient failures use **503**; **502** means the sandbox is not usable without a client-side change — see [HTTP 503 (transient) vs 502 (not retryable)](#http-503-transient-vs-502-not-retryable).
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/executions \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"command": "echo hello", "timeout_ms": 10000}'
+```
+
+---
+
+### GET /sandboxes/{id}/executions/{exec_id}
+
+Resume or replay an execution stream. Use this to reconnect after a transient
+stream disconnect without re-executing the command.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+- `exec_id` — Execution ID (from the `started` event)
+
+**Query Parameters:**
+- `after` — Sequence number; only events with `seq > after` are returned (default: all events)
+- `follow` — `true` to keep the stream open until the command finishes (default: `false`)
+
+When `follow=false`, the endpoint returns retained events as a one-shot snapshot.
+When `follow=true`, it streams events until an `exit` or `error` event is sent,
+or the client disconnects.
+
+**Response:** `200 OK` — `Content-Type: application/x-ndjson`
+
+Same NDJSON event format as `POST /sandboxes/{id}/executions`.
+
+**Errors:** `400` invalid parameters, `404` execution not found, `410` requested history is no longer retained, `429` [too many requests in progress](#http-429--too-many-requests-in-progress)
+
+**Example:**
+
+```bash
+# Resume from sequence 5
+curl "http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/executions/a1b2c3d4-...?after=5&follow=true" \
+  -H "X-Api-Key: YOUR_API_KEY"
+```
+
+---
+
+### DELETE /sandboxes/{id}/executions/{exec_id}
+
+Delete an execution. Kills the running process (if still active) and immediately
+removes the execution state from memory. After deletion, the execution can no
+longer be resumed or queried. The operation is idempotent — deleting a
+nonexistent execution returns `204`.
+
+This is the one sandbox route that never wakes a stopped sandbox. An execution
+lives only in the guest's memory, so a sandbox that is stopped, or that was
+restarted after a crash, has already lost it and the runner answers `204` without
+starting anything. It therefore never returns `409 sandbox_restarted` either, and
+never spends the one restart report a crash gets — that report is kept for the next
+request a client actually reads. The SDK relies on this: it deletes an execution in
+the background after every command and discards the answer.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+- `exec_id` — Execution ID (from the `started` event)
+
+**Response:** `204 No Content`
+
+**Errors:** `400` invalid id, `404` sandbox not found, `429` past this route's own limits (see [HTTP 429](#http-429--too-many-requests-in-progress)), `503` if the sandbox does not answer within 10 seconds
+
+**Example:**
+
+```bash
+curl -X DELETE http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/executions/a1b2c3d4-... \
+  -H "X-Api-Key: YOUR_API_KEY"
+```
+
+---
+
+### GET /sandboxes/{id}/files
+
+List files in a sandbox directory.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Query Parameters:**
+- `path` — Directory path (default: `/`)
+- `recursive` — `true` to list recursively (default: `false`)
+- `extension` — Filter by file extension, e.g. `.ts` (default: none)
+
+**Response:** `200 OK`
+
+```json
+[
+  {
+    "name": "file.txt",
+    "size": 1024,
+    "is_dir": false,
+    "type": "file",
+    "mod_time": "2024-01-01T00:00:00Z"
+  }
+]
+```
+
+**Errors:** `400` invalid id, `404` directory not found, `429` [too many requests in progress](#http-429--too-many-requests-in-progress)
+
+**Example:**
+
+```bash
+curl "http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/files?path=/home&recursive=true&extension=.ts" \
+  -H "X-Api-Key: YOUR_API_KEY"
+```
+
+---
+
+### GET /sandboxes/{id}/files/content
+
+Download a file from a sandbox.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Query Parameters:**
+- `path` — File path (required)
+
+**Response:** `200 OK` — `Content-Type: application/octet-stream`
+
+Raw file contents.
+
+**Errors:** `400` invalid id or missing path, `404` file not found, `429` [too many requests in progress](#http-429--too-many-requests-in-progress)
+
+**Example:**
+
+```bash
+curl "http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/files/content?path=/home/user/file.txt" \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -o file.txt
+```
+
+---
+
+### PUT /sandboxes/{id}/files
+
+Upload (write) a file to a sandbox.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Query Parameters:**
+- `path` — Destination file path (required)
+- `overwrite` — `false` to prevent overwriting existing files (default: `true`)
+
+**Request:**
+- `Content-Type: application/octet-stream`
+- Body: raw file contents
+- Max size: 10 MB (configurable via `SANDBOX_API_MAX_FILE_BYTES`)
+
+**Response:** `200 OK`
+
+**Errors:** `400` invalid id or missing path, `409` file exists (when `overwrite=false`), `429` [too many requests in progress](#http-429--too-many-requests-in-progress)
+
+**Example:**
+
+```bash
+curl -X PUT "http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/files?path=/home/user/file.txt" \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @local-file.txt
+```
+
+---
+
+### POST /sandboxes/{id}/files/archive
+
+Write many files in one request from a tar archive, plain or gzip-compressed. Parent directories are created and existing files are overwritten, as with `PUT /sandboxes/{id}/files`.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Query Parameters:**
+- `path` — Directory to unpack into (required); created if missing
+
+**Request:**
+- `Content-Type: application/x-tar` or `application/gzip`; gzip is recognised from the body, not the header
+- Body: a tar archive whose entry paths are relative to `path`
+- Max size: 10 MB, compressed (configurable via `SANDBOX_API_MAX_FILE_BYTES`)
+
+Only regular files and directories are accepted. An entry with an absolute path or a `..` component, a link, device, FIFO or sparse file, or a path that resolves outside `path` (for example through a symlink already in the sandbox) is refused with `400` naming the entry. Modes, owners and times in the archive are ignored: new files get `0644` and new directories `0755`, while existing ones keep theirs, as with `PUT /sandboxes/{id}/files`.
+
+Entries are written in order. The first one that fails stops the request, and the entries before it stay written. Only the sandbox's disk limits how much an archive unpacks to, as for any other write.
+
+**Response:** `200 OK` with the number of regular files written and their total size.
+
+```json
+{"files": 150, "bytes": 123456}
+```
+
+**Errors:** `400` invalid id, missing path, unreadable archive or refused entry, `404` sandbox not found, `429` [too many requests in progress](#http-429--too-many-requests-in-progress)
+
+**Example:**
+
+```bash
+tar -czf - -C ./kb . | curl -X POST "http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/files/archive?path=/home/user/kb" \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/gzip" \
+  --data-binary @-
+```
+
+---
+
+### POST /sandboxes/{id}/files
+
+Append data to a file in a sandbox. Creates the file if it doesn't exist.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Query Parameters:**
+- `path` — File path (required)
+
+**Request:**
+- `Content-Type: application/octet-stream`
+- Body: raw data to append
+- Max size: 10 MB (configurable via `SANDBOX_API_MAX_FILE_BYTES`)
+
+**Response:** `200 OK`
+
+**Errors:** `400` invalid id or missing path, `404` path not found, `429` [too many requests in progress](#http-429--too-many-requests-in-progress)
+
+**Example:**
+
+```bash
+curl -X POST "http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/files?path=/home/user/log.txt" \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary "new log line\n"
+```
+
+---
+
+### DELETE /sandboxes/{id}/files
+
+Delete a file or directory from a sandbox.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Query Parameters:**
+- `path` — File or directory path (required)
+- `recursive` — `true` to remove non-empty directories (default: `false`)
+- `force` — `true` to ignore "not found" errors (default: `false`)
+
+**Response:** `204 No Content`
+
+**Errors:** `400` invalid id or missing path, `429` [too many requests in progress](#http-429--too-many-requests-in-progress)
+
+**Example:**
+
+```bash
+curl -X DELETE "http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/files?path=/home/user/dir&recursive=true&force=true" \
+  -H "X-Api-Key: YOUR_API_KEY"
+```
+
+---
+
+### POST /sandboxes/{id}/files/copy
+
+Copy a file or directory within a sandbox.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Request Body:**
+
+```json
+{
+  "src": "/home/user/file.txt",
+  "dest": "/home/user/file-copy.txt",
+  "recursive": false,
+  "overwrite": false
+}
+```
+
+| Field       | Type   | Required | Default |
+|-------------|--------|----------|---------|
+| `src`       | string | yes      |         |
+| `dest`      | string | yes      |         |
+| `recursive` | bool   | no       | `false` |
+| `overwrite` | bool   | no       | `false` |
+
+**Response:** `200 OK`
+
+**Errors:** `400` invalid id, missing src/dest, `404` source not found, `409` destination exists, `429` [too many requests in progress](#http-429--too-many-requests-in-progress)
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/files/copy \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"src": "/home/file.txt", "dest": "/tmp/file.txt", "overwrite": true}'
+```
+
+---
+
+### POST /sandboxes/{id}/files/move
+
+Move (rename) a file or directory within a sandbox.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Request Body:**
+
+```json
+{
+  "src": "/home/user/old.txt",
+  "dest": "/home/user/new.txt",
+  "overwrite": false
+}
+```
+
+| Field       | Type   | Required | Default |
+|-------------|--------|----------|---------|
+| `src`       | string | yes      |         |
+| `dest`      | string | yes      |         |
+| `overwrite` | bool   | no       | `false` |
+
+**Response:** `200 OK`
+
+**Errors:** `400` invalid id, missing src/dest, `404` source not found, `409` destination exists, `429` [too many requests in progress](#http-429--too-many-requests-in-progress)
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/files/move \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"src": "/home/old.txt", "dest": "/home/new.txt"}'
+```
+
+---
+
+### POST /sandboxes/{id}/mkdir
+
+Create a directory in a sandbox.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Query Parameters:**
+- `path` — Directory path (required)
+- `recursive` — `true` to create parent directories as needed (default: `false`)
+
+**Response:** `201 Created`
+
+**Errors:** `400` invalid id or missing path, `409` directory already exists, `429` [too many requests in progress](#http-429--too-many-requests-in-progress)
+
+**Example:**
+
+```bash
+curl -X POST "http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/mkdir?path=/home/user/newdir&recursive=true" \
+  -H "X-Api-Key: YOUR_API_KEY"
+```
+
+---
+
+### GET /sandboxes/{id}/stat
+
+Get file or directory metadata.
+
+**Path Parameters:**
+- `id` — Sandbox UUID
+
+**Query Parameters:**
+- `path` — File or directory path (required)
+
+**Response:** `200 OK`
+
+```json
+{
+  "name": "file.txt",
+  "path": "/home/user/file.txt",
+  "type": "file",
+  "size": 1024,
+  "created_at": "2024-01-01T00:00:00Z",
+  "modified_at": "2024-01-01T00:00:00Z"
+}
+```
+
+`exists()` can be derived: a `200` means the file exists, a `404` means it doesn't.
+
+**Errors:** `400` invalid id or missing path, `404` file not found, `429` [too many requests in progress](#http-429--too-many-requests-in-progress)
+
+**Example:**
+
+```bash
+curl "http://localhost:8080/sandboxes/550e8400-e29b-41d4-a716-446655440000/stat?path=/home/user/file.txt" \
+  -H "X-Api-Key: YOUR_API_KEY"
+```
+
+---
+
+## Code sandboxes
+
+Sandboxes for the code execution. Admin and tenant keys; provisioner and scaler keys get `403`, and a missing or unknown key gets `401`. With an admin key the sandbox is owned by `__admin__`, a single tenant for all admin keys.
+
+The `/sandboxes` routes do not serve code sandboxes: they answer `404` for a code sandbox's id, leave code sandboxes out of `GET /sandboxes`, and `POST /sandboxes` answers `409` for an id a code sandbox has.
+
+### POST /code/sandboxes
+
+Return the current code sandbox of a name, or create one. The client picks the name and the service picks the `id`.
+
+```json
+{
+  "name": "550e8400-e29b-41d4-a716-446655440000",
+  "runtime": "n8n-js",
+  "runtimeVersion": "2.42.0",
+  "maxConcurrency": 2,
+  "memoryMb": 1024,
+  "idleTimeoutMs": 30000,
+  "maxAgeMs": 60000
+}
+```
+
+**Request body fields:**
+
+- `name` (required) — 1 to 128 characters from `A-Z`, `a-z`, `0-9`, `.`, `_`, `:` and `-`. A name points to at most one current sandbox per tenant. Other tenants can use the same name.
+- `runtime` (required) — `n8n-js` or `n8n-python`.
+- `runtimeVersion` (required) — up to 64 characters from `A-Z`, `a-z`, `0-9`, `.`, `+` and `-`.
+- `maxConcurrency` (required) — number of lanes, greater than `0`. A lane runs one task at a time.
+- `memoryMb` (required) — greater than `0`.
+- `idleTimeoutMs`, `maxAgeMs` (optional) — `0` or more; `0` or left out means not set.
+
+Unknown fields return `400`. The service stores these settings but does not apply them yet. Every code sandbox has egress `none` and is ephemeral (see `POST /sandboxes`).
+
+A create for a name that already has a current sandbox returns that sandbox with `200` if the settings are equal. If any setting differs, it returns `409` with reason `sandbox_settings_mismatch`. Concurrent creates of one name get the same sandbox. If two API replicas create it at the same time, the one saved second is deleted from its runner. A sandbox past its idle window is deleted, and the name gets a new sandbox.
+
+With a tenant key, the sandbox counts toward the tenant's `max_sandboxes` quota. Placement and the `503` `no_capacity` answer work as for `POST /sandboxes`.
+
+**Response:** `201 Created` for a new sandbox, `200 OK` for the current sandbox of the name
+
+```json
+{
+  "id": "uuid",
+  "name": "550e8400-e29b-41d4-a716-446655440000",
+  "created": true,
+  "state": "ready"
+}
+```
+
+**Errors:** `400` invalid request body, `401` missing or unknown API key, `403` provisioner or scaler key, or tenant sandbox quota exceeded, `409` `sandbox_settings_mismatch` or tenant deleted, `429` [too many requests in progress](#http-429--too-many-requests-in-progress), `502` the runner did not confirm egress `none` or deleting a sandbox past its idle window failed, `503` `no_capacity`, or the name moved to another sandbox during the create (retry)
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8080/code/sandboxes \
+  -H "X-Api-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"scope-1","runtime":"n8n-js","runtimeVersion":"2.42.0","maxConcurrency":2,"memoryMb":1024}'
+```
+
+---
+
+## Admin: tenants and API keys
+
+All `/admin/*` routes require an admin API key (`SANDBOX_API_KEYS`) unless marked "Admin or provisioner" or "Admin or scaler". Any other key receives `403`.
+
+### GET /admin/tenants
+
+Admin only. List tenants.
+
+**Response:** `200 OK`
+
+```json
+[
+  {
+    "id": "uuid",
+    "name": "string",
+    "external_ref": "string",
+    "max_sandboxes": 50,
+    "created_at": 1700000000
+  }
+]
+```
+
+### POST /admin/tenants
+
+Admin or provisioner. Create a tenant. By default also mints one API key (`create_key` defaults to `true`).
+
+**Request body (optional):**
+
+```json
+{
+  "name": "my-instance",
+  "external_ref": "n8n-instance-id",
+  "max_sandboxes": 50,
+  "create_key": true
+}
+```
+
+| Field          | Type   | Required | Default |
+|----------------|--------|----------|---------|
+| `name`         | string | no       | `""` |
+| `external_ref` | string | no       | `""` |
+| `max_sandboxes`| int    | no       | `SANDBOX_API_DEFAULT_MAX_SANDBOXES` (`50`) |
+| `create_key`   | bool   | no       | `true` |
+
+`name` is an optional human-readable label. `external_ref` is an optional opaque id from the caller (for example an n8n instance id); the API does not enforce uniqueness. Unknown fields return `400`.
+
+`max_sandboxes` is the per-tenant sandbox quota (`0` = unlimited). Must be between `0` and `2147483647`. When omitted, the service default applies. With a provisioner key an explicit value must be between `1` and `SANDBOX_API_DEFAULT_MAX_SANDBOXES`; `0` and larger values return `400`.
+
+**Response:** `201 Created`
+
+```json
+{
+  "tenant": {
+    "id": "uuid",
+    "name": "my-instance",
+    "external_ref": "n8n-instance-id",
+    "max_sandboxes": 50,
+    "created_at": 1700000000
+  },
+  "key": {
+    "id": "uuid",
+    "tenant_id": "uuid",
+    "prefix": "a1b2c3d4",
+    "created_at": 1700000000,
+    "api_key": "sbk_a1b2c3d4_…"
+  }
+}
+```
+
+The plaintext `api_key` is only returned on create. Store it securely.
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8080/admin/tenants \
+  -H "X-Api-Key: ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"cloud-instance-1","external_ref":"inst_123"}'
+```
+
+### GET /admin/tenants/{id}
+
+Admin only. Get a tenant by id.
+
+### PATCH /admin/tenants/{id}
+
+Admin or provisioner. Change a tenant's limits. A provisioner key may change any tenant, not only the ones it created.
+
+**Request body:**
+
+```json
+{
+  "max_sandboxes": 20
+}
+```
+
+`max_sandboxes` is required and has the same bounds as on [create](#post-admintenants): `0`…`2147483647` with an admin key, `1`…`SANDBOX_API_DEFAULT_MAX_SANDBOXES` with a provisioner key. Unknown fields return `400`.
+
+The tenant's sandboxes are never touched. If the new limit is below the tenant's current count, creating a new sandbox returns `403` until the tenant is below it again.
+
+**Response:** `200 OK` with the updated tenant, as `GET /admin/tenants/{id}` returns it.
+
+```json
+{
+  "id": "uuid",
+  "name": "my-instance",
+  "external_ref": "n8n-instance-id",
+  "max_sandboxes": 20,
+  "created_at": 1700000000
+}
+```
+
+**Errors:** `400` invalid tenant id, invalid body, or `max_sandboxes` missing or out of bounds, `403` tenant key, `404` tenant not found
+
+**Example:**
+
+```bash
+curl -X PATCH http://localhost:8080/admin/tenants/0f0e0d0c-0000-4000-8000-000000000001 \
+  -H "X-Api-Key: PROVISIONER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"max_sandboxes":20}'
+```
+
+### DELETE /admin/tenants/{id}
+
+Admin or provisioner. Delete a tenant and its API keys (`204`).
+
+Fails with `409 Conflict` if the tenant still owns sandboxes — delete those first with an admin key or the tenant's own key; a provisioner key cannot. This avoids orphaning running sandboxes after credentials are removed.
+
+`DeleteTenant` locks the tenant row while checking ownership and deleting, and tenant sandbox `Create` takes the same lock before insert. That closes the race where a sandbox create is in flight (runner VM already started, store row not yet written) while delete sees an empty count.
+
+### GET /admin/tenants/{id}/keys
+
+Admin only. List API key metadata for a tenant (no plaintext secrets).
+
+### POST /admin/tenants/{id}/keys
+
+Admin only. Mint an additional API key for the tenant. Returns plaintext `api_key` once (`201`).
+
+### DELETE /admin/tenants/{id}/keys/{keyId}
+
+Admin only. Revoke an API key (`204`). The API replica that handles the revoke rejects the key from the next request on; other replicas may still accept it for up to `SANDBOX_API_KEY_CACHE_TTL` (default `15s`). Exec streams that are already open keep running.
+
+---
+
+## Admin: runners
+
+### GET /admin/runners
+
+Admin or scaler. Lists every registered runner, ordered by `id`, with the capacity it last reported. Runners that stopped heartbeating stay in the list: the in-memory registry drops a runner when it disconnects, the Postgres registry never does. Filter on `healthy` and `last_seen` to keep the live ones. Runner addresses are not returned.
+
+`cordoned` is `true` while the runner is [cordoned](#put-adminrunnersidcordon--delete-adminrunnersidcordon).
+
+**Response:** `200 OK`
+
+```json
+{
+  "runners": [
+    {
+      "id": "runner-1",
+      "healthy": true,
+      "cordoned": false,
+      "capacity_total": 20,
+      "capacity_used": 7,
+      "capacity_stopped": 2,
+      "last_seen": 1700000000
+    }
+  ]
+}
+```
+
+`last_seen` is the Unix time in seconds of the runner's last heartbeat. `runners` is `[]` when none are registered.
+
+**Errors:** `403` provisioner or tenant key, `500` registry read failed
+
+**Example:**
+
+```bash
+curl http://localhost:8080/admin/runners -H "X-Api-Key: SCALER_KEY"
+```
+
+### PUT /admin/runners/{id}/cordon · DELETE /admin/runners/{id}/cordon
+
+Admin or scaler. `PUT` cordons the runner: it gets no new sandboxes and keeps serving its running ones. A request that would wake one of its sandboxes whose `status` is `stopped` deletes the sandbox and gets `404 sandbox not found` instead, so the client creates it again on another runner. If the runner can't be reached, the API removes only its own record and still answers `404`; a runner that is in fact still up keeps the sandbox until it restarts. A runner that has sent no heartbeat within `SANDBOX_API_RUNNER_HEARTBEAT_GRACE` gets 5 s to answer. The in-memory registry forgets a runner's cordon when the runner disconnects. If the runner answers but the delete fails, the request gets `503` and the sandbox stays, so a retry tries again. A stopped sandbox that gets no such request stays until the idle sweeper deletes it or the runner is reimaged or removed. `DELETE` uncordons the runner, which restores wakes. Both are idempotent. A runner restart clears the cordon.
+
+**Response:** `200 OK`
+
+```json
+{"id": "runner-1", "cordoned": true}
+```
+
+**Errors:** `403` provisioner or tenant key, `404` unknown runner, `409` another runner now has its address, `502` the runner did not apply it, `503` the runner is unreachable or has stopped heartbeating
+
+**Example:**
+
+```bash
+curl -X PUT http://localhost:8080/admin/runners/runner-1/cordon -H "X-Api-Key: SCALER_KEY"
+```
+
+---
+
+## Admin: capacity scaler
+
+### GET /admin/scaler
+
+Admin only. Forwards to `SANDBOX_API_SCALER_URL`'s `/policy` endpoint; on success, relays the response body unchanged and copies `Content-Type` when present. The scaler itself is operated privately, outside this repository.
+
+The scaler authenticates its own callers, so send its bearer token in the `Authorization` header; the API forwards that header as is. The admin key in `X-Api-Key` is not forwarded.
+
+- `SANDBOX_API_SCALER_URL` unset → `503 {"error": "scaler not configured", "code": 503}`.
+- Set but the scaler is down, times out (5s), redirects, answers anything other than `200` (including `401` for a missing or wrong token), or returns a body over 1 MiB → `503 {"error": "scaler unavailable", "code": 503}`.
+- Set and reachable → `200` with the scaler's response body, unchanged.

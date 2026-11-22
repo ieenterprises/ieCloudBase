@@ -1,0 +1,98 @@
+// Package runner is the runtime-agnostic runner process: the HTTP router the API
+// proxies sandbox requests to, and the SandboxControl gRPC server.
+package runner
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"time"
+
+	"github.com/n8n-io/sandbox-service/internal/limits"
+	"github.com/n8n-io/sandbox-service/internal/metrics"
+	"github.com/n8n-io/sandbox-service/internal/runner/config"
+	runnerruntime "github.com/n8n-io/sandbox-service/internal/runner/runtime"
+)
+
+// NewRouter creates the HTTP handler for sandbox operations. If rec is
+// enabled, its /metrics handler is mounted and HTTPMiddleware wraps the chain.
+func NewRouter(rt runnerruntime.Runtime, cfg *config.Config, rec *metrics.RunnerRecorder) http.Handler {
+	mux := http.NewServeMux()
+
+	livenessHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}
+
+	mux.HandleFunc("GET /healthz", livenessHandler)
+	mux.HandleFunc("GET /livez", livenessHandler)
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		if err := rt.Ready(ctx); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	if rec.Enabled() {
+		mux.Handle("GET /metrics", metrics.Handler(rec.Registry()))
+	}
+
+	mux.HandleFunc("GET /sandboxes/{id}", GetSandbox(rt))
+
+	// Proxy exec, files, mkdir, stat to daemon
+	limitSandbox := sandboxLimit(limits.NewKeyedLimiter(cfg.MaxInflightPerSandbox), rec)
+	// Execution DELETEs have a limit of their own, so work can be cancelled
+	// while the sandbox's other requests fill theirs. Turning the sandbox limit
+	// off turns this one off too.
+	maxDeletes := 0
+	if cfg.MaxInflightPerSandbox > 0 {
+		maxDeletes = maxExecutionDeletesPerSandbox
+	}
+	limitSandboxDeletes := sandboxLimit(limits.NewKeyedLimiter(maxDeletes), rec)
+	proxy := limitSandbox(ProxyHandler(rt, cfg, rec))
+	uploadProxy := limitSandbox(UploadProxyHandler(rt, cfg, rec))
+
+	mux.HandleFunc("POST /sandboxes/{id}/executions", limitSandbox(ExecProxyHandler(rt, cfg, rec)))
+	mux.HandleFunc("GET /sandboxes/{id}/executions/{exec_id}", proxy)
+	mux.HandleFunc("DELETE /sandboxes/{id}/executions/{exec_id}", limitSandboxDeletes(DeleteExecutionHandler(rt, cfg, rec)))
+	mux.HandleFunc("POST /sandboxes/{id}/files/copy", proxy)
+	mux.HandleFunc("POST /sandboxes/{id}/files/move", proxy)
+	mux.HandleFunc("GET /sandboxes/{id}/files", proxy)
+	mux.HandleFunc("GET /sandboxes/{id}/files/content", proxy)
+	mux.HandleFunc("PUT /sandboxes/{id}/files", uploadProxy)
+	mux.HandleFunc("POST /sandboxes/{id}/files", uploadProxy)
+	mux.HandleFunc("POST /sandboxes/{id}/files/archive", uploadProxy)
+	mux.HandleFunc("DELETE /sandboxes/{id}/files", proxy)
+	mux.HandleFunc("POST /sandboxes/{id}/mkdir", proxy)
+	mux.HandleFunc("GET /sandboxes/{id}/stat", proxy)
+
+	// Apply middleware (outermost first)
+	var handler http.Handler = mux
+	if rec.Enabled() {
+		handler = metrics.HTTPMiddleware(rec)(handler)
+	}
+	handler = AuthMiddleware(cfg.APIKeys)(handler)
+	handler = publicPaths.RejectOtherMethods(handler)
+	handler = LoggingMiddleware(handler)
+	handler = RecoveryMiddleware(handler)
+
+	return handler
+}
+
+func writeJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}

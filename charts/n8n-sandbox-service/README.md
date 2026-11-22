@@ -1,0 +1,526 @@
+# n8n Sandbox Service Helm Chart
+
+This chart deploys the n8n Sandbox Service API and, optionally, an in-cluster Docker-in-Docker runner.
+
+## Install
+
+Create or provide:
+
+- An auth Secret with API keys and runner registration tokens, or set `auth.*` values and let the chart create one.
+- TLS Secrets for the API registration server, API control client, runner registration client, and runner control server, or set `tls.mode=certManager`.
+- A Sysbox-ready node pool for `runner.isolation=sysbox` (the default). Use `runner.isolation=privileged` on clusters that cannot install sysbox.
+
+```sh
+helm upgrade --install n8n-sandbox-service ./charts/n8n-sandbox-service \
+  --namespace n8n-sandbox \
+  --create-namespace
+```
+
+## Data Plane Mode
+
+`dataPlane.mode` selects where the data plane runs:
+
+- `in-cluster` — the chart renders a Docker-in-Docker runner StatefulSet. `runner.isolation` selects how the runner gets its privileges.
+- `external` — runners live outside Kubernetes. The chart renders only the API resources.
+
+The Firecracker runner is a separate image/entrypoint for external host deployments and is not charted here yet.
+
+After install, if no runner pod appears, inspect the StatefulSet events. RuntimeClass and Pod Security Admission rejections land there, not on a pod:
+
+```sh
+kubectl -n n8n-sandbox describe statefulset -l app.kubernetes.io/name=n8n-sandbox-service
+```
+
+## Runner Isolation
+
+`runner.isolation` selects the source of privilege for the in-cluster runner. Both isolations run the same runner image.
+
+- `sysbox` (default) — run under the `sysbox-runc` RuntimeClass. Needs sysbox installed on the nodes. Recommended.
+- `privileged` — run with `privileged: true`. Any node can run it. See below.
+
+The isolation-specific settings (`runtime` and `scheduling`) live in the `runner.sysbox` and `runner.privileged` subblocks. The chart reads only the subblock that matches `runner.isolation`; values in the other subblock are ignored. All other `runner.*` keys are shared between isolations.
+
+The runner resource names follow the isolation (`<release>-sysbox-runner`, `<release>-privileged-runner`). Switching isolation therefore recreates the runner StatefulSet under the other name; this is required because StatefulSet selectors are immutable.
+
+The runner name caps at 61 characters. The StatefulSet appends `-<ordinal>` to build each pod name, and Kubernetes limits the resulting pod hostname to 63 characters. The cap keeps room for ordinals 0-9. Set `fullnameOverride` to a shorter name if you run more than 10 runner replicas. A release name that is too long for the cap gets a short hash in the privileged name, so two long release names stay unique.
+
+## Privileged Isolation
+
+Use `runner.isolation: privileged` on clusters that cannot install sysbox. This includes immutable-rootfs distributions such as Talos, Bottlerocket, Flatcar, and Fedora CoreOS, where sysbox cannot modify the node filesystem or the containerd configuration.
+
+The security boundary is weaker than sysbox. The runner container runs with `privileged: true` in the host user namespace. An escape from the runner container reaches the node. Because of this, the chart refuses to render until you acknowledge the trade-off:
+
+```yaml
+dataPlane:
+  mode: in-cluster
+runner:
+  isolation: privileged
+  acknowledgePrivileged: true
+```
+
+Requirements and recommendations:
+
+- The namespace needs Pod Security Admission level `privileged`: `kubectl label namespace n8n-sandbox pod-security.kubernetes.io/enforce=privileged`. A PSA denial surfaces as an event on the StatefulSet, not as a failing pod.
+- Prefer a dedicated node pool for the runner via `runner.privileged.scheduling`.
+- Platforms that block privileged containers outright (for example GKE Autopilot) cannot use this isolation; use `dataPlane.mode: external` there.
+
+The chart bounds the inner Docker daemon's data root for both isolations; see [Docker Data Root](#docker-data-root).
+
+Two hardening options:
+
+- **Kubernetes user namespaces.** On Kubernetes ≥ 1.33 with containerd ≥ 2.0, set `runner.privileged.runtime.hostUsers: false`. Container root then maps to an unprivileged host UID, and the privileged capabilities are scoped to the pod's user namespace. Verify that sandbox creation and resource limits work on your platform before you rely on it; inner-Docker cgroup management inside a user namespace depends on the node's kernel and runtime versions. Disk quotas (`defaultDiskQuotaMb`) do not work inside a user namespace.
+- **VM-based RuntimeClass.** Set `runner.privileged.runtime.runtimeClassName` to a VM runtime such as Kata Containers. `privileged: true` then applies inside the guest VM, not on the node. Talos ships an official kata-containers system extension. This needs bare-metal nodes or nested virtualization.
+
+Do not set `runner.privileged.runtime.runtimeClassName: sysbox-runc`; the chart fails the render and points you to `runner.isolation: sysbox`.
+
+## Migrating from 0.3.x
+
+Chart 0.4.0 restructured the data-plane values. The render fails with a message that names the new key if you still set an old key. Existing `sysbox` releases upgrade without workload changes: the runner resource names and labels are unchanged, so the StatefulSet is untouched.
+
+| Old key | New key |
+| --- | --- |
+| `dataPlane.mode: sysbox` | `dataPlane.mode: in-cluster` (sysbox is the default isolation) |
+| `sysboxRunner.enabled: false` | `dataPlane.mode: external` |
+| `sysboxRunner.runtime.*` | `runner.sysbox.runtime.*` |
+| `sysboxRunner.scheduling.*` | `runner.sysbox.scheduling.*` |
+| `sysboxRunner.*` (all other keys) | `runner.*` (same key names) |
+| `networkPolicy.sysboxRunner` | `networkPolicy.runner` |
+| `monitoring.serviceMonitor.sysboxRunner` | `monitoring.serviceMonitor.runner` |
+
+## Sysbox Scheduling Defaults
+
+The default runner scheduling follows the Sysbox Kubernetes convention:
+
+```yaml
+runner:
+  sysbox:
+    runtime:
+      runtimeClassName: sysbox-runc
+      hostUsers: false
+    scheduling:
+      nodeSelector:
+        sysbox-install: "yes"
+      tolerations:
+      - key: sysbox-runtime
+        operator: Equal
+        value: not-running
+        effect: NoSchedule
+```
+
+The Sysbox installer labels the nodes `sysbox-install=yes` and taints them `sysbox-runtime=not-running:NoSchedule` until the runtime is ready. The default selector and toleration match that convention.
+
+`hostUsers: false` asks Kubernetes to run the pod in a user namespace rather than the host user namespace. This is required by some Kubernetes/Sysbox setups for the runner pod to start.
+
+If inner Docker cannot use `overlay2` in that environment, set `runner.config.dockerStorageDriver` to another dockerd storage driver such as `vfs`. This is slower than `overlay2`, but avoids nested overlayfs mounts.
+
+If your cluster uses a dedicated node pool with custom labels and taints, override them through values:
+
+```yaml
+runner:
+  sysbox:
+    scheduling:
+      nodeSelector:
+        nodetype: sysbox
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: sysbox
+          effect: NoSchedule
+```
+
+## Docker Data Root
+
+The runner always gets a volume for the inner Docker daemon's data root, so its image layers and sandbox filesystems cannot fill the node disk. The table below shows the volume for each configuration.
+
+| `runner.isolation` | `runner.dockerDataRoot.persistence.enabled` | Volume |
+| --- | --- | --- |
+| `sysbox` | `false` | Per-pod `emptyDir`, bounded by `emptyDir.sizeLimit` |
+| `sysbox` | `true` | Unsupported, fails to render |
+| `privileged` | `false` | Per-pod `emptyDir`, bounded by `emptyDir.sizeLimit` |
+| `privileged` | `true` | Per-pod PVC, sized by `persistence.size` |
+
+The volume mounts at `/var/lib/docker`, or at `/var/lib/docker-pool` when `runner.config.defaultDiskQuotaMb` is above 0. See [Disk Quotas](#disk-quotas).
+
+## Disk Quotas
+
+`runner.config.defaultDiskQuotaMb` above 0 caps the writable layer of each sandbox. To enforce the cap, the runner allocates a loopback xfs image, mounts it with `prjquota` at `/var/lib/docker`, and runs the inner Docker daemon against that mount.
+
+The mount does not bound the image, so the image needs a bounded volume of its own. For both isolations, the chart mounts the Docker data root volume at `/var/lib/docker-pool` and puts the image there. Persistence selects a PVC; otherwise the chart uses a bounded `emptyDir`.
+
+The chart requires an explicit pool size that fits the volume. The default `sysbox` isolation can use the `emptyDir` without persistence:
+
+```yaml
+runner:
+  config:
+    defaultDiskQuotaMb: "2048"
+    diskQuotaPoolSizeGb: "60"
+```
+
+The `emptyDir` also holds the pool image with privileged isolation. Set `runner.dockerDataRoot.emptyDir.sizeLimit` to at least `diskQuotaPoolSizeGb`:
+
+```yaml
+runner:
+  isolation: privileged
+  acknowledgePrivileged: true
+  config:
+    defaultDiskQuotaMb: "2048"
+    diskQuotaPoolSizeGb: "60"
+  dockerDataRoot:
+    emptyDir:
+      sizeLimit: 64Gi
+```
+
+`runner.config.diskQuotaPoolPath` overrides the image path. When it points at a volume you mount yourself (for example through `runner.extraVolumes`), the chart skips the size comparison. You then own the fit between the pool and that volume. Keep the override on a volume with a size limit; the mount that the image backs does not bound the image.
+
+The render fails in two cases:
+
+- `runner.config.diskQuotaPoolSizeGb` is not a positive whole number of GB. The chart never falls back to the derived pool size, because that size scales with `runner.config.capacityTotal`. A 2048 MB per-sandbox quota and the default `capacityTotal` of 1000 derive a 2400 GB pool.
+- `runner.config.diskQuotaPoolSizeGb` is larger than the chart-owned volume.
+
+If the node kernel lacks xfs quota support, the pool mount fails. The runner then logs `disk quota enforcement: DISABLED`, the inner Docker daemon uses the container filesystem, and the volume stays unused. Watch that log line after you enable quotas.
+
+## Volume Cache
+
+The runner keeps the read-only volumes sandboxes attach in its volume cache, at `runner.config.volumeCacheDir` (default `<runner.config.dataDir>/volume-cache`), within `runner.config.volumeCacheMaxBytes` (default 20 GiB). Unpacking a volume takes room for the tar and its files at once. By default the cache uses the runner container's own filesystem.
+
+Give it an `emptyDir` of its own when sandboxes use volumes:
+
+```yaml
+runner:
+  config:
+    volumeCacheMaxBytes: "21474836480"
+  volumeCache:
+    emptyDir:
+      enabled: true
+      sizeLimit: 24Gi
+```
+
+The render fails unless `sizeLimit` is a whole number of Gi that holds the budget and 5% more: the kubelet evicts a pod whose `emptyDir` outgrows its limit. It also fails for a cache dir the runner would refuse or whose startup wipe would delete something else: `/`, the data dir or a dir containing it, or a dir inside or containing the Docker data root (`/var/lib/docker` or the pool mount). The cache shares the node's disk with the Docker data root, and with disk quotas, with the pool image, which grows as sandboxes write. The cache keeps 5% of the disk free, but cannot see what the pool has yet to grow into, so size the node's disk for both volumes' limits.
+
+## Existing Auth Secret
+
+For production, prefer creating the auth Secret outside Helm and referencing it:
+
+```yaml
+auth:
+  existingSecret: n8n-sandbox-auth
+  secretKeys:
+    apiKeys: api-keys
+    provisionerKeys: provisioner-api-keys
+    scalerKeys: scaler-api-keys
+    runnerRegistrationToken: runner-registration-token
+    runnerApiKey: runner-api-key
+    runnerApiKeys: runner-api-keys
+```
+
+`provisionerKeys` is optional: the API reads it as `SANDBOX_API_PROVISIONER_KEYS` with `secretKeyRef.optional: true`, so a Secret without that key runs with no provisioner keys. When it is set, `api.config.defaultMaxSandboxes` must be above `0` or the API refuses to start. `scalerKeys` (`SANDBOX_API_SCALER_KEYS`) is optional the same way.
+
+If `auth.existingSecret` is empty, the chart creates an opaque Secret from `auth.generated`:
+
+```yaml
+auth:
+  existingSecret: ""
+  generated:
+    apiKeys: replace-with-random-api-key
+    provisionerKeys: "" # optional; empty leaves the key out
+    scalerKeys: "" # optional; empty leaves the key out
+    runnerRegistrationToken: replace-with-random-registration-token
+    runnerApiKey: replace-with-random-runner-api-key
+    runnerApiKeys: replace-with-random-runner-api-key
+```
+
+The chart fails rendering when any required generated auth value is empty or `changeme`. Do not expose the API with placeholder credentials.
+
+The API uses `apiKeys`, `provisionerKeys`, `scalerKeys`, `runnerRegistrationToken`, and `runnerApiKey`. The runner uses `runnerApiKeys` and `runnerRegistrationToken`.
+
+## TLS Secrets
+
+The service requires gRPC mTLS between the API and runners. Configure it in one place with `tls.mode`:
+
+- `tls.mode=existingSecret`: create the TLS Secrets yourself and point the chart at them.
+- `tls.mode=certManager`: the chart renders cert-manager `Certificate` resources for the required Secrets.
+
+The chart mounts the Secrets and wires the corresponding `SANDBOX_*_TLS_*` environment variables.
+
+Expected default key names are `tls.crt`, `tls.key`, and `ca.crt`; override the `*FileKey` values if your Secret uses different names.
+
+```yaml
+tls:
+  mode: existingSecret
+  certificates:
+    apiRegistrationServer:
+      secretName: n8n-sandbox-api-registration-tls
+    apiControlClient:
+      secretName: n8n-sandbox-api-control-client-tls
+    runnerRegistrationClient:
+      secretName: n8n-sandbox-runner-registration-tls
+    runnerControlServer:
+      secretName: n8n-sandbox-runner-control-tls
+```
+
+## cert-manager
+
+If cert-manager is installed, enable certificate generation and reference an existing private `Issuer` or `ClusterIssuer`:
+
+```yaml
+tls:
+  mode: certManager
+  certManager:
+    issuerRef:
+      name: sandbox-ca
+      kind: ClusterIssuer
+      group: cert-manager.io
+```
+
+This renders four `Certificate` resources:
+
+- API registration server certificate with `server auth`.
+- API control client certificate with `client auth`.
+- Runner registration client certificate with `client auth`.
+- Runner control server certificate with `server auth`.
+
+The generated Secret names match `tls.certificates.*.secretName`, so the workloads mount the same Secrets whether cert-manager or an external process creates them.
+
+For the API registration server certificate, the chart includes the API Service DNS names. For the runner control server certificate, the chart includes the headless Service DNS names and a wildcard pod DNS name for StatefulSet runners. Add extra SANs through:
+
+```yaml
+tls:
+  certificates:
+    apiRegistrationServer:
+      dnsNames:
+        - sandbox-api.example.internal
+    runnerControlServer:
+      dnsNames:
+        - "*.custom-runner.sandbox.svc.cluster.local"
+```
+
+## Traefik Ingress
+
+API ingress is optional. Enable it when the API should be addressable through Traefik or another Ingress controller:
+
+```yaml
+api:
+  ingress:
+    enabled: true
+    className: traefik
+    hosts:
+      - host: sandbox.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: sandbox-api-public-tls
+        hosts:
+          - sandbox.example.com
+```
+
+If Traefik is configured through annotations instead of `ingressClassName`, leave `className` empty and set `api.ingress.annotations`.
+
+The Ingress exposes only the public HTTP API port. The private runner registration gRPC port stays on the ClusterIP Service.
+
+## NetworkPolicy
+
+`networkPolicy.enabled` is disabled by default because many clusters use provider-specific policy CRDs or manage network policy outside application charts.
+
+When enabled, the chart renders Kubernetes `NetworkPolicy` resources for the API and the in-cluster runner:
+
+- API HTTP remains reachable from all sources by default so an existing ingress controller continues to work. Set `networkPolicy.api.httpIngressFrom` to restrict it to your ingress controller.
+- API registration gRPC is reachable from the in-chart runner by default. In external data-plane mode it is denied unless peers are added through `networkPolicy.api.grpcIngressFrom`. The volume-objects port of a [local volume store](#volume-store) admits the same peers.
+- The API metrics port, when `api.config.metricsListenAddr` sets one, is reachable from all sources by default so an existing Prometheus keeps scraping. Set `networkPolicy.api.metricsIngressFrom` to restrict it to your monitoring namespace.
+- Runner HTTP/control ports are reachable from the in-chart API by default. Add peers through `networkPolicy.runner.ingressFrom` only if another component needs direct runner access.
+
+Example restricting public API traffic to an ingress controller namespace:
+
+```yaml
+networkPolicy:
+  enabled: true
+  api:
+    httpIngressFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: ingress-nginx
+```
+
+## Prometheus Metrics
+
+The API and the in-cluster runner expose Prometheus metrics at `/metrics`, by default on the same HTTP port that serves their API. If your cluster uses Prometheus Operator, enable `ServiceMonitor` resources:
+
+```yaml
+monitoring:
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack
+```
+
+This renders one `ServiceMonitor` for the API Service and, when the in-chart runner is enabled, one for the runner headless Service. It also enables the matching `/metrics` handlers in the API and runner containers. Use `monitoring.serviceMonitor.api.enabled` or `monitoring.serviceMonitor.runner.enabled` to disable either scrape target.
+
+### A dedicated metrics port for the API
+
+`api.config.metricsListenAddr` moves the API's `/metrics` off the port an Ingress publishes:
+
+```yaml
+api:
+  config:
+    metricsListenAddr: ":9100"
+```
+
+The chart then adds a `metrics` port to the API container and to its Service, points the API `ServiceMonitor` at it instead of `http`, and — when `networkPolicy.enabled` — renders an ingress rule for it that `networkPolicy.api.metricsIngressFrom` restricts. Leaving the value empty, or giving it the `api.config.listenAddr` port, keeps `/metrics` on the API's HTTP port, which is the default and what earlier chart versions rendered.
+
+The port must not collide with `api.config.grpcListenAddr`, and if it uses the `api.config.listenAddr` port the whole address must match it; either mistake fails the render. A loopback bind such as `127.0.0.1:9100` also fails while the API `ServiceMonitor` is enabled, since that scrape reaches the pod by IP — bind all interfaces, or set `monitoring.serviceMonitor.api.enabled=false` if something inside the pod does the scraping. This needs an API image that supports `SANDBOX_API_METRICS_LISTEN_ADDR`. An image predating it ignores the variable and keeps serving `/metrics` on its HTTP port, which leaves the scrape pointed at a port nothing listens on — the target shows as connection-refused rather than silently returning partial data.
+
+The runner's HTTP listener serves TLS, so its scrape overrides the shared `scheme` with `monitoring.serviceMonitor.runner.scheme` (`https`). The scrape verifies that TLS by default: with `monitoring.serviceMonitor.runner.tlsConfig` left empty, the chart points `ca` at `tls.certificates.runnerControlServer.secretName` and pins `serverName` to the runner Service DNS name. Targets are scraped by pod IP, which is not a SAN, so that pin is what makes verification succeed; every runner pod presents the same certificate, so one name covers the StatefulSet.
+
+Under `tls.mode=certManager` this works as rendered, because the chart issues that certificate itself. Under `tls.mode=existingSecret` the certificate is yours, so it must carry `<runner-service>.<namespace>.svc.cluster.local` as a SAN or the scrape fails to verify. Setting `monitoring.serviceMonitor.runner.tlsConfig` replaces the default outright, so if you cannot reissue, `insecureSkipVerify: true` is the escape hatch — acceptable in that `/metrics` is unauthenticated and carries no tenant or sandbox identifiers, at the cost of letting an on-path peer forge the metrics your alerts read.
+
+## Runner Identity
+
+The in-cluster runner is deployed as a StatefulSet with a headless Service so each runner pod has direct, DNS-based addressability from the API:
+
+```text
+https://<pod>.<runner-service>.<namespace>.svc.cluster.local:8080
+<pod>.<runner-service>.<namespace>.svc.cluster.local:9091
+```
+
+The API must call the specific runner that owns a sandbox; a load-balanced Service is not enough for exec/files/control operations. Stable pod DNS also makes the runner certificate SANs practical: both the HTTP listener and the control gRPC listener serve TLS with the same certificate, so those names must appear in its SANs.
+
+If a runner dies, sandboxes on that runner should be treated as lost.
+
+## API Persistence
+
+**SQLite (default):** Keep `api.replicaCount: 1`. `api.persistence.enabled` is enabled by default so sandbox routing state survives API pod restarts.
+
+**Postgres (multi-pod):** Set `api.replicaCount` to 2 or more, or enable [API Autoscaling](#api-autoscaling), and configure Postgres via environment variables:
+
+```yaml
+api:
+  replicaCount: 3
+  persistence:
+    enabled: false
+  config:
+    store: postgres
+  extraEnv:
+    - name: SANDBOX_API_POSTGRES_HOST
+      value: your-postgres-host
+    - name: SANDBOX_API_POSTGRES_USER
+      value: sandbox
+    - name: SANDBOX_API_POSTGRES_DB
+      value: sandbox
+    - name: SANDBOX_API_POSTGRES_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: sandbox-api-postgres
+          key: password
+```
+
+## API Autoscaling
+
+`api.autoscaling.enabled` adds a HorizontalPodAutoscaler for the API and leaves `spec.replicas` out of the Deployment, so the HPA owns the replica count and `api.replicaCount` is ignored. It needs the Postgres store with persistence disabled, as in [API Persistence](#api-persistence), and the Kubernetes metrics API (`metrics.k8s.io`, usually served by metrics-server), without which the HPA cannot read CPU or memory and does not scale on load:
+
+```yaml
+api:
+  persistence:
+    enabled: false
+  config:
+    store: postgres
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 80
+```
+
+The CPU target is a percentage of `api.resources.requests.cpu`, which the render requires to be above zero while that target is set. The memory target is off by default. It is an average per pod rather than a share of the memory request, so it can sit just under the memory limit. Size Postgres `max_connections` for `maxReplicas` plus the rollout surge: each API pod opens up to 25 store connections plus `SANDBOX_API_IDLE_SWEEP_CONCURRENCY + 5` lock connections. Tenant request limits are counted per pod, so a tenant's total limit grows with the replica count too.
+
+Enabling autoscaling on a running release removes `spec.replicas`, which can drop the Deployment to one pod until the HPA scales it back up. The Kubernetes docs on [migrating to horizontal autoscaling](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/#migrating-deployments-and-statefulsets-to-horizontal-autoscaling) show how to avoid that. Turning autoscaling off again sets the Deployment back to `api.replicaCount`, so raise that first.
+
+## API ServiceAccount
+
+By default the API pods run as the namespace's `default` ServiceAccount. Give them one of their own when a container in them needs a cloud identity, such as a [volume store helper](#api-sidecars) that reaches object storage through workload identity. The identity then belongs to the API pods only, not to the runner pods, which also use `default`.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `api.serviceAccount.create` | `false` | Create a ServiceAccount for the API pods. |
+| `api.serviceAccount.name` | `""` | With `create`, the name of the created ServiceAccount; empty means `<fullname>-api`. Without `create`, the name of an existing ServiceAccount; empty keeps `default`. |
+| `api.serviceAccount.annotations` | `{}` | Annotations on the created ServiceAccount. |
+| `api.podLabels` | `{}` | Extra labels for the API pods. Keys of the selector labels are ignored. |
+
+The API does not call the Kubernetes API. Whenever a ServiceAccount is set, the API pods set `automountServiceAccountToken: false`, and so does a created ServiceAccount.
+
+For Azure Workload Identity, give the managed identity a federated credential for `system:serviceaccount:<namespace>:<name>`. The webhook gives the identity's token to every container not listed in `skip-containers`, so this keeps it out of the API container and in a sidecar, as in [API Sidecars](#api-sidecars). `podAnnotations` also reaches the runner pods, where it does nothing without the label:
+
+```yaml
+podAnnotations:
+  azure.workload.identity/skip-containers: api
+api:
+  serviceAccount:
+    create: true
+    annotations:
+      azure.workload.identity/client-id: <managed-identity-client-id>
+  podLabels:
+    azure.workload.identity/use: "true"
+```
+
+## API Sidecars
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `api.initContainers` | `[]` | Init containers for the API pods. One with `restartPolicy: Always` is a native sidecar: it starts before the API and stops after it. Native sidecars need Kubernetes 1.29 or later; older clusters drop `restartPolicy`, so the sidecar never finishes and the API never starts. |
+| `api.terminationGracePeriodSeconds` | `""` | How long the API pods get to stop, in whole seconds. Empty keeps the Kubernetes default of 30. |
+
+A volume store helper for `SANDBOX_API_VOLUME_STORE=remote` (see `docs/volume-store-helper.md` in the service repository) runs as a native sidecar. Its socket directory is an `emptyDir` that the API mounts read-only and reaches through the pod's `fsGroup`. Raise the grace period so uploads in flight can finish:
+
+```yaml
+api:
+  terminationGracePeriodSeconds: 300
+  extraEnv:
+    - name: SANDBOX_API_VOLUME_STORE
+      value: remote
+    - name: SANDBOX_API_VOLUME_REMOTE_SOCKET
+      value: /run/volume-store/store.sock
+  extraVolumes:
+    - name: volume-store
+      emptyDir: {}
+  extraVolumeMounts:
+    - name: volume-store
+      mountPath: /run/volume-store
+      readOnly: true
+  initContainers:
+    - name: volume-store
+      image: <helper-image>
+      restartPolicy: Always
+      # The helper's own settings, including the same socket path.
+      env: []
+      volumeMounts:
+        - name: volume-store
+          mountPath: /run/volume-store
+```
+
+## Volume Store
+
+With `api.config.volumeStore: local`, the API keeps volume objects in `api.config.dataDir` and serves them to runners on a listener of its own. That listener requires TLS 1.3 and a client certificate, with the registration certificates the chart already mounts, so it needs no further setup:
+
+```yaml
+api:
+  config:
+    volumeStore: local
+```
+
+The chart then sets `SANDBOX_API_VOLUME_STORE`, `SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR` and `SANDBOX_API_VOLUME_LOCAL_URL` (see `docs/configuration.md` in the service repository), adds a `volume-objects` port to the API container and Service, and with `networkPolicy.enabled` admits the same peers to it as to the registration gRPC port.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `api.config.volumeStore` | `""` | `local` turns the store on. For `remote`, set `SANDBOX_API_VOLUME_STORE` through `api.extraEnv`, as in [API Sidecars](#api-sidecars). |
+| `api.config.volumeLocalListenAddr` | `":8443"` | The listener's address. Its port must differ from the API's other ports. |
+| `api.service.volumeObjectsPort` | `8443` | The listener's Service port. |
+| `api.config.volumeLocalUrl` | `""` | Where runners reach the listener. Empty means `https://<API Service name>:<api.service.volumeObjectsPort>`. In either data-plane mode, its host must be the host runners register with, and the API registration certificate must carry it, or the name runners verify registration against if one is set (`tls.certificates.runnerRegistrationClient.serverName` for in-cluster runners), whether cert-manager issues the certificate (`tls.certificates.apiRegistrationServer.dnsNames`) or it comes from an existing Secret. The default meets both for in-cluster runners. |
+
+The store keeps its objects on one API pod's volume and signs read URLs with a key of that pod's own, so it needs `api.persistence.enabled`, `api.replicaCount: 1` and no autoscaling; the render fails otherwise. Read URLs stop working when the pod restarts.
+
+With `dataPlane.mode: external`, runners cannot resolve the API Service name, so the render requires `api.config.volumeLocalUrl`, and with `networkPolicy.enabled` the runners must be listed in `networkPolicy.api.grpcIngressFrom`.

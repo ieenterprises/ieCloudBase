@@ -1,0 +1,756 @@
+import { test, expect } from '@playwright/test';
+import './matchers';
+import {
+  ADMIN_API_KEY,
+  BASE_URL,
+  addAddress,
+  apiClient,
+  client,
+  createSandbox,
+  deleteSandbox,
+  docker,
+  exec,
+  execWithTransientRetry,
+  innerContainerName,
+  scrapeRunnerMetrics,
+  siblingOf,
+  stopSandboxViaRunner,
+} from './helpers';
+import { parseCounter, parseGauge } from './metrics-helpers';
+import { DOCKER_ONLY, FIRECRACKER_ONLY } from './tags';
+import type { SandboxClient } from '@n8n/sandbox-client';
+
+const tcpConnect = (ip: string, port: number = 80, timeout: number = 3) =>
+  `curl --connect-timeout ${timeout} -s -o /dev/null http://${ip}:${port}/`;
+
+// Keeps the response body, so a test can tell which listener answered rather
+// than only whether the connection succeeded.
+const httpGet = (ip: string, port: number, timeout: number = 3) =>
+  `curl --connect-timeout ${timeout} -s http://${ip}:${port}/`;
+
+const httpGetWithRetry = (ip: string, port: number) =>
+  `curl --retry 5 --retry-connrefused --retry-delay 1 --connect-timeout 3 -fsS http://${ip}:${port}/`;
+
+const tcpConnectV6 = (ip: string, port: number = 443, timeout: number = 3) =>
+  `curl --connect-timeout ${timeout} -sk -o /dev/null -6 "https://[${ip}]:${port}/"`;
+
+// Succeeds only once the TCP handshake completes. curl's exit code cannot tell
+// a blocked port from one that accepted the connection and then answered
+// something other than HTTP, which is what a DNS port does.
+const tcpOpen = (ip: string, port: number, timeout: number = 3) =>
+  `timeout ${timeout} bash -c 'exec 3<>/dev/tcp/${ip}/${port}'`;
+
+const resolve = (host: string) =>
+  `getent ahostsv4 ${host} | head -1 | awk '{print $1}'`;
+
+// Azure WireServer and platform DNS. Blocked by netpolicy.PrivateRangesV4
+// although it is a public address.
+const AZURE_PLATFORM_IP = '168.63.129.16';
+
+const MULTICAST_GROUP = '239.255.42.42';
+const MULTICAST_PORT = 41234;
+const MULTICAST_LOG = '/tmp/multicast.log';
+
+// Joins the group and appends every datagram it receives to MULTICAST_LOG.
+const multicastListen = () =>
+  `node -e "const d=require('dgram').createSocket({type:'udp4',reuseAddr:true});` +
+  `d.on('message',m=>require('fs').appendFileSync('${MULTICAST_LOG}',m+';'));` +
+  `d.bind(${MULTICAST_PORT},()=>d.addMembership('${MULTICAST_GROUP}'));` +
+  `setTimeout(()=>process.exit(0),60000)" >/dev/null 2>&1 &`;
+
+// Sends token to the group a few times, since UDP may drop any one datagram.
+const multicastSend = (token: string) =>
+  `node -e "const s=require('dgram').createSocket('udp4');let n=0;` +
+  `const t=setInterval(()=>{s.send('${token}',${MULTICAST_PORT},'${MULTICAST_GROUP}');` +
+  `if(++n===5){clearInterval(t);setTimeout(()=>s.close(),200);}},100)"`;
+
+// Both runtimes put the gateway at .1 of the sandbox's own /24: the TAP address
+// on Firecracker, the bridge gateway on Sysbox. Deriving it beats reading it,
+// since iproute2 is absent from the image and the Firecracker guest has no
+// /proc/net/route either — the daemon runs as PID 1, so nothing mounts /proc.
+const gatewayOf = (ip: string) => ip.split('.').slice(0, 3).concat('1').join('.');
+
+const tcpConnectFrom = (source: string, ip: string, port: number, timeout: number = 3) =>
+  `curl --interface ${source} --connect-timeout ${timeout} -s -o /dev/null http://${ip}:${port}/`;
+
+// Cleanup runs even when the test body has already failed, so a delete failure
+// is reported softly: throwing here would replace the real error with this one.
+// Returns whether the sandbox is gone, which decides whether its tenant can be
+// deleted at all. 404 is already treated as success by deleteSandbox, and the
+// SDK retries transient failures, so anything reaching here is a real leak.
+const cleanUpSandbox = async (id: string, c?: SandboxClient): Promise<boolean> => {
+  try {
+    await deleteSandbox(id, c);
+    return true;
+  } catch (err) {
+    expect.soft(err, `expected sandbox ${id} to be deleted`).toBeUndefined();
+    return false;
+  }
+};
+
+test.describe('Network isolation', () => {
+  test('sandbox can reach public internet', async () => {
+    const id = await createSandbox();
+    try {
+      const result = await exec(id, `curl -fsSL -o /dev/null -w '%{http_code}' --max-time 15 https://example.com/`, {
+        timeoutMs: 30_000,
+      });
+      expect(result).toHaveSucceeded();
+      expect(result.stdout.trim()).toBe('200');
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  test('sandbox cannot reach private IPs', async () => {
+    const id = await createSandbox();
+    try {
+      // One address per blocked range in netpolicy.PrivateRangesV4, except
+      // 127.0.0.0/8: the guest routes loopback to its own lo, so it never
+      // reaches the FORWARD chain and the assertion would prove nothing.
+      // Multicast and the Azure platform address have tests of their own.
+      const privateIPs = [
+        '10.0.0.1',
+        '172.16.0.1',
+        '192.168.1.1',
+        '169.254.169.254', // cloud metadata endpoint
+        '100.64.0.1', // carrier-grade NAT
+        '198.18.0.1', // benchmarking
+        '240.0.0.1', // reserved
+      ];
+
+      for (const ip of privateIPs) {
+        const result = await execWithTransientRetry(id, tcpConnect(ip, 80, 3), { timeoutMs: 10_000 });
+        expect(result.exitCode, `expected private IP ${ip} to be unreachable`).not.toBe(0);
+      }
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  // WireServer listens on 80 and 32526, platform DNS on 53. Off Azure nothing
+  // answers there and this passes trivially, as the metadata check above does;
+  // the Azure VM lanes are where it answers the host and the test has teeth.
+  test('sandbox cannot reach the Azure platform address', async () => {
+    const id = await createSandbox();
+    try {
+      for (const port of [80, 32526, 53]) {
+        const result = await execWithTransientRetry(id, tcpOpen(AZURE_PLATFORM_IP, port, 3), {
+          timeoutMs: 10_000,
+        });
+        expect(result.exitCode, `expected ${AZURE_PLATFORM_IP}:${port} to be unreachable`).not.toBe(0);
+      }
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  // Multicast is the one destination the private ranges left open between two
+  // sandboxes on a Sysbox bridge. Firecracker slots share no layer 2 at all,
+  // so there it only asserts that this stays true. B hearing its own datagrams,
+  // through multicast loopback, before and after A sends is the control: it
+  // shows B was in the group and listening the whole time.
+  test('sandboxes cannot reach each other over multicast', async () => {
+    const sender = await createSandbox();
+    let listener: string | undefined;
+    try {
+      listener = await createSandbox();
+      const lid = listener;
+
+      const started = await execWithTransientRetry(lid, multicastListen(), { timeoutMs: 5_000 });
+      expect(started).toHaveSucceeded();
+
+      const expectHeard = async (token: string) => {
+        let log = '';
+        for (let attempt = 0; attempt < 10 && !log.includes(token); attempt++) {
+          await execWithTransientRetry(lid, multicastSend(token), { timeoutMs: 10_000 });
+          log = (await execWithTransientRetry(lid, `cat ${MULTICAST_LOG} 2>/dev/null`, { timeoutMs: 5_000 }))
+            .stdout;
+        }
+        expect(log, `expected the listener to hear its own ${token}`).toContain(token);
+      };
+
+      const run = Date.now();
+      await expectHeard(`before${run}`);
+
+      const fromSender = `sender${run}`;
+      const sent = await execWithTransientRetry(sender, multicastSend(fromSender), { timeoutMs: 10_000 });
+      expect(sent, 'expected the sender to send without error').toHaveSucceeded();
+
+      await expectHeard(`after${run}`);
+      const log = (await execWithTransientRetry(lid, `cat ${MULTICAST_LOG}`, { timeoutMs: 5_000 })).stdout;
+      expect(log, "expected the listener not to receive the other sandbox's datagrams").not.toContain(
+        fromSender,
+      );
+    } finally {
+      if (listener) await cleanUpSandbox(listener);
+      await cleanUpSandbox(sender);
+    }
+  });
+
+  test('sandboxes cannot reach each other across tenants', async ({ request }) => {
+    const id1 = await createSandbox();
+    let otherTenantId: string | undefined;
+    let otherClient: SandboxClient | undefined;
+    let id2: string | undefined;
+
+    try {
+      // What makes this cross-tenant is the API side: id2 is created and exec'd
+      // with otherClient, and sandbox 1's key cannot name it. The runner has no
+      // tenant concept, so the network side proves only that one sandbox cannot
+      // reach another's listener, by whichever mechanism gets there first. On
+      // Sysbox that is the shared egress chain's drop on anything leaving the
+      // bridge the way it came in, ahead of the private ranges. On Firecracker
+      // every guest holds the same address, so sandbox 1 ends up dialling
+      // itself. Neither can be narrowed from inside a sandbox, which is why the
+      // positive control below carries the weight: without it the assertion
+      // would also pass if nothing were listening at all.
+      const other = await request.post('/admin/tenants', {
+        headers: { 'X-Api-Key': ADMIN_API_KEY, 'Content-Type': 'application/json' },
+        data: { name: `netiso-${Date.now()}` },
+      });
+      expect(other.status()).toBe(201);
+      const otherBody = await other.json();
+      otherTenantId = otherBody.tenant.id as string;
+      otherClient = apiClient(BASE_URL, otherBody.key.api_key as string);
+
+      id2 = (await otherClient.createSandbox({ egress: 'public' })).id;
+
+      const ipResult = await execWithTransientRetry(id2, 'hostname -I', { timeoutMs: 5_000 }, otherClient);
+      expect(ipResult).toHaveSucceeded();
+      const sandbox2IP = ipResult.stdout.trim().split(/\s+/)[0];
+      expect(sandbox2IP, 'expected sandbox 2 to report its own IPv4 address').toMatch(
+        /^\d+\.\d+\.\d+\.\d+$/,
+      );
+
+      // A per-run token, so reaching sandbox 2's listener is distinguishable
+      // from reaching anything else that happens to answer on that port.
+      const token = `netiso${Date.now()}`;
+      await execWithTransientRetry(
+        id2,
+        `node -e "require('http').createServer((q,r)=>r.end('${token}')).listen(9999,'0.0.0.0');setTimeout(()=>{},30000)" &`,
+        { timeoutMs: 5_000 },
+        otherClient,
+      );
+
+      // Positive control. Sandbox 2 reaches the listener on its own address,
+      // which stays inside its netns and so is unaffected by the policy.
+      // --retry-connrefused covers the gap between backgrounding node and the
+      // port being bound.
+      const control = await execWithTransientRetry(
+        id2,
+        httpGetWithRetry(sandbox2IP, 9999),
+        { timeoutMs: 20_000 },
+        otherClient,
+      );
+      expect(
+        control,
+        `expected sandbox 2 to reach its own listener on ${sandbox2IP}:9999`,
+      ).toHaveSucceeded();
+      expect(control.stdout.trim(), 'expected the listener to answer with the token').toBe(token);
+
+      const result = await execWithTransientRetry(id1, httpGet(sandbox2IP, 9999), { timeoutMs: 10_000 });
+      expect(result.exitCode, `expected sandbox 1 to not reach ${sandbox2IP}:9999`).not.toBe(0);
+      expect(result.stdout, "expected sandbox 1 to not receive sandbox 2's response").not.toContain(
+        token,
+      );
+    } finally {
+      const sandbox2Gone = id2 && otherClient ? await cleanUpSandbox(id2, otherClient) : true;
+      await cleanUpSandbox(id1);
+
+      // The API refuses to delete a tenant that still owns a sandbox, so the
+      // tenant delete is conditional: attempting it after a failed sandbox
+      // delete would report a conflict rather than the leak behind it.
+      if (otherTenantId && sandbox2Gone) {
+        const res = await request.delete(`/admin/tenants/${otherTenantId}`, {
+          headers: { 'X-Api-Key': ADMIN_API_KEY },
+        });
+        expect.soft(res.status(), `expected tenant ${otherTenantId} to be deleted`).toBe(204);
+      }
+    }
+  });
+
+  test('sandbox cannot reach the runner', async () => {
+    const id = await createSandbox();
+    try {
+      const ipResult = await execWithTransientRetry(id, 'hostname -I', { timeoutMs: 5_000 });
+      expect(ipResult).toHaveSucceeded();
+      const ownIP = ipResult.stdout.trim().split(/\s+/)[0];
+      expect(ownIP, 'expected the sandbox to report its own IPv4 address').toMatch(
+        /^\d+\.\d+\.\d+\.\d+$/,
+      );
+      const gateway = gatewayOf(ownIP);
+
+      // On Sysbox the gateway is a host address that the runner listens on, so
+      // this is the regression test for the INPUT chain in netrules. On
+      // Firecracker the gateway is the TAP inside the sandbox netns and the
+      // runner is not there at all, so it only asserts that this stays true;
+      // the guest's route to the host is covered by the private-range test.
+      for (const port of [8080, 9091]) {
+        const result = await execWithTransientRetry(id, tcpConnect(gateway, port, 3), {
+          timeoutMs: 10_000,
+        });
+        expect(
+          result.exitCode,
+          `expected runner port ${port} on ${gateway} to be unreachable`,
+        ).not.toBe(0);
+      }
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  // The host and private-range rules match on the bridge interface, not on the
+  // address the runner assigned. No runtime lets a sandbox add an address today,
+  // so this test skips on both lanes. It stays as the check that reactivates if
+  // one ever grants CAP_NET_ADMIN.
+  test('sandbox cannot escape the policy by adding an address', async () => {
+    const id = await createSandbox();
+    try {
+      const ipResult = await execWithTransientRetry(id, 'hostname -I', { timeoutMs: 5_000 });
+      expect(ipResult).toHaveSucceeded();
+      const ownIP = ipResult.stdout.trim().split(/\s+/)[0];
+      expect(ownIP, 'expected the sandbox to report its own IPv4 address').toMatch(
+        /^\d+\.\d+\.\d+\.\d+$/,
+      );
+      // An unused address in the sandbox's own subnet, so it stays inside the
+      // NAT source range and looks like a legitimate neighbour to any rule that
+      // matches on addresses.
+      const extraIP = siblingOf(ownIP);
+
+      const added = await execWithTransientRetry(id, addAddress(extraIP), { timeoutMs: 10_000 });
+      test.skip(
+        added.exitCode !== 0,
+        `sandbox cannot add an address (${added.stderr.trim() || 'no stderr'}), so this bypass does not apply to this runtime`,
+      );
+
+      // Establishes that the added address is usable as a source, so a failure
+      // below means the policy blocked the traffic rather than that it never
+      // left the sandbox.
+      const publicResult = await execWithTransientRetry(
+        id,
+        `curl --interface ${extraIP} -fsS -o /dev/null --max-time 15 https://example.com/`,
+        { timeoutMs: 30_000 },
+      );
+      expect(publicResult, `expected ${extraIP} to work as a source address`).toHaveSucceeded();
+
+      const blocked: [string, number][] = [
+        [gatewayOf(ownIP), 8080],
+        [gatewayOf(ownIP), 9091],
+        ['169.254.169.254', 80],
+      ];
+      for (const [ip, port] of blocked) {
+        const result = await execWithTransientRetry(id, tcpConnectFrom(extraIP, ip, port), {
+          timeoutMs: 10_000,
+        });
+        expect(
+          result.exitCode,
+          `expected ${ip}:${port} to be unreachable from the added address ${extraIP}`,
+        ).not.toBe(0);
+      }
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  test('sandbox cannot reach IPv6 destinations', async () => {
+    const id = await createSandbox();
+    try {
+      // Cloudflare and Google public DNS, IPv6 addresses. With IPv6 disabled
+      // in the container netns, the AF_INET6 connect must fail.
+      const v6Targets = [
+        '2606:4700:4700::1111',
+        '2001:4860:4860::8888',
+      ];
+
+      for (const ip of v6Targets) {
+        const result = await execWithTransientRetry(id, tcpConnectV6(ip, 443, 3), { timeoutMs: 10_000 });
+        expect(result.exitCode, `expected IPv6 ${ip} to be unreachable`).not.toBe(0);
+      }
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  test('DNS resolution works', async () => {
+    const id = await createSandbox();
+    try {
+      const result = await execWithTransientRetry(id, resolve('example.com'), { timeoutMs: 10_000 });
+      expect(result).toHaveSucceeded();
+      // Should resolve to an IP address
+      expect(result.stdout.trim()).toMatch(/^\d+\.\d+\.\d+\.\d+$/);
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  // Docker's embedded DNS forwards to the runner's own resolver unless the
+  // runner configures others (SANDBOX_RUNNER_DOCKER_DNS_SERVERS). On this lane
+  // that resolver is the outer Docker's, which knows the API container by name,
+  // reached from the runner's namespace where the bridge policy never sees it.
+  // With public resolvers configured the name must not resolve. It is qualified
+  // with its network because the embedded DNS keeps single-label names to
+  // itself whenever the runner's resolv.conf sets ndots, which the outer
+  // Docker's does.
+  test('sandbox DNS does not go through the runner resolver', DOCKER_ONLY, async () => {
+    const apiContainer = process.env.E2E_API_CONTAINER_NAME;
+    test.skip(!apiContainer, 'needs E2E_API_CONTAINER_NAME (from e2e/run.sh)');
+    test.skip(!process.env.E2E_RUNNER_DOCKER_DNS_SERVERS, 'runner uses its own resolver');
+    const apiNetwork = docker([
+      'inspect',
+      '--format',
+      '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}',
+      apiContainer!,
+    ])
+      .trim()
+      .split(/\s+/)[0];
+    const apiName = `${apiContainer}.${apiNetwork}`;
+
+    const id = await createSandbox();
+    try {
+      const control = await execWithTransientRetry(id, resolve('example.com'), { timeoutMs: 10_000 });
+      expect(control.stdout.trim(), 'expected a public name to resolve').toMatch(/^\d+\.\d+\.\d+\.\d+$/);
+
+      const leaked = await execWithTransientRetry(id, resolve(apiName), { timeoutMs: 20_000 });
+      expect(leaked.stdout.trim(), `expected ${apiName} not to resolve from a sandbox`).toBe('');
+
+      // The runner's search domains stay out too, so a short name is never
+      // completed with a domain only the runner's network knows.
+      const resolvConf = await execWithTransientRetry(id, 'cat /etc/resolv.conf', { timeoutMs: 5_000 });
+      expect(resolvConf.stdout, 'expected no search domains in the guest').not.toMatch(/^search\s/m);
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+});
+
+test.describe('Egress none', () => {
+  // The same three probes run against a public and a sealed sandbox on the same
+  // runner, so a failure on the sealed side is the policy, not a runner without
+  // internet: a public address dialled directly, so the check does not depend on
+  // DNS; DNS itself, since a resolver reachable from a sealed sandbox would be a
+  // covert channel out; and a name over HTTPS.
+  const PUBLIC_IP = '1.1.1.1';
+  const PUBLIC_HOST = 'example.com';
+
+  // A sealed Firecracker sandbox drops packets rather than refusing them, so its
+  // probes only end when something gives up: with glibc's defaults (5 s, two
+  // attempts, two nameservers) the DNS lookup alone runs 20 s, and a test that
+  // probes twice cannot fit its 60 s budget. Bounding the resolver ends a sealed
+  // lookup in about 4 s; a public resolver answers in milliseconds either way.
+  // Sysbox seals with an internal network, where the same probes fail at once.
+  const BOUNDED_RESOLVER = `RES_OPTIONS='timeout:1 attempts:2'`;
+
+  const probe = async (id: string) => {
+    const direct = await execWithTransientRetry(id, tcpConnect(PUBLIC_IP, 80, 3), { timeoutMs: 10_000 });
+    const dns = await execWithTransientRetry(id, `${BOUNDED_RESOLVER} ${resolve(PUBLIC_HOST)}`, { timeoutMs: 15_000 });
+    const named = await execWithTransientRetry(
+      id,
+      `${BOUNDED_RESOLVER} curl -sS -o /dev/null --max-time 10 https://${PUBLIC_HOST}/`,
+      { timeoutMs: 20_000 },
+    );
+    return { direct: direct.exitCode === 0, dns: dns.stdout.trim() !== '', named: named.exitCode === 0 };
+  };
+
+  const expectOpen = async (id: string) =>
+    expect(await probe(id), 'expected the public sandbox to reach everything').toEqual({
+      direct: true,
+      dns: true,
+      named: true,
+    });
+
+  const expectSealed = async (id: string) =>
+    expect(await probe(id), 'expected the sealed sandbox to reach nothing').toEqual({
+      direct: false,
+      dns: false,
+      named: false,
+    });
+
+  test('sandbox reaches nothing a public sandbox reaches, and reports its mode', async () => {
+    const open = await createSandbox({ egress: 'public' });
+    let sealed: string | undefined;
+    try {
+      sealed = await createSandbox({ egress: 'none' });
+      expect((await client.getSandbox(open)).egress).toBe('public');
+      expect((await client.getSandbox(sealed)).egress).toBe('none');
+
+      // The sealed sandbox itself is fine: the daemon answers, only the way out is shut.
+      const alive = await execWithTransientRetry(sealed, 'echo sealed', { timeoutMs: 5_000 });
+      expect(alive).toHaveSucceeded();
+
+      await expectOpen(open);
+      await expectSealed(sealed);
+    } finally {
+      if (sealed) await cleanUpSandbox(sealed);
+      await cleanUpSandbox(open);
+    }
+  });
+
+  test('the mode survives a stop and wake', async () => {
+    test.skip(
+      !process.env.E2E_RUNNER_CONTROL_GRPC_ADDR || !process.env.E2E_RUNNER_API_KEY,
+      'needs the runner control address (from e2e/run.sh)',
+    );
+    const id = await createSandbox({ egress: 'none' });
+    try {
+      await expectSealed(id);
+      stopSandboxViaRunner(id);
+      // The exec wakes the sandbox. On Firecracker that is a fresh slot with a
+      // fresh namespace, so this is where a policy that only lived in the first
+      // namespace would be lost.
+      const woke = await execWithTransientRetry(id, 'echo after-wake', { timeoutMs: 30_000 });
+      expect(woke).toHaveSucceeded();
+      await expectSealed(id);
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+});
+
+// The Firecracker runner builds each slot's network namespace in the background
+// and rebuilds it after every release, so the second sandbox on a slot runs in a
+// namespace the wirer built. Slots are not in the API, so the runner's metrics
+// stand in: an empty runner (no slot-blocking sandbox) hands out slot 0 first, so
+// A and B share a slot when both are created into one; sandbox_slots_unwired is
+// zero once the wirer has nothing left to build, A's slot included; and a create
+// that finds its slot built spends no measurable time in setup_network, where an
+// inline build takes 85–105 ms (docs/performance.md).
+test.describe('Reused slot', FIRECRACKER_ONLY, () => {
+  const ACTIVE = 'sandbox_containers_active';
+  const UNWIRED = 'sandbox_slots_unwired';
+  const STEP = 'sandbox_lifecycle_step_duration_seconds';
+  const SETUP_NETWORK = { role: 'runner', operation: 'create', step: 'setup_network' };
+  const PREWIRED_MAX_SECONDS = 0.04;
+
+  const setupNetworkOfCreates = (body: string) => ({
+    count: parseCounter(body, `${STEP}_count`, SETUP_NETWORK),
+    sum: parseCounter(body, `${STEP}_sum`, SETUP_NETWORK),
+  });
+
+  // Every slot built, not a count that came back: mid-pass — the startup pass on
+  // a fresh runner, say — another slot's build could restore a count while A's
+  // slot is still waiting its turn. Only once nothing is left to build does B's
+  // setup_network time say whether B found its slot built rather than how long
+  // it queued behind the build.
+  async function waitForWirerIdle(timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let unwired = parseGauge(scrapeRunnerMetrics(), UNWIRED);
+    while (unwired !== 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+      unwired = parseGauge(scrapeRunnerMetrics(), UNWIRED);
+    }
+    if (unwired !== 0) {
+      throw new Error(`${UNWIRED} = ${unwired} after ${timeoutMs}ms — the wirer left slots unbuilt`);
+    }
+  }
+
+  test('the second sandbox on a slot gets the rebuilt namespace, egress policy intact', async () => {
+    test.skip(
+      !process.env.E2E_RUNNER_HTTP_ADDR && !process.env.E2E_RUNNER_CONTAINER_NAME,
+      'needs runner metrics (E2E_RUNNER_HTTP_ADDR from e2e/run-firecracker.sh)',
+    );
+    test.skip(
+      parseGauge(scrapeRunnerMetrics(), ACTIVE) !== 0,
+      'runner is not empty, so A and B are not guaranteed the same slot',
+    );
+
+    const first = await createSandbox();
+    await deleteSandbox(first);
+    expect(parseGauge(scrapeRunnerMetrics(), ACTIVE), 'A did not give its slot back').toBe(0);
+    await waitForWirerIdle();
+
+    const before = setupNetworkOfCreates(scrapeRunnerMetrics());
+    const id = await createSandbox();
+    try {
+      const after = setupNetworkOfCreates(scrapeRunnerMetrics());
+      expect(after.count, 'expected B to be the only create between the scrapes').toBe(before.count + 1);
+      expect(
+        after.sum - before.sum,
+        'B built its own namespace, so the wirer did not rebuild the slot after A',
+      ).toBeLessThan(PREWIRED_MAX_SECONDS);
+
+      const blocked = await execWithTransientRetry(id, tcpConnect('169.254.169.254', 80, 3), {
+        timeoutMs: 10_000,
+      });
+      expect(blocked.exitCode, 'expected the metadata endpoint to be unreachable on a reused slot').not.toBe(
+        0,
+      );
+
+      const allowed = await exec(
+        id,
+        `curl -fsSL -o /dev/null -w '%{http_code}' --max-time 15 https://example.com/`,
+        { timeoutMs: 30_000 },
+      );
+      expect(allowed, 'expected public egress to work on a reused slot').toHaveSucceeded();
+      expect(allowed.stdout.trim()).toBe('200');
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  // The egress none rule is applied to a slot's namespace at activation, so the
+  // question is whether it goes with the namespace when the slot is released.
+  // A public sandbox on the slot a sealed one just left must have its egress.
+  test('a sealed sandbox leaves no policy behind on its slot', async () => {
+    test.skip(
+      !process.env.E2E_RUNNER_HTTP_ADDR && !process.env.E2E_RUNNER_CONTAINER_NAME,
+      'needs runner metrics (E2E_RUNNER_HTTP_ADDR from e2e/run-firecracker.sh)',
+    );
+    test.skip(
+      parseGauge(scrapeRunnerMetrics(), ACTIVE) !== 0,
+      'runner is not empty, so A and B are not guaranteed the same slot',
+    );
+
+    const sealed = await createSandbox({ egress: 'none' });
+    await deleteSandbox(sealed);
+    expect(parseGauge(scrapeRunnerMetrics(), ACTIVE), 'A did not give its slot back').toBe(0);
+    await waitForWirerIdle();
+
+    const id = await createSandbox();
+    try {
+      const allowed = await exec(
+        id,
+        `curl -fsSL -o /dev/null -w '%{http_code}' --max-time 15 https://example.com/`,
+        { timeoutMs: 30_000 },
+      );
+      expect(allowed, "expected the sealed sandbox's DROP to have gone with its namespace").toHaveSucceeded();
+      expect(allowed.stdout.trim()).toBe('200');
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+});
+
+// These assert the installed rules rather than connectivity, which the tests
+// above cannot cover. A sandbox dialling another sandbox's daemon port from the
+// gateway address fails from the outside either way: the reply goes to the real
+// gateway, where the runner resets it, unless the attacker also poisons the
+// victim's ARP entry. So a curl proves nothing about whether the rule accepted
+// the packet, while the ruleset says so exactly.
+test.describe('Runner bridge policy', DOCKER_ONLY, () => {
+  const ruleChain = (rule: string) => rule.split(' ')[1];
+
+  test('policy leaves no address-matched way onto the bridge', async () => {
+    test.skip(
+      !process.env.E2E_RUNNER_CONTAINER_NAME,
+      'needs E2E_RUNNER_CONTAINER_NAME (from e2e/run.sh)',
+    );
+    const runnerContainer = process.env.E2E_RUNNER_CONTAINER_NAME!;
+
+    const id = await createSandbox();
+    try {
+      const rules = docker(['exec', runnerContainer, 'iptables', '-S'])
+        .split('\n')
+        .map((line) => line.trim());
+
+      // The interface the shared policy is keyed on, taken from the ruleset so
+      // the test does not depend on how Docker named this bridge.
+      const egressJump = rules
+        .map((line) => /^-A DOCKER-USER -i (\S+) -j N8N-SB-BR-EGRESS$/.exec(line))
+        .find((match) => match !== null);
+      expect(egressJump, 'expected the shared egress jump on the runner bridge').toBeTruthy();
+      const bridgeIface = egressJump![1];
+
+      // Every accept in a daemon ingress chain must exclude the bridge:
+      // a sandbox picks its own source address, so an accept matched on one is
+      // an accept it can claim.
+      const ingressRules = rules.filter((line) => /^-A N8N-SB-\w+-IN /.test(line));
+      expect(ingressRules.length, 'expected a daemon ingress chain for the sandbox').toBeGreaterThan(
+        0,
+      );
+      for (const rule of ingressRules.filter((line) => line.endsWith('-j ACCEPT'))) {
+        expect(rule, `expected the accept to exclude traffic arriving on ${bridgeIface}`).toContain(
+          `! -i ${bridgeIface}`,
+        );
+      }
+
+      for (const chain of new Set(ingressRules.map(ruleChain))) {
+        const chainRules = ingressRules.filter((rule) => ruleChain(rule) === chain);
+        expect(chainRules[chainRules.length - 1], `expected ${chain} to end in a drop`).toBe(
+          `-A ${chain} -j DROP`,
+        );
+      }
+
+      // The shared egress chain starts by dropping traffic for another sandbox
+      // on the bridge, which Docker's own inter-container block would never see
+      // behind the terminal accept, and ends in that accept, so nothing the
+      // policy blocks can have been appended behind it.
+      const egressRules = rules.filter((line) => line.startsWith('-A N8N-SB-BR-EGRESS '));
+      expect(egressRules[0], 'expected the bridge-to-bridge drop to be the first rule').toBe(
+        `-A N8N-SB-BR-EGRESS -o ${bridgeIface} -j DROP`,
+      );
+      for (const cidr of ['169.254.0.0/16', '224.0.0.0/4', '168.63.129.16/32']) {
+        expect(egressRules, 'expected the blocked ranges to sit before the terminal accept').toContain(
+          `-A N8N-SB-BR-EGRESS -d ${cidr} -j DROP`,
+        );
+      }
+      expect(
+        egressRules[egressRules.length - 1],
+        'expected the terminal accept to be the last rule',
+      ).toBe('-A N8N-SB-BR-EGRESS -j ACCEPT');
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  // Explicit servers are what keeps Docker's embedded DNS from forwarding to the
+  // runner's own resolver; the behaviour is covered by the DNS test above.
+  test('sandbox containers name the configured resolvers and no search domain', async () => {
+    test.skip(
+      !process.env.E2E_RUNNER_CONTAINER_NAME,
+      'needs E2E_RUNNER_CONTAINER_NAME (from e2e/run.sh)',
+    );
+    const servers = process.env.E2E_RUNNER_DOCKER_DNS_SERVERS;
+    test.skip(!servers, 'runner uses its own resolver');
+    const runnerContainer = process.env.E2E_RUNNER_CONTAINER_NAME!;
+
+    const id = await createSandbox();
+    try {
+      const container = JSON.parse(
+        docker(['exec', runnerContainer, 'docker', 'inspect', innerContainerName(id)]),
+      )[0] as { HostConfig: { Dns: string[]; DnsSearch: string[] } };
+      expect(container.HostConfig.Dns).toEqual(servers!.split(',').map((s) => s.trim()));
+      expect(container.HostConfig.DnsSearch).toEqual(['.']);
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  // The no-egress bridge never reaches the shared egress chain: its DOCKER-USER
+  // rule is a plain drop, keyed on the interface, and the network is internal so
+  // Docker's own isolation and the missing default route back it up.
+  test('the no-egress bridge drops in DOCKER-USER and is an internal network', async () => {
+    test.skip(
+      !process.env.E2E_RUNNER_CONTAINER_NAME,
+      'needs E2E_RUNNER_CONTAINER_NAME (from e2e/run.sh)',
+    );
+    const runnerContainer = process.env.E2E_RUNNER_CONTAINER_NAME!;
+
+    const id = await createSandbox({ egress: 'none' });
+    try {
+      const network = JSON.parse(
+        docker(['exec', runnerContainer, 'docker', 'network', 'inspect', 'runner-no-egress']),
+      )[0] as { Internal: boolean; Options: Record<string, string>; Containers: Record<string, unknown> };
+      expect(network.Internal, 'expected runner-no-egress to be an internal network').toBe(true);
+      expect(network.Options['com.docker.network.bridge.enable_icc']).toBe('false');
+      expect(
+        Object.keys(network.Containers).length,
+        'expected the sealed sandbox to be attached to runner-no-egress',
+      ).toBeGreaterThan(0);
+      const bridgeIface = network.Options['com.docker.network.bridge.name'];
+      expect(bridgeIface).toBe('br-no-egress');
+
+      const rules = docker(['exec', runnerContainer, 'iptables', '-S'])
+        .split('\n')
+        .map((line) => line.trim());
+      expect(rules).toContain(`-A DOCKER-USER -i ${bridgeIface} -j DROP`);
+      expect(
+        rules.filter((line) => line.startsWith(`-A DOCKER-USER -i ${bridgeIface} `)),
+        'expected the drop to be the only DOCKER-USER rule for the no-egress bridge',
+      ).toEqual([`-A DOCKER-USER -i ${bridgeIface} -j DROP`]);
+      expect(rules).toContain(`-A INPUT -i ${bridgeIface} -j N8N-SB-BR-HOST`);
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+});

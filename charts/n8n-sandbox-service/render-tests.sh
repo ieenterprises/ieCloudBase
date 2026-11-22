@@ -1,0 +1,804 @@
+#!/usr/bin/env bash
+# Render tests for the n8n-sandbox-service chart. CI runs this script.
+# Run it locally from any directory:
+#
+#   charts/n8n-sandbox-service/render-tests.sh
+#
+# The tests only render templates with helm; they need no cluster.
+set -euo pipefail
+
+CHART_DIR=$(cd "$(dirname "$0")" && pwd)
+
+render() {
+	helm template n8n-sandbox-service "$CHART_DIR" \
+		--set auth.existingSecret=n8n-sandbox-auth "$@"
+}
+
+must_fail() {
+	local message=$1
+	shift
+	local out
+	if out=$(render "$@" 2>&1); then
+		echo "expected the render to fail: $*" >&2
+		exit 1
+	fi
+	if ! printf '%s' "$out" | grep -q "$message"; then
+		echo "expected failure message [$message] for: $*" >&2
+		printf '%s\n' "$out" >&2
+		exit 1
+	fi
+}
+
+privileged=(--set runner.isolation=privileged --set runner.acknowledgePrivileged=true)
+
+echo "==> render variants"
+render >/dev/null
+render --set dataPlane.mode=external >/dev/null
+render \
+	--set tls.mode=certManager \
+	--set tls.certManager.issuerRef.name=sandbox-ca \
+	--set tls.certManager.issuerRef.kind=ClusterIssuer >/dev/null
+render \
+	--set api.ingress.enabled=true \
+	--set 'api.ingress.hosts[0].host=sandbox.example.com' \
+	--set 'api.ingress.tls[0].secretName=sandbox-api-public-tls' \
+	--set 'api.ingress.tls[0].hosts[0]=sandbox.example.com' >/dev/null
+render --set networkPolicy.enabled=true >/dev/null
+render --set dataPlane.mode=external --set networkPolicy.enabled=true >/dev/null
+render "${privileged[@]}" >/dev/null
+render "${privileged[@]}" --set networkPolicy.enabled=true >/dev/null
+
+echo "==> default values render the golden manifests"
+# Existing installs must not change: the default render is pinned byte for
+# byte, with the chart and app versions masked so version bumps leave it alone,
+# and without the blank line Helm 4 adds before each document separator.
+# After an intended change to the default render, regenerate it with:
+#   UPDATE_GOLDEN=1 charts/n8n-sandbox-service/render-tests.sh
+golden="$CHART_DIR/testdata/default-render.yaml"
+chart_info=$(helm show chart "$CHART_DIR")
+chart_version=$(awk '/^version:/{print $2}' <<<"$chart_info")
+app_version=$(awk '/^appVersion:/{print $2}' <<<"$chart_info")
+default_render=$(render | awk '
+	/^$/ {blank_lines++; next}
+	$0 != "---" {while (blank_lines-- > 0) print ""}
+	{blank_lines = 0; print}')
+default_render=${default_render//"n8n-sandbox-service-$chart_version"/n8n-sandbox-service-CHART_VERSION}
+default_render=${default_render//"$app_version"/APP_VERSION}
+if test -n "${UPDATE_GOLDEN:-}"; then
+	printf '%s\n' "$default_render" >"$golden"
+fi
+if ! diff -u "$golden" <(printf '%s\n' "$default_render"); then
+	echo "the default render changed; see $golden" >&2
+	exit 1
+fi
+
+echo "==> quota pool image lands on the bounded volume"
+# Privileged isolation: the pool lands on the bounded emptyDir.
+manifests=$(render "${privileged[@]}" \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=60)
+echo "$manifests" | grep -q 'mountPath: "/var/lib/docker-pool"'
+echo "$manifests" | grep -q 'SANDBOX_RUNNER_DISK_QUOTA_POOL_PATH: "/var/lib/docker-pool/docker.img"'
+
+# Privileged isolation: the quota pool can live on a PVC.
+manifests=$(render "${privileged[@]}" \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=60 \
+	--set runner.dockerDataRoot.persistence.enabled=true \
+	--set runner.dockerDataRoot.persistence.size=64Gi)
+echo "$manifests" | grep -q 'mountPath: "/var/lib/docker-pool"'
+echo "$manifests" | grep -q 'SANDBOX_RUNNER_DISK_QUOTA_POOL_PATH: "/var/lib/docker-pool/docker.img"'
+
+# A pool larger than the volume must fail the render.
+must_fail "must not exceed the docker data root size" "${privileged[@]}" \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=100
+
+# The pool size must be a positive integer.
+must_fail "positive whole number" "${privileged[@]}" \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=0
+must_fail "positive whole number" "${privileged[@]}" \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=-5
+must_fail "positive whole number" "${privileged[@]}" \
+	--set runner.config.defaultDiskQuotaMb=2048
+
+# Sysbox isolation gets the bounded emptyDir data root when persistence is off,
+# the same as privileged isolation. This is the default configuration.
+manifests=$(render)
+echo "$manifests" | grep -q 'mountPath: "/var/lib/docker"'
+echo "$manifests" | grep -q 'sizeLimit: 64Gi'
+
+# Persistence replaces the emptyDir with a volume claim, and the claim is the
+# only data-root volume.
+manifests=$(render "${privileged[@]}" \
+	--show-only templates/runner-statefulset.yaml \
+	--set runner.dockerDataRoot.persistence.enabled=true)
+echo "$manifests" | grep -q 'mountPath: "/var/lib/docker"'
+echo "$manifests" | grep -q "volumeClaimTemplates"
+if echo "$manifests" | grep -q 'emptyDir:'; then
+	echo "expected no emptyDir when persistence is enabled" >&2
+	exit 1
+fi
+
+# Sysbox always uses the emptyDir, even when hostUsers is omitted.
+must_fail "requires runner.isolation=privileged" \
+	--set runner.dockerDataRoot.persistence.enabled=true
+must_fail "requires runner.isolation=privileged" \
+	--set runner.dockerDataRoot.persistence.enabled=true \
+	--set runner.sysbox.runtime.hostUsers=null
+# Privileged isolation permits persistence.
+render "${privileged[@]}" \
+	--set runner.dockerDataRoot.persistence.enabled=true >/dev/null
+# The chart does not check hostUsers for privileged isolation.
+render "${privileged[@]}" \
+	--set runner.dockerDataRoot.persistence.enabled=true \
+	--set runner.privileged.runtime.hostUsers=false >/dev/null
+# Disk quotas do not allow Sysbox persistence.
+must_fail "requires runner.isolation=privileged" \
+	--set runner.dockerDataRoot.persistence.enabled=true \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=60
+must_fail "requires runner.isolation=privileged" \
+	--set runner.dockerDataRoot.persistence.enabled=true \
+	--set runner.sysbox.runtime.hostUsers=null \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=60
+render "${privileged[@]}" \
+	--set runner.dockerDataRoot.persistence.enabled=true \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=60 >/dev/null
+render "${privileged[@]}" \
+	--set runner.dockerDataRoot.persistence.enabled=true \
+	--set runner.privileged.runtime.hostUsers=false \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=60 >/dev/null
+
+# A missing or unsupported volume size must fail, not skip the guard.
+must_fail "whole number of G or Gi" "${privileged[@]}" \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=60 \
+	--set runner.dockerDataRoot.emptyDir.sizeLimit=null
+must_fail "whole number of G or Gi" "${privileged[@]}" \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=60 \
+	--set runner.dockerDataRoot.emptyDir.sizeLimit=500Mi
+
+# An explicit pool path owns its own volume; skip the size comparison.
+manifests=$(render "${privileged[@]}" \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=100 \
+	--set runner.config.diskQuotaPoolPath=/mnt/pool/docker.img)
+echo "$manifests" | grep -q 'SANDBOX_RUNNER_DISK_QUOTA_POOL_PATH: "/mnt/pool/docker.img"'
+
+# Default sysbox isolation now holds the pool image on its bounded emptyDir,
+# so quotas render without persistence.
+manifests=$(render \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=60)
+echo "$manifests" | grep -q 'mountPath: "/var/lib/docker-pool"'
+echo "$manifests" | grep -q 'SANDBOX_RUNNER_DISK_QUOTA_POOL_PATH: "/var/lib/docker-pool/docker.img"'
+echo "$manifests" | grep -q 'sizeLimit: 64Gi'
+# The pool size is still mandatory, and still checked against that volume.
+must_fail "positive whole number" \
+	--set runner.config.defaultDiskQuotaMb=2048
+must_fail "must not exceed the docker data root size" \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=100
+
+# An explicit pool path covers that case: the operator owns the volume.
+manifests=$(render \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=60 \
+	--set runner.config.diskQuotaPoolPath=/mnt/pool/docker.img)
+echo "$manifests" | grep -q 'SANDBOX_RUNNER_DISK_QUOTA_POOL_PATH: "/mnt/pool/docker.img"'
+echo "$manifests" | grep -q 'SANDBOX_RUNNER_DISK_QUOTA_POOL_SIZE_GB: "60"'
+
+echo "==> volume cache"
+# Defaults leave the runner's cache settings alone and add no volume.
+manifests=$(render)
+if echo "$manifests" | grep -e SANDBOX_RUNNER_VOLUME_CACHE -e 'name: volume-cache' >/dev/null; then
+	echo "expected no volume cache settings or volume by default" >&2
+	exit 1
+fi
+
+manifests=$(render \
+	--set runner.config.volumeCacheDir=/var/cache/volumes \
+	--set runner.config.volumeCacheMaxBytes=10737418240 \
+	--set runner.volumeCache.emptyDir.enabled=true \
+	--set runner.volumeCache.emptyDir.sizeLimit=12Gi)
+echo "$manifests" | grep 'SANDBOX_RUNNER_VOLUME_CACHE_DIR: "/var/cache/volumes"' >/dev/null
+echo "$manifests" | grep 'SANDBOX_RUNNER_VOLUME_CACHE_MAX_BYTES: "10737418240"' >/dev/null
+echo "$manifests" | grep 'mountPath: "/var/cache/volumes"' >/dev/null
+echo "$manifests" | grep 'sizeLimit: 12Gi' >/dev/null
+
+# Without a dir of its own, the emptyDir mounts at the runner's default under
+# the data dir, and must hold the default 20 GiB budget and 5% more.
+manifests=$(render "${privileged[@]}" \
+	--set runner.config.dataDir=/data/ \
+	--set runner.volumeCache.emptyDir.enabled=true \
+	--set runner.volumeCache.emptyDir.sizeLimit=21Gi)
+echo "$manifests" | grep 'mountPath: "/data/volume-cache"' >/dev/null
+must_fail "and 5% more" \
+	--set runner.volumeCache.emptyDir.enabled=true \
+	--set runner.volumeCache.emptyDir.sizeLimit=20Gi
+must_fail "and 5% more" \
+	--set runner.config.volumeCacheMaxBytes=10737418240 \
+	--set runner.volumeCache.emptyDir.enabled=true \
+	--set runner.volumeCache.emptyDir.sizeLimit=10Gi
+# The runner empties its cache dir at startup: never Docker's data root.
+must_fail "the runner empties the cache dir at startup" \
+	--set runner.config.volumeCacheDir=/var/lib/docker/volume-cache
+must_fail "the runner empties the cache dir at startup" \
+	--set runner.config.volumeCacheDir=/var/lib
+must_fail "the runner empties the cache dir at startup" \
+	--set runner.config.defaultDiskQuotaMb=2048 \
+	--set runner.config.diskQuotaPoolSizeGb=60 \
+	--set runner.config.volumeCacheDir=/var/lib/docker-pool/
+for unclean in /var/lib//docker /var/lib/./docker/cache /var//lib /var/cache/../lib/docker; do
+	must_fail "the runner empties the cache dir at startup" \
+		--set "runner.config.volumeCacheDir=$unclean"
+done
+must_fail "must be an absolute path" \
+	--set runner.config.volumeCacheDir=volume-cache
+must_fail "must be an absolute path" \
+	--set runner.config.dataDir=sandboxes \
+	--set runner.volumeCache.emptyDir.enabled=true \
+	--set runner.volumeCache.emptyDir.sizeLimit=21Gi
+# A relative data dir, which the runner resolves itself, still renders.
+render --set runner.config.dataDir=sandboxes >/dev/null
+# An empty data dir is the runner's default.
+render --set runner.config.dataDir= \
+	--set runner.volumeCache.emptyDir.enabled=true \
+	--set runner.volumeCache.emptyDir.sizeLimit=21Gi \
+	--show-only templates/runner-statefulset.yaml |
+	grep 'mountPath: "/var/sandboxes/volume-cache"' >/dev/null
+# Whatever the runner refuses to wipe fails here too.
+must_fail "must not be /" \
+	--set runner.config.volumeCacheDir=/
+must_fail "must not be the data dir" \
+	--set runner.config.volumeCacheDir=/var/sandboxes/
+must_fail "must not be the data dir" \
+	--set runner.config.volumeCacheDir=/var
+# Surrounding space is trimmed, as the runner trims it.
+render --set 'runner.config.volumeCacheDir= /var/cache/volumes ' \
+	--set runner.volumeCache.emptyDir.enabled=true \
+	--set runner.volumeCache.emptyDir.sizeLimit=21Gi \
+	--show-only templates/runner-statefulset.yaml |
+	grep 'mountPath: "/var/cache/volumes"' >/dev/null
+must_fail "at most 16 digits" \
+	--set runner.config.volumeCacheMaxBytes=500000000000000000 \
+	--set runner.volumeCache.emptyDir.enabled=true \
+	--set runner.volumeCache.emptyDir.sizeLimit=1Gi
+must_fail "whole number of Gi" \
+	--set runner.volumeCache.emptyDir.enabled=true
+must_fail "whole number of Gi" \
+	--set runner.volumeCache.emptyDir.enabled=true \
+	--set runner.volumeCache.emptyDir.sizeLimit=20G
+must_fail "positive whole number of bytes" \
+	--set runner.config.volumeCacheMaxBytes=20GiB
+# --set-json reads numbers as float64, as values files do.
+render --set-json 'runner.config.volumeCacheMaxBytes=10737418240' |
+	grep 'SANDBOX_RUNNER_VOLUME_CACHE_MAX_BYTES: "10737418240"' >/dev/null
+
+echo "==> long runner names stay isolation-specific and unique"
+statefulset_name() {
+	local release_name=$1
+	shift
+	helm template "$release_name" "$CHART_DIR" \
+		--set auth.existingSecret=n8n-sandbox-auth "$@" \
+		--show-only templates/runner-statefulset.yaml |
+		awk '/^  name:/{print $2; exit}'
+}
+release_name=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+other_release_name=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab
+sysbox_name=$(statefulset_name "$release_name")
+privileged_name=$(statefulset_name "$release_name" "${privileged[@]}")
+other_privileged_name=$(statefulset_name "$other_release_name" "${privileged[@]}")
+test "$sysbox_name" != "$privileged_name"
+test "$privileged_name" != "$other_privileged_name"
+
+echo "==> runner names leave room for the StatefulSet ordinal"
+# The StatefulSet controller copies the pod name "<runner>-<ordinal>" into the
+# pod hostname, and Kubernetes limits a hostname to 63 characters. A runner
+# name above 61 characters therefore renders a StatefulSet whose pods the API
+# server always rejects. Helm limits a release name to 53 characters.
+for length in 1 20 40 41 42 43 44 45 46 47 48 49 50 53; do
+	long_release=$(printf 'a%.0s' $(seq "$length"))
+	for isolation in sysbox privileged; do
+		name=$(statefulset_name "$long_release" \
+			--set runner.isolation="$isolation" \
+			--set runner.acknowledgePrivileged=true)
+		if test "${#name}" -gt 61; then
+			echo "runner name leaves no room for the ordinal:" >&2
+			echo "  isolation=$isolation release length=$length name=$name (${#name})" >&2
+			exit 1
+		fi
+	done
+done
+
+echo "==> the API serves metrics on its HTTP port by default"
+# dataPlane.mode=external isolates the API ServiceMonitor: both live in one
+# rendered file, so the runner's would otherwise satisfy these greps too.
+api_only=(--set dataPlane.mode=external --set monitoring.serviceMonitor.enabled=true)
+config=$(render "${api_only[@]}" --show-only templates/configmap.yaml)
+grep -q 'SANDBOX_API_METRICS_ENABLED: "true"' <<<"$config"
+grep -q 'SANDBOX_API_METRICS_LISTEN_ADDR: ""' <<<"$config"
+render "${api_only[@]}" --show-only templates/servicemonitor.yaml | grep -q 'port: http'
+# Render first, then test the captured output: set -e is suspended inside an if
+# condition, so a broken template would look like a correctly absent port.
+default_service=$(render "${api_only[@]}" --show-only templates/api-service.yaml)
+if grep -q 'name: metrics' <<<"$default_service"; then
+	echo "the default must not add a metrics Service port" >&2
+	exit 1
+fi
+
+echo "==> a dedicated metrics port moves the container port, Service port, scrape and policy"
+# --set-string, or helm reads the leading colon as a nested key.
+separate=("${api_only[@]}" --set-string api.config.metricsListenAddr=:9100)
+# Without the env var the API keeps /metrics on its HTTP port, and every port
+# assertion below would still pass against a dead scrape target.
+render "${separate[@]}" --show-only templates/configmap.yaml |
+	grep -q 'SANDBOX_API_METRICS_LISTEN_ADDR: ":9100"'
+render "${separate[@]}" --show-only templates/api-deployment.yaml | grep -q 'containerPort: 9100'
+render "${separate[@]}" --show-only templates/api-service.yaml | grep -q 'port: 9100'
+render "${separate[@]}" --show-only templates/servicemonitor.yaml | grep -q 'port: metrics'
+render "${separate[@]}" --set networkPolicy.enabled=true \
+	--show-only templates/networkpolicy.yaml | grep -q 'port: metrics'
+
+echo "==> a metrics addr on the API port keeps the shared listener"
+# Wildcard spellings and a padded port included: the chart must not split a
+# listener the binary would share.
+for addr in :8080 0.0.0.0:8080 "[::]:8080" :08080; do
+	shared=("${api_only[@]}" --set-string "api.config.metricsListenAddr=$addr")
+	shared_service=$(render "${shared[@]}" --show-only templates/api-service.yaml)
+	if grep -q 'name: metrics' <<<"$shared_service"; then
+		echo "metricsListenAddr=$addr must not add a Service port" >&2
+		exit 1
+	fi
+	render "${shared[@]}" --show-only templates/servicemonitor.yaml | grep -q 'port: http'
+done
+
+echo "==> conflicting metrics addresses fail the render"
+must_fail "must not use the port of api.config.grpcListenAddr" \
+	--set-string api.config.metricsListenAddr=:9090
+must_fail "must be host:port with a numeric port" \
+	--set-string api.config.metricsListenAddr=9100
+# A port the API rejects at startup must not render a manifest.
+must_fail "port must be between 1 and 65535" \
+	--set-string api.config.metricsListenAddr=:70000
+# Same port, genuinely different host: the API refuses this, so the render does.
+must_fail "leave it empty to serve /metrics on the API listener" \
+	--set-string api.config.listenAddr=127.0.0.1:8080 \
+	--set-string api.config.metricsListenAddr=0.0.0.0:8080
+# net.SplitHostPort rejects an unbracketed IPv6 address; the bracketed form is fine.
+must_fail "must be host:port with a numeric port" \
+	--set-string api.config.metricsListenAddr=::1:9100
+render "${api_only[@]}" --set-string 'api.config.metricsListenAddr=[::]:9100' \
+	--show-only templates/api-service.yaml | grep -q 'port: 9100'
+# Helm cannot resolve a service name, so it must not guess at one.
+must_fail "must use a numeric port when api.config.metricsListenAddr is set" \
+	--set-string api.config.listenAddr=:http \
+	--set-string api.config.metricsListenAddr=:80
+# api.service.* ports are independent of the bound ports, so a metrics port can
+# collide with one and make the Service list it twice.
+must_fail "repeats an API Service port" \
+	--set api.service.httpPort=9100 \
+	--set-string api.config.metricsListenAddr=:9100
+must_fail "repeats an API Service port" \
+	--set api.service.grpcPort=9100 \
+	--set-string api.config.metricsListenAddr=:9100
+# A custom Service port that does not collide still renders.
+render "${api_only[@]}" --set api.service.httpPort=8090 \
+	--set-string api.config.metricsListenAddr=:9100 \
+	--show-only templates/api-service.yaml | grep -q 'port: 9100'
+# A loopback bind is unreachable from a ServiceMonitor scraping the pod IP.
+must_fail "binds loopback" \
+	--set monitoring.serviceMonitor.enabled=true \
+	--set-string api.config.metricsListenAddr=127.0.0.1:9100
+# ...but it is legitimate for a sidecar, so it renders with that scrape off.
+render --set monitoring.serviceMonitor.enabled=true \
+	--set monitoring.serviceMonitor.api.enabled=false \
+	--set-string api.config.metricsListenAddr=127.0.0.1:9100 \
+	--show-only templates/api-service.yaml | grep -q 'port: 9100'
+# A loopback address on the shared port is listenAddr's business, not the
+# metrics port's: the scrape follows the http port, so this must still render
+# rather than send the operator to advice that trips the host-mismatch guard.
+render --set monitoring.serviceMonitor.enabled=true \
+	--set-string api.config.listenAddr=127.0.0.1:8080 \
+	--set-string api.config.metricsListenAddr=127.0.0.1:8080 \
+	--show-only templates/configmap.yaml | grep -q 'SANDBOX_API_METRICS_LISTEN_ADDR: "127.0.0.1:8080"'
+# An unset address must not read as one that was set ("<nil>").
+render "${api_only[@]}" --set api.config.metricsListenAddr=null \
+	--show-only templates/configmap.yaml | grep -q 'SANDBOX_API_METRICS_LISTEN_ADDR: ""'
+
+echo "==> the runner scrape verifies TLS by default"
+# The default must pin serverName to a name the runner certificate actually
+# carries, or the scrape fails to verify. Compare against the issued SANs
+# rather than a literal, so renaming the runner cannot drift the two apart.
+cert_manager=(
+	--set tls.mode=certManager
+	--set tls.certManager.issuerRef.name=sandbox-ca
+	--set tls.certManager.issuerRef.kind=ClusterIssuer
+)
+monitor=$(render --set monitoring.serviceMonitor.enabled=true "${cert_manager[@]}" \
+	--show-only templates/servicemonitor.yaml)
+echo "$monitor" | grep -q 'key: "ca.crt"'
+server_name=$(echo "$monitor" | sed -n 's/.*serverName: "\(.*\)"/\1/p')
+test -n "$server_name"
+# Strip the list markers and match the whole value as a fixed string: the dots
+# in a DNS name are regex wildcards to grep, so a pattern match would accept a
+# SAN that differs from serverName wherever a dot sits.
+render "${cert_manager[@]}" --show-only templates/cert-manager.yaml |
+	sed -n 's/^[[:space:]]*- //p' |
+	grep -Fxq "$server_name"
+
+echo "==> the runner scrape TLS config stays overridable"
+render --set monitoring.serviceMonitor.enabled=true \
+	--set monitoring.serviceMonitor.runner.tlsConfig.insecureSkipVerify=true \
+	--show-only templates/servicemonitor.yaml | grep -q 'insecureSkipVerify: true'
+# A plaintext scrape must not carry a tlsConfig. Render first and test the
+# captured output: set -e is suspended inside an if condition, and a failed
+# render leaves grep with nothing to match, so a broken template would look
+# exactly like a correctly absent tlsConfig and pass.
+plaintext=$(render --set monitoring.serviceMonitor.enabled=true \
+	--set monitoring.serviceMonitor.runner.scheme=http \
+	--show-only templates/servicemonitor.yaml)
+if grep -q 'tlsConfig' <<<"$plaintext"; then
+	echo "a plaintext runner scrape must not render a tlsConfig" >&2
+	exit 1
+fi
+
+echo "==> provisioner keys are an optional Secret key"
+# The env var always renders, marked optional, so an existing Secret without
+# the key still starts the API.
+api=$(render --show-only templates/api-deployment.yaml)
+# The whole env entry, from its name to the next one.
+provisioner_env=$(awk '/name: SANDBOX_API_PROVISIONER_KEYS/{f=1; next} f && /- name:/{exit} f' <<<"$api")
+grep -q 'key: provisioner-api-keys' <<<"$provisioner_env"
+grep -q 'optional: true' <<<"$provisioner_env"
+# The generated Secret carries the key only when a non-blank value is given.
+generated=(
+	--set auth.existingSecret=""
+	--set auth.generated.apiKeys=admin-secret
+	--set auth.generated.runnerRegistrationToken=reg-secret
+	--set auth.generated.runnerApiKey=runner-secret
+	--set auth.generated.runnerApiKeys=runner-secret
+)
+for blank in "" "  "; do
+	secret=$(render "${generated[@]}" --set auth.generated.provisionerKeys="$blank" --show-only templates/secrets.yaml)
+	if grep -q 'provisioner-api-keys' <<<"$secret"; then
+		echo "a blank auth.generated.provisionerKeys must not render a Secret key" >&2
+		exit 1
+	fi
+done
+render "${generated[@]}" --set auth.generated.provisionerKeys=prov-secret \
+	--show-only templates/secrets.yaml | grep -q 'provisioner-api-keys: "prov-secret"'
+must_fail "auth.generated.provisionerKeys must not be a placeholder" \
+	"${generated[@]}" --set auth.generated.provisionerKeys=changeme
+
+echo "==> scaler keys are an optional Secret key"
+scaler_env=$(awk '/name: SANDBOX_API_SCALER_KEYS/{f=1; next} f && /- name:/{exit} f' <<<"$api")
+grep -q 'key: scaler-api-keys' <<<"$scaler_env"
+grep -q 'optional: true' <<<"$scaler_env"
+for blank in "" "  "; do
+	secret=$(render "${generated[@]}" --set auth.generated.scalerKeys="$blank" --show-only templates/secrets.yaml)
+	if grep -q 'scaler-api-keys' <<<"$secret"; then
+		echo "a blank auth.generated.scalerKeys must not render a Secret key" >&2
+		exit 1
+	fi
+done
+render "${generated[@]}" --set auth.generated.scalerKeys=scaler-secret \
+	--show-only templates/secrets.yaml | grep -q 'scaler-api-keys: "scaler-secret"'
+must_fail "auth.generated.scalerKeys must not be a placeholder" \
+	"${generated[@]}" --set auth.generated.scalerKeys=changeme
+
+echo "==> API autoscaling is off by default"
+default_api=$(render --show-only templates/api-deployment.yaml)
+grep -q 'replicas: 1' <<<"$default_api"
+default_manifests=$(render)
+if grep -q 'kind: HorizontalPodAutoscaler' <<<"$default_manifests"; then
+	echo "api.autoscaling must be off by default" >&2
+	exit 1
+fi
+
+echo "==> enabled API autoscaling owns the replica count"
+postgres_api=(--set api.config.store=postgres --set api.persistence.enabled=false)
+autoscaling=("${postgres_api[@]}" --set api.autoscaling.enabled=true --set api.resources.requests.cpu=100m)
+scaled_api=$(render "${autoscaling[@]}" --show-only templates/api-deployment.yaml)
+# A rendered spec.replicas is what a GitOps tool resets the HPA's count to.
+if grep -q 'replicas:' <<<"$scaled_api"; then
+	echo "the Deployment must leave spec.replicas to the HPA" >&2
+	exit 1
+fi
+hpa=$(render "${autoscaling[@]}" --show-only templates/api-hpa.yaml)
+api_name=$(awk '/^  name:/{print $2; exit}' <<<"$scaled_api")
+grep -A3 'scaleTargetRef:' <<<"$hpa" | grep -q "name: $api_name\$"
+grep -q 'averageUtilization: 80' <<<"$hpa"
+if grep -q 'name: memory' <<<"$hpa"; then
+	echo "the memory metric must be opt-in" >&2
+	exit 1
+fi
+render "${autoscaling[@]}" --set api.autoscaling.targetMemoryAverageValue=700Mi \
+	--show-only templates/api-hpa.yaml | grep -q 'averageValue: "700Mi"'
+# A memory-only HPA needs no CPU request. Null and empty both drop the CPU metric.
+for cpu_off in null ""; do
+	memory_only=$(render "${postgres_api[@]}" --set api.autoscaling.enabled=true \
+		--set "api.autoscaling.targetCPUUtilizationPercentage=$cpu_off" \
+		--set api.autoscaling.targetMemoryAverageValue=700Mi \
+		--show-only templates/api-hpa.yaml)
+	grep -q 'name: memory' <<<"$memory_only"
+	if grep -q 'name: cpu' <<<"$memory_only"; then
+		echo "targetCPUUtilizationPercentage=$cpu_off must drop the CPU metric" >&2
+		exit 1
+	fi
+done
+# The API server accepts utilization above 100: use can exceed the request.
+render "${autoscaling[@]}" --set api.autoscaling.targetCPUUtilizationPercentage=150 \
+	--show-only templates/api-hpa.yaml | grep -q 'averageUtilization: 150'
+
+echo "==> API autoscaling values the API server would reject fail the render"
+must_fail "minReplicas must be a whole number of at least 1" \
+	"${autoscaling[@]}" --set api.autoscaling.minReplicas=0
+must_fail "maxReplicas must be a whole number of at least 1" \
+	"${autoscaling[@]}" --set api.autoscaling.maxReplicas=2.5
+must_fail "must not be below api.autoscaling.minReplicas" \
+	"${autoscaling[@]}" --set api.autoscaling.minReplicas=5 --set api.autoscaling.maxReplicas=2
+# A 0 must not quietly drop the CPU metric and leave a memory-only HPA.
+must_fail "targetCPUUtilizationPercentage must be a whole number of at least 1" \
+	"${autoscaling[@]}" --set api.autoscaling.targetCPUUtilizationPercentage=0 \
+	--set api.autoscaling.targetMemoryAverageValue=700Mi
+must_fail "targetCPUUtilizationPercentage must be a whole number of at least 1" \
+	"${autoscaling[@]}" --set api.autoscaling.targetCPUUtilizationPercentage=-5
+must_fail "targetMemoryAverageValue must be a whole number with an optional unit" \
+	"${autoscaling[@]}" --set api.autoscaling.targetMemoryAverageValue=0
+# These values render unquoted, so a newline must not smuggle YAML into the HPA.
+must_fail "minReplicas must be a whole number of at least 1" \
+	"${autoscaling[@]}" --set-string $'api.autoscaling.minReplicas=2\n  behavior: {}'
+
+echo "==> API autoscaling refuses setups that cannot run several API pods"
+must_fail "requires api.config.store=postgres" \
+	--set api.persistence.enabled=false \
+	--set api.autoscaling.enabled=true --set api.resources.requests.cpu=100m
+must_fail "requires api.persistence.enabled=false" \
+	--set api.config.store=postgres \
+	--set api.autoscaling.enabled=true --set api.resources.requests.cpu=100m
+must_fail "requires api.resources.requests.cpu" \
+	"${postgres_api[@]}" --set api.autoscaling.enabled=true
+# The API server accepts a zero CPU request, but the HPA cannot scale on it.
+for cpu_zero in 0 0m 0.0; do
+	must_fail "requires api.resources.requests.cpu above zero" \
+		"${postgres_api[@]}" --set api.autoscaling.enabled=true \
+		--set-string "api.resources.requests.cpu=$cpu_zero"
+done
+for cpu_request in 1 250m 0.5; do
+	render "${postgres_api[@]}" --set api.autoscaling.enabled=true \
+		--set-string "api.resources.requests.cpu=$cpu_request" >/dev/null
+done
+must_fail "targetMemoryAverageValue, or both" \
+	"${postgres_api[@]}" --set api.autoscaling.enabled=true \
+	--set api.autoscaling.targetCPUUtilizationPercentage=null
+
+echo "==> the API keeps the namespace's default ServiceAccount by default"
+# The golden covers this too; these checks survive a careless regeneration.
+if grep -q 'kind: ServiceAccount' <<<"$default_manifests"; then
+	echo "api.serviceAccount.create must be off by default" >&2
+	exit 1
+fi
+for field in serviceAccountName automountServiceAccountToken initContainers terminationGracePeriodSeconds; do
+	if grep -q "$field" <<<"$default_api"; then
+		echo "the default API Deployment must not set $field" >&2
+		exit 1
+	fi
+done
+
+echo "==> a created API ServiceAccount carries its annotations and a derived name"
+created=(
+	--set api.serviceAccount.create=true
+	--set-string 'api.serviceAccount.annotations.azure\.workload\.identity/client-id=00000000-0000-0000-0000-000000000001'
+)
+service_account=$(render "${created[@]}" --show-only templates/api-serviceaccount.yaml)
+grep -q '^  name: "n8n-sandbox-service-api"$' <<<"$service_account"
+grep -Fq 'azure.workload.identity/client-id: 00000000-0000-0000-0000-000000000001' <<<"$service_account"
+grep -q '^automountServiceAccountToken: false$' <<<"$service_account"
+created_api=$(render "${created[@]}" --show-only templates/api-deployment.yaml)
+grep -q 'serviceAccountName: "n8n-sandbox-service-api"' <<<"$created_api"
+grep -q '^      automountServiceAccountToken: false$' <<<"$created_api"
+# A name set alongside create names the created ServiceAccount.
+render "${created[@]}" --set api.serviceAccount.name=sandbox-api \
+	--show-only templates/api-serviceaccount.yaml | grep -q '^  name: "sandbox-api"$'
+
+echo "==> an existing API ServiceAccount is used, not created, and mounts no token"
+existing=$(render --set api.serviceAccount.name=sandbox-api-existing)
+grep -q 'serviceAccountName: "sandbox-api-existing"' <<<"$existing"
+grep -q '^      automountServiceAccountToken: false$' <<<"$existing"
+if grep -q 'kind: ServiceAccount' <<<"$existing"; then
+	echo "api.serviceAccount.create=false must not render a ServiceAccount" >&2
+	exit 1
+fi
+
+echo "==> api.podLabels join the pod labels but never replace the selector labels"
+# --set, not --set-string, for the workload identity label: a boolean must
+# still render as the string Kubernetes requires.
+labelled=$(render \
+	--set 'api.podLabels.azure\.workload\.identity/use=true' \
+	--set-string 'api.podLabels.app\.kubernetes\.io/component=sysbox-runner' \
+	--set-string 'api.podLabels.app\.kubernetes\.io/instance=other' \
+	--show-only templates/api-deployment.yaml)
+selector_labels='app.kubernetes.io/name: n8n-sandbox-service
+app.kubernetes.io/instance: n8n-sandbox-service
+app.kubernetes.io/component: api'
+# The lines nested under a header line, without their indent.
+nested_lines() {
+	awk -v header="$1" '
+		$0 == header {inside=1; match($0, /^ */); depth=RLENGTH; next}
+		inside {match($0, /^ */); if (RLENGTH <= depth) exit; sub(/^ +/, ""); print}'
+}
+test "$(nested_lines '    matchLabels:' <<<"$labelled")" = "$selector_labels"
+test "$(nested_lines '      labels:' <<<"$labelled")" = "$selector_labels
+azure.workload.identity/use: \"true\""
+
+echo "==> api.initContainers render as given, so a native sidecar keeps its restartPolicy"
+sidecar=$(render \
+	--set 'api.initContainers[0].name=volume-store' \
+	--set 'api.initContainers[0].image=example.com/volume-store:1' \
+	--set 'api.initContainers[0].restartPolicy=Always' \
+	--show-only templates/api-deployment.yaml)
+test "$(nested_lines '      initContainers:' <<<"$sidecar")" = "- image: example.com/volume-store:1
+name: volume-store
+restartPolicy: Always"
+
+echo "==> api.terminationGracePeriodSeconds renders when set, including 0"
+for seconds in 300 0; do
+	render --set "api.terminationGracePeriodSeconds=$seconds" \
+		--show-only templates/api-deployment.yaml |
+		grep -q "^      terminationGracePeriodSeconds: $seconds\$"
+done
+no_grace_period=$(render --set api.terminationGracePeriodSeconds=null \
+	--show-only templates/api-deployment.yaml)
+if grep -q terminationGracePeriodSeconds <<<"$no_grace_period"; then
+	echo "a null api.terminationGracePeriodSeconds must keep the Kubernetes default" >&2
+	exit 1
+fi
+for seconds in -1 2.5 30s 010; do
+	must_fail "api.terminationGracePeriodSeconds must be a whole number of seconds" \
+		--set-string "api.terminationGracePeriodSeconds=$seconds"
+done
+must_fail "api.terminationGracePeriodSeconds must be a whole number of seconds" \
+	--set api.terminationGracePeriodSeconds=-1
+
+echo "==> whole numbers from values files render as integers, not in exponent form"
+# --set-json reads numbers as float64, as values files do.
+render --set-json 'api.terminationGracePeriodSeconds=1000000' \
+	--show-only templates/api-deployment.yaml |
+	grep -q '^      terminationGracePeriodSeconds: 1000000$'
+must_fail "api.terminationGracePeriodSeconds must be a whole number of seconds" \
+	--set-json 'api.terminationGracePeriodSeconds=2.5'
+render --set-json 'api.podLabels.build=20240101' \
+	--show-only templates/api-deployment.yaml | grep -q '^        build: "20240101"$'
+
+echo "==> the local volume store is off by default"
+# The golden covers this too; these checks survive a careless regeneration.
+default_with_policy=$(render --set networkPolicy.enabled=true)
+for manifests in "$default_manifests" "$default_with_policy"; do
+	if grep -q 'volume-objects\|SANDBOX_API_VOLUME' <<<"$manifests"; then
+		echo "the default render must not open the volume-objects port or set volume settings" >&2
+		exit 1
+	fi
+done
+
+echo "==> api.config.volumeStore=local opens the volume-objects port to runners and derives the URL"
+local_store=(--set api.config.volumeStore=local)
+volume_config=$(render "${local_store[@]}" --show-only templates/configmap.yaml)
+grep -q 'SANDBOX_API_VOLUME_STORE: "local"' <<<"$volume_config"
+grep -q 'SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR: ":8443"' <<<"$volume_config"
+volume_url=$(sed -n 's/.*SANDBOX_API_VOLUME_LOCAL_URL: "\(.*\)"/\1/p' <<<"$volume_config")
+test "$volume_url" = "https://n8n-sandbox-service-api:8443"
+# The URL names the host in-cluster runners register with, which the
+# registration certificate carries.
+volume_host=${volume_url#https://}
+volume_host=${volume_host%:*}
+runner_grpc_addr=$(render "${local_store[@]}" --show-only templates/runner-statefulset.yaml |
+	awk '/name: SANDBOX_RUNNER_API_GRPC_ADDR/{getline; print}' | sed -n 's/.*value: "\(.*\)"/\1/p')
+test "$volume_host" = "${runner_grpc_addr%:*}"
+render "${local_store[@]}" "${cert_manager[@]}" --show-only templates/cert-manager.yaml |
+	sed -n 's/^[[:space:]]*- //p' |
+	grep -Fx "$volume_host" >/dev/null
+render "${local_store[@]}" --show-only templates/api-deployment.yaml |
+	grep -A1 'name: volume-objects' | grep 'containerPort: 8443' >/dev/null
+render "${local_store[@]}" --show-only templates/api-service.yaml |
+	grep -A1 'name: volume-objects' | grep 'port: 8443' >/dev/null
+# The same peers as the grpc port: the port joins that rule and no other.
+volume_policy=$(render "${local_store[@]}" --set networkPolicy.enabled=true --show-only templates/networkpolicy.yaml)
+grep -A2 -- '- port: grpc' <<<"$volume_policy" | grep 'port: volume-objects' >/dev/null
+test "$(grep -c 'port: volume-objects' <<<"$volume_policy")" = 1
+# A custom Service port moves the URL with it; a custom address moves the
+# container port.
+render "${local_store[@]}" --set api.service.volumeObjectsPort=9443 \
+	--show-only templates/configmap.yaml |
+	grep 'SANDBOX_API_VOLUME_LOCAL_URL: "https://n8n-sandbox-service-api:9443"' >/dev/null
+render "${local_store[@]}" --set-string api.config.volumeLocalListenAddr=:9443 \
+	--show-only templates/api-deployment.yaml |
+	grep -A1 'name: volume-objects' | grep 'containerPort: 9443' >/dev/null
+
+echo "==> with an external data plane, runners need an explicit volume-objects URL"
+must_fail "api.config.volumeLocalUrl is required" "${local_store[@]}" --set dataPlane.mode=external
+external_store=("${local_store[@]}" --set dataPlane.mode=external
+	--set api.config.volumeLocalUrl=https://sandbox-api.example.internal:8443)
+render "${external_store[@]}" --show-only templates/configmap.yaml |
+	grep 'SANDBOX_API_VOLUME_LOCAL_URL: "https://sandbox-api.example.internal:8443"' >/dev/null
+# As for the grpc port, only the peers listed for it get through.
+external_policy=$(render "${external_store[@]}" --set networkPolicy.enabled=true \
+	--show-only templates/networkpolicy.yaml)
+if grep -q 'volume-objects' <<<"$external_policy"; then
+	echo "without grpcIngressFrom, no peer may reach the volume-objects port" >&2
+	exit 1
+fi
+render "${external_store[@]}" --set networkPolicy.enabled=true \
+	--set 'networkPolicy.api.grpcIngressFrom[0].ipBlock.cidr=10.0.0.0/8' \
+	--show-only templates/networkpolicy.yaml |
+	grep -A2 -- '- port: grpc' | grep 'port: volume-objects' >/dev/null
+
+echo "==> the local volume store refuses setups and ports it cannot serve"
+must_fail "requires api.persistence.enabled" "${local_store[@]}" --set api.persistence.enabled=false
+must_fail "requires api.replicaCount=1" "${local_store[@]}" --set api.replicaCount=2
+must_fail "requires api.autoscaling.enabled=false" "${local_store[@]}" "${autoscaling[@]}"
+must_fail "must be empty or local" --set api.config.volumeStore=remote
+must_fail "must not use the port of api.config.listenAddr" "${local_store[@]}" \
+	--set-string api.config.volumeLocalListenAddr=:8080
+must_fail "must not use the port of api.config.grpcListenAddr" "${local_store[@]}" \
+	--set-string api.config.volumeLocalListenAddr=:9090
+must_fail "must not use port 8080 or 9090" "${local_store[@]}" \
+	--set-string api.config.listenAddr=:8081 \
+	--set-string api.config.volumeLocalListenAddr=:8080
+must_fail "must not use the port of api.config.metricsListenAddr" "${local_store[@]}" \
+	--set-string api.config.metricsListenAddr=:9100 \
+	--set-string api.config.volumeLocalListenAddr=:9100
+must_fail "must use a numeric port when api.config.volumeStore=local" "${local_store[@]}" \
+	--set-string api.config.listenAddr=:http
+must_fail "must be host:port with a numeric port" "${local_store[@]}" \
+	--set-string api.config.volumeLocalListenAddr=8443
+must_fail "port must be between 1 and 65535" "${local_store[@]}" \
+	--set-string api.config.volumeLocalListenAddr=:70000
+must_fail "binds loopback" "${local_store[@]}" \
+	--set-string api.config.volumeLocalListenAddr=127.0.0.1:8443
+must_fail "repeats api.service.httpPort" "${local_store[@]}" --set api.service.volumeObjectsPort=8080
+must_fail "repeats api.service.grpcPort" "${local_store[@]}" --set api.service.volumeObjectsPort=9090
+must_fail "repeats the metrics port" "${local_store[@]}" \
+	--set-string api.config.metricsListenAddr=:9100 --set api.service.volumeObjectsPort=9100
+must_fail "api.service.volumeObjectsPort must be a port" "${local_store[@]}" \
+	--set api.service.volumeObjectsPort=0
+# The API refuses these at startup, so the render does; the rule refuses a
+# few more, such as hosts no DNS name or address can have and ports past 65535.
+for bad_url in http://sandbox-api:8443 https://sandbox-api:8443/path "https://user:pw@sandbox-api" https://:8443 \
+	https://-sandbox-api https://sandbox-api:0 https://sandbox-api:65536 https://sandbox-api: "https://[fd00::1" https://fd00::1 \
+	"https://[.]" "https://[1.2.3.4]" "https://[fd00:1]"; do
+	must_fail "api.config.volumeLocalUrl must be an https URL" "${local_store[@]}" \
+		--set-string "api.config.volumeLocalUrl=$bad_url"
+done
+# --set-json, since --set reads a backslash as an escape.
+for bad_url in '"https://sandbox\\api"' '"https://sandbox\"api"' '"https://sandbox api"'; do
+	must_fail "api.config.volumeLocalUrl must be an https URL" "${local_store[@]}" \
+		--set-json "api.config.volumeLocalUrl=$bad_url"
+done
+for good_url in https://sandbox-api.example.internal https://sandbox-api.example.internal:8443/ \
+	https://10.0.0.1:8443 "https://[fd00::1]:8443" "https://[::ffff:10.0.0.1]:8443"; do
+	render "${local_store[@]}" --set-string "api.config.volumeLocalUrl=$good_url" \
+		--show-only templates/configmap.yaml |
+		grep -F "SANDBOX_API_VOLUME_LOCAL_URL: \"$good_url\"" >/dev/null
+done
+# Turned on through an env entry, the chart would open no port and check nothing.
+must_fail "api.extraEnv sets SANDBOX_API_VOLUME_STORE=local" \
+	--set 'api.extraEnv[0].name=SANDBOX_API_VOLUME_STORE' --set-string 'api.extraEnv[0].value=local'
+# remote through api.extraEnv stays as the README section 'API Sidecars' shows.
+render --set 'api.extraEnv[0].name=SANDBOX_API_VOLUME_STORE' --set-string 'api.extraEnv[0].value=remote' \
+	--show-only templates/api-deployment.yaml |
+	grep -A1 'name: SANDBOX_API_VOLUME_STORE' | grep 'value: remote' >/dev/null
+# An env entry would override the chart's settings and leave its ports wrong.
+for name in SANDBOX_API_VOLUME_STORE SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR SANDBOX_API_VOLUME_LOCAL_URL; do
+	must_fail "api.extraEnv sets $name" "${local_store[@]}" \
+		--set "api.extraEnv[0].name=$name" --set-string 'api.extraEnv[0].value=x'
+done
+
+echo "render tests passed"

@@ -1,0 +1,255 @@
+package runner
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/n8n-io/sandbox-service/internal/metrics"
+	"github.com/n8n-io/sandbox-service/internal/runner/config"
+	runnerruntime "github.com/n8n-io/sandbox-service/internal/runner/runtime"
+)
+
+type fakeRuntime struct {
+	daemonURL string
+	daemonErr error
+	ensureErr error
+	readyErr  error
+	recovered bool
+
+	ensureCalls atomic.Int32
+}
+
+func (f *fakeRuntime) Prepare(context.Context) {}
+
+func (f *fakeRuntime) Ready(context.Context) error {
+	return f.readyErr
+}
+
+func (f *fakeRuntime) ReadyCh() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+func (f *fakeRuntime) Capacity(context.Context) (runnerruntime.Capacity, error) {
+	return runnerruntime.Capacity{}, nil
+}
+
+func (f *fakeRuntime) CreateSandbox(context.Context, string, *runnerruntime.CreateOptions) (*runnerruntime.SandboxInfo, error) {
+	return nil, nil
+}
+
+func (f *fakeRuntime) GetSandboxInfo(context.Context, string) (*runnerruntime.SandboxInfo, error) {
+	return nil, nil
+}
+
+func (f *fakeRuntime) DeleteSandbox(context.Context, string) error {
+	return nil
+}
+
+func (f *fakeRuntime) StopSandbox(context.Context, string) error {
+	return nil
+}
+
+func (f *fakeRuntime) EnsureSandboxRunning(context.Context, string) (runnerruntime.WakeResult, error) {
+	f.ensureCalls.Add(1)
+	if f.ensureErr != nil {
+		return runnerruntime.WakeResult{}, f.ensureErr
+	}
+	// A wake that returns without an error ends with the sandbox up, recovery or
+	// not. For a recovery that is what makes refusing the request safe: the client's
+	// retry has somewhere to go.
+	f.daemonErr = nil
+	return runnerruntime.WakeResult{Recovered: f.recovered}, nil
+}
+
+func (f *fakeRuntime) DaemonURL(context.Context, string) (string, error) {
+	if f.daemonErr != nil {
+		return "", f.daemonErr
+	}
+	return f.daemonURL, nil
+}
+
+func (f *fakeRuntime) Shutdown(context.Context) {}
+
+// The archive route has no size limit of its own, only the body cap.
+func TestRunnerCapsArchiveBody(t *testing.T) {
+	var received atomic.Int64
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, _ := io.Copy(io.Discard, r.Body)
+		received.Add(n)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer daemon.Close()
+
+	cfg := &config.Config{APIKeys: map[string]struct{}{"k": {}}, MaxFileBytes: 1024}
+	router := NewRouter(&fakeRuntime{daemonURL: daemon.URL}, cfg, metrics.NewRunnerRecorder(false))
+
+	req := authedRequest(context.Background(), http.MethodPost,
+		"/sandboxes/550e8400-e29b-41d4-a716-446655440000/files/archive?path=/tmp", strings.Repeat("x", 2048))
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected %d, got %d body=%s", http.StatusBadRequest, rr.Code, rr.Body.String())
+	}
+	if n := received.Load(); n > 1024 {
+		t.Fatalf("daemon received %d bytes, past the 1024-byte cap", n)
+	}
+}
+
+// Only the runtime itself may call the daemon's volume mount endpoint.
+func TestRunnerDoesNotProxyVolumeMount(t *testing.T) {
+	var received atomic.Int32
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer daemon.Close()
+
+	cfg := &config.Config{APIKeys: map[string]struct{}{"k": {}}, MaxFileBytes: 1024}
+	router := NewRouter(&fakeRuntime{daemonURL: daemon.URL}, cfg, metrics.NewRunnerRecorder(false))
+
+	for _, path := range []string{"/volumes/mount", "/files/../volumes/mount"} {
+		req := authedRequest(context.Background(), http.MethodPost,
+			"/sandboxes/550e8400-e29b-41d4-a716-446655440000"+path, `{"volumes":[]}`)
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+		if rr.Code < 300 {
+			t.Errorf("POST %s: status %d, want it refused", path, rr.Code)
+		}
+	}
+	if n := received.Load(); n != 0 {
+		t.Fatalf("daemon received %d requests, want none", n)
+	}
+}
+
+func TestRunnerLivenessEndpointsDoNotCheckRuntime(t *testing.T) {
+	router := NewRouter(&fakeRuntime{readyErr: errors.New("runtime down")}, &config.Config{}, metrics.NewRunnerRecorder(false))
+
+	for _, path := range []string{"/healthz", "/livez"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rec := httptest.NewRecorder()
+
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected %s to return 200, got %d", path, rec.Code)
+			}
+		})
+	}
+}
+
+func TestRunnerReadyzChecksRuntime(t *testing.T) {
+	router := NewRouter(&fakeRuntime{}, &config.Config{}, metrics.NewRunnerRecorder(false))
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected readyz to return 200, got %d", rec.Code)
+	}
+}
+
+func TestRunnerReadyzFailsWhenRuntimeUnavailable(t *testing.T) {
+	router := NewRouter(&fakeRuntime{readyErr: errors.New("runtime down")}, &config.Config{}, metrics.NewRunnerRecorder(false))
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected readyz to return 503, got %d", rec.Code)
+	}
+}
+
+func TestRunnerReadyzFailsWhenRuntimeNotReady(t *testing.T) {
+	router := NewRouter(&fakeRuntime{readyErr: errors.New("runtime not ready")}, &config.Config{}, metrics.NewRunnerRecorder(false))
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected readyz to return 503 when runtime not ready, got %d", rec.Code)
+	}
+}
+
+func TestRunnerMetricsEndpointEnabledBypassesAuth(t *testing.T) {
+	cfg := &config.Config{APIKeys: map[string]struct{}{"k": {}}}
+	router := NewRouter(&fakeRuntime{}, cfg, metrics.NewRunnerRecorder(true))
+
+	// Warm-up: a request the mux can dispatch so HTTPMiddleware records a series.
+	// Scrapes only emit families that have at least one observed series.
+	// /healthz is allowlisted from auth, so no API key needed.
+	warm := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	router.ServeHTTP(httptest.NewRecorder(), warm)
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"sandbox_http_requests_total",
+		`role="runner"`,
+		`route="/healthz"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics body missing %q", want)
+		}
+	}
+}
+
+// A public path with another method is refused before auth and metrics run, so
+// the caller-chosen method never becomes a series.
+func TestRunnerRejectsOtherMethodsOnPublicPaths(t *testing.T) {
+	cfg := &config.Config{APIKeys: map[string]struct{}{"k": {}}}
+	router := NewRouter(&fakeRuntime{}, cfg, metrics.NewRunnerRecorder(true))
+
+	for _, path := range []string{"/healthz", "/livez", "/readyz", "/metrics"} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest("FOO", path, nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("FOO %s: status = %d, want %d", path, rec.Code, http.StatusMethodNotAllowed)
+		}
+	}
+
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `route="/healthz"`) {
+		t.Errorf("metrics body missing the GET /healthz series:\n%s", body)
+	}
+	for _, unwanted := range []string{`route="unmatched"`, `method="FOO"`, `method="other"`} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("metrics body contains %q", unwanted)
+		}
+	}
+}
+
+func TestRunnerMetricsEndpointDisabledReturns404(t *testing.T) {
+	cfg := &config.Config{APIKeys: map[string]struct{}{"k": {}}}
+	router := NewRouter(&fakeRuntime{}, cfg, metrics.NewRunnerRecorder(false))
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set("X-Api-Key", "k")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}

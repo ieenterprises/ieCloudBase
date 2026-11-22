@@ -1,0 +1,259 @@
+{{/*
+Expand the name of the chart.
+*/}}
+{{- define "n8n-sandbox-service.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Create a default fully qualified app name.
+*/}}
+{{- define "n8n-sandbox-service.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Chart name and version label.
+*/}}
+{{- define "n8n-sandbox-service.chart" -}}
+{{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "n8n-sandbox-service.apiName" -}}
+{{- printf "%s-api" (include "n8n-sandbox-service.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+The API pods' ServiceAccount, or "" to leave serviceAccountName unset.
+*/}}
+{{- define "n8n-sandbox-service.apiServiceAccountName" -}}
+{{- $name := .Values.api.serviceAccount.name | default "" | toString | trim -}}
+{{- if .Values.api.serviceAccount.create -}}
+{{- $name | default (include "n8n-sandbox-service.apiName" .) -}}
+{{- else -}}
+{{- $name -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+api.podLabels without the selector label keys, so they cannot move API pods
+out of the Deployment's selector or into another component's. Values become
+strings, since Kubernetes rejects other label types.
+*/}}
+{{- define "n8n-sandbox-service.apiPodLabels" -}}
+{{- $selector := include "n8n-sandbox-service.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "api") | fromYaml -}}
+{{- $labels := dict -}}
+{{- range $key, $value := .Values.api.podLabels -}}
+{{- if not (hasKey $selector $key) -}}
+{{- $_ := set $labels $key (include "n8n-sandbox-service.scalarString" $value) -}}
+{{- end -}}
+{{- end -}}
+{{- with $labels -}}
+{{- toYaml . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+api.terminationGracePeriodSeconds as a string, or "" when unset. A 0 stays "0".
+*/}}
+{{- define "n8n-sandbox-service.apiTerminationGracePeriodSeconds" -}}
+{{- $seconds := .Values.api.terminationGracePeriodSeconds -}}
+{{- if not (kindIs "invalid" $seconds) -}}
+{{- include "n8n-sandbox-service.scalarString" $seconds | trim -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+A value as a string. Numbers from values files are float64, which toString
+writes in exponent form from 1e6 on, so whole ones are written as integers.
+*/}}
+{{- define "n8n-sandbox-service.scalarString" -}}
+{{- if and (kindIs "float64" .) (eq . (floor .)) -}}
+{{- printf "%.0f" . -}}
+{{- else -}}
+{{- toString . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Component label and resource name for the in-cluster runner. Both follow
+runner.isolation on purpose: StatefulSet selectors are immutable, so a shared
+name would break existing sysbox releases on upgrade. Switching isolation
+recreates the runner resources under the other name.
+*/}}
+{{- define "n8n-sandbox-service.runnerComponent" -}}
+{{- if eq .Values.runner.isolation "privileged" -}}privileged-runner{{- else -}}sysbox-runner{{- end -}}
+{{- end }}
+
+{{/*
+Runner resource name. The name caps at 61 characters, not 63: the StatefulSet
+appends "-<ordinal>" to build each pod name, and the controller copies that
+pod name into the pod's hostname, which Kubernetes limits to 63 characters. A
+63-character runner name therefore renders a StatefulSet that can never create
+a pod. 61 leaves room for ordinals 0-9. Use fullnameOverride to shorten the
+name further if you run more than 10 runner replicas.
+
+The privileged name keeps the suffix whole and adds a hash of the full name
+when the base must be truncated, so two long release names cannot produce the
+same runner.
+*/}}
+{{- define "n8n-sandbox-service.runnerName" -}}
+{{- $fullname := include "n8n-sandbox-service.fullname" . -}}
+{{- $maxLength := 61 -}}
+{{- if eq .Values.runner.isolation "privileged" -}}
+{{- $suffix := "-privileged-runner" -}}
+{{- $baseLength := sub $maxLength (len $suffix) | int -}}
+{{- if le (len $fullname) $baseLength -}}
+{{- printf "%s%s" $fullname $suffix -}}
+{{- else -}}
+{{- $hash := sha256sum $fullname | trunc 8 -}}
+{{- $base := $fullname | trunc (sub $baseLength 9 | int) | trimSuffix "-" -}}
+{{- printf "%s-%s%s" $base $hash $suffix -}}
+{{- end -}}
+{{- else -}}
+{{- printf "%s-sysbox-runner" $fullname | trunc $maxLength | trimSuffix "-" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Mount path of the inner Docker data root volume. With disk quotas the runner
+mounts a loopback xfs image at /var/lib/docker, so the volume has to hold that
+image one level up instead. Otherwise the image lands on the container
+filesystem, where no volume limit bounds it.
+*/}}
+{{- define "n8n-sandbox-service.runnerDockerDataMountPath" -}}
+{{- if gt (int .Values.runner.config.defaultDiskQuotaMb) 0 -}}
+/var/lib/docker-pool
+{{- else -}}
+/var/lib/docker
+{{- end -}}
+{{- end }}
+
+{{/*
+The runner's data dir: runner.config.dataDir, or the runner's default when it
+is empty.
+*/}}
+{{- define "n8n-sandbox-service.runnerDataDir" -}}
+{{- default "/var/sandboxes" .Values.runner.config.dataDir -}}
+{{- end }}
+
+{{/*
+The runner's volume cache dir: runner.config.volumeCacheDir, or the runner's
+default under its data dir.
+*/}}
+{{- define "n8n-sandbox-service.runnerVolumeCacheDir" -}}
+{{- default "" .Values.runner.config.volumeCacheDir | toString | trim | default (printf "%s/volume-cache" (include "n8n-sandbox-service.runnerDataDir" .)) | clean -}}
+{{- end }}
+
+{{/*
+runner.config.volumeCacheMaxBytes as a string, or "" when unset.
+*/}}
+{{- define "n8n-sandbox-service.runnerVolumeCacheMaxBytes" -}}
+{{- $maxBytes := .Values.runner.config.volumeCacheMaxBytes -}}
+{{- if not (kindIs "invalid" $maxBytes) -}}
+{{- include "n8n-sandbox-service.scalarString" $maxBytes | trim -}}
+{{- end -}}
+{{- end }}
+
+{{- define "n8n-sandbox-service.authSecretName" -}}
+{{- default (printf "%s-auth" (include "n8n-sandbox-service.fullname" .)) .Values.auth.existingSecret | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "n8n-sandbox-service.labels" -}}
+helm.sh/chart: {{ include "n8n-sandbox-service.chart" . }}
+app.kubernetes.io/name: {{ include "n8n-sandbox-service.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- with .Values.commonLabels }}
+{{ toYaml . }}
+{{- end }}
+{{- end }}
+
+{{- define "n8n-sandbox-service.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "n8n-sandbox-service.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: {{ .component }}
+{{- end }}
+
+{{- define "n8n-sandbox-service.sandboxImage" -}}
+{{- printf "%s:%s" .Values.runner.sandboxImage.repository (.Values.runner.sandboxImage.tag | default .Chart.AppVersion) }}
+{{- end }}
+
+{{/*
+api.config.metricsListenAddr, normalized. Defined once and included everywhere
+because toString on an unset value yields "<nil>", which would read as an
+address the operator had set.
+*/}}
+{{- define "n8n-sandbox-service.apiMetricsListenAddr" -}}
+{{- .Values.api.config.metricsListenAddr | default "" | toString | trim -}}
+{{- end }}
+
+{{/*
+The API's dedicated metrics port, or "" when /metrics shares the HTTP port.
+Every metrics port, scrape and policy block in the chart keys off this.
+*/}}
+{{- define "n8n-sandbox-service.apiMetricsPort" -}}
+{{- $addr := include "n8n-sandbox-service.apiMetricsListenAddr" . -}}
+{{- if $addr -}}
+{{/*
+atoi, not the raw string: ":8080" and ":08080" are one socket to net.Listen.
+validation.yaml rejects a non-numeric port on either address first, since atoi
+would read a service name as 0 and split a listener the API would share.
+*/}}
+{{- $port := last (splitList ":" $addr) | atoi -}}
+{{- $listenPort := last (splitList ":" (.Values.api.config.listenAddr | toString | trim)) | atoi -}}
+{{- if ne $port $listenPort -}}
+{{- $port -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+"true" when an api.autoscaling metric target is set, "" when it is null or
+empty. Not `with`: that also skips a 0, which would drop the metric silently.
+The HPA template and validation.yaml both key off this.
+*/}}
+{{- define "n8n-sandbox-service.autoscalingTargetSet" -}}
+{{- if not (or (kindIs "invalid" .) (eq (toString .) "")) -}}true{{- end -}}
+{{- end }}
+
+{{/*
+api.config.volumeStore, normalized like apiMetricsListenAddr.
+*/}}
+{{- define "n8n-sandbox-service.apiVolumeStore" -}}
+{{- .Values.api.config.volumeStore | default "" | toString | trim -}}
+{{- end }}
+
+{{/*
+The port of api.config.volumeLocalListenAddr with api.config.volumeStore=local,
+or "" without it. Every volume-objects port, policy rule and setting in the
+chart keys off this; validation.yaml checks the address first.
+*/}}
+{{- define "n8n-sandbox-service.apiVolumeObjectsPort" -}}
+{{- if eq (include "n8n-sandbox-service.apiVolumeStore" .) "local" -}}
+{{- last (splitList ":" (.Values.api.config.volumeLocalListenAddr | default "" | toString | trim)) | atoi -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Where runners reach the volume-objects listener: api.config.volumeLocalUrl, or
+the API Service name and port, the host in-cluster runners register with.
+*/}}
+{{- define "n8n-sandbox-service.apiVolumeLocalUrl" -}}
+{{- $url := .Values.api.config.volumeLocalUrl | default "" | toString | trim -}}
+{{- if $url -}}
+{{- $url -}}
+{{- else -}}
+{{- printf "https://%s:%s" (include "n8n-sandbox-service.apiName" .) (include "n8n-sandbox-service.scalarString" .Values.api.service.volumeObjectsPort) -}}
+{{- end -}}
+{{- end }}

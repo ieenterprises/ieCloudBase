@@ -1,0 +1,107 @@
+// Package api implements the API gateway: authentication, tenant scoping, sandbox
+// CRUD, proxying of exec and file requests to runners, and the idle sweeper.
+package api
+
+import (
+	"errors"
+	"net/http"
+
+	"golang.org/x/sync/singleflight"
+
+	"github.com/n8n-io/sandbox-service/internal/api/config"
+	"github.com/n8n-io/sandbox-service/internal/api/registry"
+	"github.com/n8n-io/sandbox-service/internal/api/store"
+	"github.com/n8n-io/sandbox-service/internal/limits"
+	"github.com/n8n-io/sandbox-service/internal/metrics"
+)
+
+// NewGatewayRouter creates the public API gateway that manages state and
+// coordinates with registered runner services. If rec is enabled, HTTPMiddleware
+// wraps the request chain, and its /metrics handler is mounted here unless
+// cfg gives metrics a listener of their own. Proxied requests report sandbox
+// activity to activity, which the caller runs.
+func NewGatewayRouter(s store.SandboxStore, cfg *config.APIConfig, reg registry.RunnerRegistry, rec *metrics.APIRecorder, activity *ActivityRecorder) (http.Handler, error) {
+	if activity == nil {
+		return nil, errors.New("api: an activity recorder is required")
+	}
+	runnerTransport, err := newRunnerTransport(cfg)
+	if err != nil {
+		return nil, err
+	}
+	quota := newTenantQuota(countTenantSandboxes(s))
+	sandboxProxy := sandboxProxyHandler(s, reg, cfg, runnerTransport, activity, rec)
+	keyCache := newAPIKeyCache(cfg.APIKeyCacheTTL)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	// A dedicated metrics port is served by NewMetricsRouter instead.
+	if rec.Enabled() && cfg.MetricsOnMainListener() {
+		mux.Handle("GET /metrics", metrics.Handler(rec.Registry()))
+	}
+
+	limitTenant := tenantLimit(limits.NewKeyedLimiter(cfg.MaxInflightPerTenant), rec)
+	// Execution DELETEs have a limit of their own, so a tenant can cancel work
+	// while its other requests fill theirs. Turning the tenant limit off turns
+	// this one off too.
+	maxDeletes := 0
+	if cfg.MaxInflightPerTenant > 0 {
+		maxDeletes = maxExecutionDeletesPerTenant
+	}
+	limitTenantDeletes := tenantLimit(limits.NewKeyedLimiter(maxDeletes), rec)
+	mux.HandleFunc("GET /sandboxes", handleListSandboxes(s))
+	// A create holds its slot until the runner is done, even after the client
+	// has gone, so a burst of creates is bounded like any other request.
+	mux.HandleFunc("POST /sandboxes", limitTenant(handleCreateSandbox(s, s, reg, cfg, rec, quota)))
+	mux.HandleFunc("POST /code/sandboxes", limitTenant(handleCreateCodeSandbox(s, s, reg, cfg, rec, quota, &singleflight.Group{})))
+	mux.HandleFunc("GET /sandboxes/{id}", handleGetSandbox(s, cfg))
+	mux.HandleFunc("DELETE /sandboxes/{id}", handleDeleteSandbox(s, cfg, rec))
+
+	mux.HandleFunc("GET /admin/tenants", handleListTenants(s))
+	mux.HandleFunc("POST /admin/tenants", handleCreateTenant(s, cfg))
+	mux.HandleFunc("GET /admin/tenants/{id}", handleGetTenant(s))
+	mux.HandleFunc("PATCH /admin/tenants/{id}", handleUpdateTenant(s, cfg))
+	mux.HandleFunc("DELETE /admin/tenants/{id}", handleDeleteTenant(s, keyCache))
+	mux.HandleFunc("GET /admin/tenants/{id}/keys", handleListTenantKeys(s))
+	mux.HandleFunc("POST /admin/tenants/{id}/keys", handleCreateTenantKey(s))
+	mux.HandleFunc("DELETE /admin/tenants/{id}/keys/{keyId}", handleRevokeTenantKey(s, keyCache))
+	mux.HandleFunc("GET /admin/scaler", handleGetScaler(cfg))
+	mux.HandleFunc("GET /admin/runners", handleListRunners(reg))
+	mux.HandleFunc("PUT /admin/runners/{id}/cordon", handleSetRunnerCordon(reg, cfg, true))
+	mux.HandleFunc("DELETE /admin/runners/{id}/cordon", handleSetRunnerCordon(reg, cfg, false))
+
+	proxy := limitTenant(sandboxProxy(proxyRoute{}))
+	uploadProxy := limitTenant(sandboxProxy(proxyRoute{limitBody: true}))
+	deleteExecutionProxy := limitTenantDeletes(sandboxProxy(proxyRoute{neverWakes: true}))
+
+	mux.HandleFunc("POST /sandboxes/{id}/executions", proxy)
+	mux.HandleFunc("GET /sandboxes/{id}/executions/{exec_id}", proxy)
+	mux.HandleFunc("DELETE /sandboxes/{id}/executions/{exec_id}", deleteExecutionProxy)
+	mux.HandleFunc("POST /sandboxes/{id}/files/copy", proxy)
+	mux.HandleFunc("POST /sandboxes/{id}/files/move", proxy)
+	mux.HandleFunc("GET /sandboxes/{id}/files", proxy)
+	mux.HandleFunc("GET /sandboxes/{id}/files/content", proxy)
+	mux.HandleFunc("PUT /sandboxes/{id}/files", uploadProxy)
+	mux.HandleFunc("POST /sandboxes/{id}/files", uploadProxy)
+	mux.HandleFunc("POST /sandboxes/{id}/files/archive", uploadProxy)
+	mux.HandleFunc("DELETE /sandboxes/{id}/files", proxy)
+	mux.HandleFunc("POST /sandboxes/{id}/mkdir", proxy)
+	mux.HandleFunc("GET /sandboxes/{id}/stat", proxy)
+
+	var handler http.Handler = mux
+	if rec.Enabled() {
+		handler = metrics.HTTPMiddleware(rec)(handler)
+	}
+	handler = AuthMiddleware(cfg.APIKeys, cfg.ProvisionerKeys, cfg.ScalerKeys, s, keyCache)(handler)
+	handler = publicPaths.RejectOtherMethods(handler)
+	handler = LoggingMiddleware(handler)
+	if cfg.EnableCORS {
+		handler = CORSMiddleware(handler)
+	}
+	handler = RecoveryMiddleware(handler)
+	return handler, nil
+}

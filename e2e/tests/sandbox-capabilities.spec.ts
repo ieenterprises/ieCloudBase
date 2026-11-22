@@ -1,0 +1,149 @@
+import { test, expect } from '@playwright/test';
+import './matchers';
+import {
+  addAddress,
+  callVolumeMount,
+  createSandbox,
+  deleteSandbox,
+  exec,
+  execWithTransientRetry,
+  siblingOf,
+} from './helpers';
+import { DOCKER_ONLY, FIRECRACKER_ONLY } from './tags';
+
+// Every sandbox process starts as uid 1000, so nothing is effective. The
+// bounding set is where a restored capability would show up.
+const NO_CAPABILITIES = '0000000000000000';
+
+test.describe('Docker sandbox capability policy', DOCKER_ONLY, () => {
+  test('daemon and user processes have no capabilities at all', async () => {
+    const id = await createSandbox();
+    try {
+      // PID 1 is Docker's init, $PPID the daemon.
+      const result = await execWithTransientRetry(
+        id,
+        `for pid in 1 $PPID self; do ` +
+          `awk '$1 == "CapEff:" { print $2 }' /proc/$pid/status; ` +
+          `awk '$1 == "CapBnd:" { print $2 }' /proc/$pid/status; ` +
+          `done`,
+      );
+      expect(result).toHaveSucceeded();
+      expect(result.stdout.trim().split(/\s+/)).toEqual([
+        NO_CAPABILITIES,
+        NO_CAPABILITIES,
+        NO_CAPABILITIES,
+        NO_CAPABILITIES,
+        NO_CAPABILITIES,
+        NO_CAPABILITIES,
+      ]);
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  // An empty bounding set alone leaves the path to root open: a setuid-root
+  // binary still makes the caller uid 0, and uid 0 owns /usr/local whatever its
+  // capabilities. This pins the three things that close it.
+  test('has no path to root', async () => {
+    const id = await createSandbox();
+    try {
+      const uid = await execWithTransientRetry(id, 'id -u');
+      expect(uid).toHaveSucceeded();
+      expect(uid.stdout.trim()).not.toBe('0');
+
+      // The whole tree, not just the exec directories: a setuid binary
+      // escalates through its absolute path, so PATH does not bound where one
+      // can hide. This is also the only check covering /home/user, which the
+      // image writes the venv and the npm prefix into after it clears the
+      // setuid bits.
+      const escalation = await exec(
+        id,
+        'command -v sudo; find / -xdev -perm /4000 -type f 2>/dev/null',
+      );
+      expect(escalation.stdout.trim(), 'expected no sudo and no setuid binary').toBe('');
+
+      const write = await exec(id, 'touch /usr/local/bin/escalated');
+      expect(write.exitCode, 'expected a write to /usr/local/bin to be refused').not.toBe(0);
+      expect(write.stderr).toMatch(/Permission denied/);
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  test('cannot add a secondary address without CAP_NET_ADMIN', async () => {
+    const id = await createSandbox();
+    try {
+      const ipResult = await execWithTransientRetry(id, 'hostname -I', { timeoutMs: 5_000 });
+      expect(ipResult).toHaveSucceeded();
+      const ownIP = ipResult.stdout.trim().split(/\s+/)[0];
+      expect(ownIP).toMatch(/^\d+\.\d+\.\d+\.\d+$/);
+      const extraIP = siblingOf(ownIP);
+
+      // Positive control. Without it the assertion below also passes when
+      // python3 fcntl is missing, hiding a capability regression.
+      const plumbing = await exec(id, 'python3 -c "import fcntl"');
+      expect(plumbing, 'expected python3 fcntl to be available').toHaveSucceeded();
+
+      const added = await exec(id, addAddress(extraIP));
+      expect(added.exitCode, 'expected address addition to be denied').not.toBe(0);
+      // The errno separates the missing capability from other ioctl failures,
+      // such as ENODEV when the interface is not named eth0.
+      expect(added.stderr, 'expected the denial to come from the missing capability').toMatch(
+        /PermissionError|Operation not permitted/,
+      );
+
+      const addresses = await exec(id, 'hostname -I');
+      expect(addresses).toHaveSucceeded();
+      expect(addresses.stdout.split(/\s+/)).not.toContain(extraIP);
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+});
+
+// The guest daemon drops root at create, before anything runs in the sandbox.
+test.describe('volume mount request', () => {
+  test('was already made when a sandbox process can send it', FIRECRACKER_ONLY, async () => {
+    const id = await createSandbox();
+    try {
+      const call = await execWithTransientRetry(id, callVolumeMount);
+      expect(call).toHaveSucceeded();
+      expect(call.stdout.trim()).toBe('409');
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+
+  test('is not served on Docker', DOCKER_ONLY, async () => {
+    const id = await createSandbox();
+    try {
+      const call = await execWithTransientRetry(id, callVolumeMount);
+      expect(call).toHaveSucceeded();
+      expect(call.stdout.trim()).toBe('501');
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+});
+
+// Both runtimes. A user namespace would hand uid 1000 every capability inside
+// it, and with them the kernel interfaces gated on those capabilities.
+test.describe('sandbox namespace policy', () => {
+  test('cannot create a user namespace', async () => {
+    const id = await createSandbox();
+    try {
+      // Positive control. Without it the assertion below also passes when
+      // unshare is missing from the image.
+      const tool = await execWithTransientRetry(id, 'command -v unshare');
+      expect(tool, 'expected unshare to be available').toHaveSucceeded();
+
+      const created = await exec(id, 'unshare --user true');
+      expect(created.exitCode, 'expected user namespace creation to be refused').not.toBe(0);
+      // EPERM from Docker's default seccomp profile, ENOSPC from the
+      // Firecracker guest's user.max_user_namespaces=0.
+      expect(created.stderr).toMatch(/Operation not permitted|No space left on device/);
+    } finally {
+      await deleteSandbox(id);
+    }
+  });
+});

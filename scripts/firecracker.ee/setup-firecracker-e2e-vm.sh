@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# Installs the host dependencies required by the Firecracker runner and
+# builds the kernel/rootfs template and snapshot locally on the VM.
+# Intended to run ON the VM after the project source has been copied to ~/project.
+set -euxo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Guarded by BASH_SOURCE, so this only defines variables and functions. It
+# resolves FIRECRACKER_VERSION / FIRECRACKER_TARBALL_SHA256 (env or the pin).
+# shellcheck source=scripts/firecracker.ee/firecracker-release.sh
+source "${SCRIPT_DIR}/firecracker-release.sh"
+
+# Defaults to the go line of ~/project/go.mod, the tree this script builds and
+# the version CI builds with.
+GO_VERSION="${GO_VERSION:-$(awk '$1 == "go" { print $2; exit }' ~/project/go.mod)}"
+NODE_MAJOR="${NODE_MAJOR:-24}"
+PNPM_VERSION="${PNPM_VERSION:-10}"
+JAILER_TMPFS_SIZE="${JAILER_TMPFS_SIZE:-8G}"
+FIRECRACKER_E2E_ROOTFS_SIZE_MB="${FIRECRACKER_E2E_ROOTFS_SIZE_MB:-2048}"
+FIRECRACKER_E2E_SNAPSHOT_MEM_MIB="${FIRECRACKER_E2E_SNAPSHOT_MEM_MIB:-512}"
+FIRECRACKER_E2E_SNAPSHOT_VCPUS="${FIRECRACKER_E2E_SNAPSHOT_VCPUS:-1}"
+SANDBOX_IMAGE="${SANDBOX_IMAGE:-n8n-sandbox:e2e-firecracker}"
+SANDBOX_ROOTFS_TAR="${SANDBOX_ROOTFS_TAR:-}"
+
+# GO_VERSION goes into a download URL whose archive root unpacks into /usr/local.
+if [[ ! "$GO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+	echo "ERROR: GO_VERSION must be a Go release such as 1.27.1; got '${GO_VERSION}'" >&2
+	exit 1
+fi
+
+if [[ "$(uname -m)" != "x86_64" ]]; then
+	echo "Firecracker e2e assets are currently amd64/x86_64 only; got $(uname -m)" >&2
+	exit 1
+fi
+
+# Reads the Azure VM size from the instance metadata service for diagnostics.
+current_azure_vm_size() {
+	curl -fsSL \
+		-H "Metadata: true" \
+		"http://169.254.169.254/metadata/instance/compute/vmSize?api-version=2021-02-01&format=text" \
+		2>/dev/null || true
+}
+
+# Returns the host CPU model reported by Linux. This is written to the manifest
+# because Firecracker snapshots are sensitive to the guest-visible CPU feature set.
+current_cpu_model() {
+	sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -n 1
+}
+
+# Returns the host CPU flags reported by Linux for preflight and diagnostics.
+current_cpu_flags() {
+	sed -n 's/^flags[[:space:]]*: //p' /proc/cpuinfo | head -n 1
+}
+
+# Checks one KVM module parameter and records its value.
+require_kvm_param() {
+	local path=$1 label=$2 expected_regex=$3 value
+	if [[ ! -r "$path" ]]; then
+		echo "ERROR: missing required KVM parameter for Firecracker: $label ($path)" >&2
+		return 1
+	fi
+
+	value="$(cat "$path")"
+	echo "$path=$value"
+	if [[ ! "$value" =~ $expected_regex ]]; then
+		echo "ERROR: $label must match ${expected_regex}; got ${value}" >&2
+		return 1
+	fi
+}
+
+# Requires nested=N|0; returns 2 if the sysfs path is missing, else require_kvm_param's status.
+require_nested_off() {
+	if [[ ! -r "$1" ]]; then
+		echo "ERROR: missing required KVM parameter for Firecracker: $2 ($1)" >&2
+		return 2
+	fi
+	require_kvm_param "$1" "$2" '^(N|0)$'
+}
+
+# True if KVM users are running or /dev/kvm use cannot be checked (unsafe to unload).
+kvm_in_use_for_nested_reload() {
+	local name
+	for name in firecracker jailer sandbox-runner; do
+		if pgrep -x "$name" >/dev/null 2>&1; then
+			return 0
+		fi
+	done
+	if ! command -v fuser >/dev/null 2>&1; then
+		echo "WARN: fuser not found (psmisc); cannot check who holds /dev/kvm." >&2
+		return 0
+	fi
+	if [[ -e /dev/kvm ]] && sudo fuser /dev/kvm >/dev/null 2>&1; then
+		return 0
+	fi
+	return 1
+}
+
+# Best-effort nested=0 conf before reboot errors; ignore persist failures.
+persist_nested_kvm_conf() {
+	sudo bash "${SCRIPT_DIR}/install-runner-host.sh" --persist-nested-kvm-conf || true
+}
+
+# Reloads kvm_intel/amd with nested=0 when safe; refuses if KVM is in use (reboot instead).
+disable_nested_kvm() {
+	local vendor value
+	for vendor in kvm_intel kvm_amd; do
+		[[ -r "/sys/module/${vendor}/parameters/nested" ]] || continue
+		value="$(cat "/sys/module/${vendor}/parameters/nested")"
+		[[ "$value" =~ ^(Y|1)$ ]] || continue
+		if kvm_in_use_for_nested_reload; then
+			persist_nested_kvm_conf
+			echo "ERROR: ${vendor} has nested=${value} but Firecracker, jailer, or a sandbox runner is using KVM, or that could not be checked; not reloading. Reboot this host instead of re-running setup." >&2
+			exit 1
+		fi
+		echo "==> Reloading ${vendor} with nested=0..."
+		if ! sudo modprobe -r "$vendor"; then
+			persist_nested_kvm_conf
+			echo "ERROR: failed to unload ${vendor} (nested=${value}); reboot this host instead of re-running setup." >&2
+			exit 1
+		fi
+		if ! sudo modprobe "$vendor" nested=0; then
+			persist_nested_kvm_conf
+			echo "ERROR: failed to reload ${vendor} with nested=0; reboot this host instead of re-running setup." >&2
+			exit 1
+		fi
+	done
+}
+
+# Fails fast unless /dev/kvm, host vmx/svm, and nested=off are in place for Firecracker.
+firecracker_host_preflight() {
+	local failed=0 nested_failed=0 nested_rc=0 flags cpu_model
+
+	echo "==> Checking Firecracker host KVM capabilities..."
+	cpu_model="$(current_cpu_model || true)"
+	flags="$(current_cpu_flags || true)"
+	echo "cpu: ${cpu_model:-unknown}"
+
+	if [[ ! -e /dev/kvm ]]; then
+		echo "ERROR: /dev/kvm is not available. Choose an Azure VM size with nested virtualization support." >&2
+		failed=1
+	elif [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+		ls -l /dev/kvm >&2 || true
+		echo "WARN: /dev/kvm is not readable and writable by $(id -un); Firecracker e2e setup runs snapshot creation and the runner via sudo." >&2
+	else
+		ls -l /dev/kvm
+	fi
+
+	if [[ " ${flags} " != *" vmx "* && " ${flags} " != *" svm "* ]]; then
+		echo "ERROR: CPU flags do not expose vmx or svm nested virtualization support." >&2
+		failed=1
+	fi
+
+	if [[ -d /sys/module/kvm_intel || " ${flags} " == *" vmx "* ]]; then
+		require_nested_off /sys/module/kvm_intel/parameters/nested "Intel nested virtualization (must be off for sandboxes)" || nested_rc=$?
+		require_kvm_param /sys/module/kvm_intel/parameters/ept "Intel EPT" '^(Y|1)$' || failed=1
+	elif [[ -d /sys/module/kvm_amd || " ${flags} " == *" svm "* ]]; then
+		require_nested_off /sys/module/kvm_amd/parameters/nested "AMD nested virtualization (must be off for sandboxes)" || nested_rc=$?
+	else
+		echo "ERROR: neither kvm_intel nor kvm_amd appears to be loaded." >&2
+		failed=1
+	fi
+
+	if [[ "$nested_rc" -eq 2 ]]; then
+		failed=1
+	elif [[ "$nested_rc" -ne 0 ]]; then
+		nested_failed=1
+	fi
+
+	# Always print nested guidance, even when another check also failed.
+	if [[ "$nested_failed" -ne 0 ]]; then
+		echo "ERROR: nested KVM is not off; reboot this host, or reload the KVM module with nested=0 before any microVM runs, then re-run setup." >&2
+	fi
+	if [[ "$failed" -ne 0 ]]; then
+		echo "ERROR: Firecracker host preflight failed; discard this VM and provision another host." >&2
+		exit 1
+	fi
+	if [[ "$nested_failed" -ne 0 ]]; then
+		exit 1
+	fi
+}
+
+# Reads whether KVM TSC scaling is enabled when the host exposes that parameter.
+# The value is diagnostic context for snapshot compatibility problems.
+current_kvm_tsc_scaling() {
+	if [[ -r /sys/module/kvm_intel/parameters/tsc_scaling ]]; then
+		cat /sys/module/kvm_intel/parameters/tsc_scaling
+	elif [[ -r /sys/module/kvm_amd/parameters/tsc_scaling ]]; then
+		cat /sys/module/kvm_amd/parameters/tsc_scaling
+	fi
+}
+
+# Returns a compact file(1) description when available for manifest diagnostics.
+file_type() {
+	if command -v file >/dev/null 2>&1; then
+		file -b "$1"
+	fi
+}
+
+# Reads the version from the banner a kernel prints at boot, so the manifest
+# names the kernel the template holds, whether pinned or passed in.
+kernel_version() {
+	grep -aoE 'Linux version [0-9]+\.[0-9]+\.[0-9]+' "$1" 2>/dev/null | head -n 1 | sed 's/^Linux version //' || true
+}
+
+# JSON-encodes a shell value before embedding it in the generated manifest.
+json_escape() {
+	node -e 'process.stdout.write(JSON.stringify(process.argv[1] ?? ""))' "$1"
+}
+
+# Ensures docker is available so we can build/export Dockerfile.sandbox on the VM.
+ensure_docker_for_sandbox_image() {
+	if command -v docker >/dev/null 2>&1; then
+		return 0
+	fi
+	echo "==> Installing docker.io for sandbox image build..."
+	sudo apt-get update -qq
+	sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io
+	sudo systemctl enable --now docker >/dev/null 2>&1 || true
+}
+
+# Builds the local kernel/rootfs template from the sandbox OCI image + CI vmlinux.
+build_template_assets() {
+	local project_root
+	# Repo layout: scripts/firecracker.ee → repo root (Dockerfile.sandbox).
+	project_root="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+	sudo rm -rf /srv/firecracker/snapshots
+	sudo mkdir -p /srv/firecracker/snapshots
+
+	if [[ -n "$SANDBOX_ROOTFS_TAR" ]]; then
+		FIRECRACKER_ROOTFS_SIZE_MB="$FIRECRACKER_E2E_ROOTFS_SIZE_MB" \
+			SANDBOX_ROOTFS_TAR="$SANDBOX_ROOTFS_TAR" \
+			TEMPLATE_DIR="/srv/firecracker/template" \
+			bash "${SCRIPT_DIR}/build-rootfs-template.sh"
+		return 0
+	fi
+
+	ensure_docker_for_sandbox_image
+	echo "==> Building sandbox image ${SANDBOX_IMAGE} from Dockerfile.sandbox..."
+	sudo docker build -f "${project_root}/Dockerfile.sandbox" -t "$SANDBOX_IMAGE" "$project_root"
+
+	# Export via sudo: the e2e user cannot talk to docker.sock, but
+	# build-rootfs-template.sh only needs a filesystem tar (SANDBOX_ROOTFS_TAR).
+	local cid="" rootfs_tar="/tmp/sandbox-rootfs-$$.tar"
+	# EXIT (not RETURN): set -e aborts the script without running RETURN traps.
+	trap 'if [[ -n "${cid:-}" ]]; then sudo docker rm -f "$cid" >/dev/null 2>&1 || true; fi; sudo rm -f "$rootfs_tar"' EXIT
+	cid="$(sudo docker create "$SANDBOX_IMAGE")"
+	# Write as root into a new path (avoid mktemp + docker -o ownership quirks).
+	sudo docker export "$cid" | sudo tee "$rootfs_tar" >/dev/null
+	sudo docker rm -f "$cid" >/dev/null
+	cid=""
+	sudo chmod 0644 "$rootfs_tar"
+
+	FIRECRACKER_ROOTFS_SIZE_MB="$FIRECRACKER_E2E_ROOTFS_SIZE_MB" \
+		SANDBOX_IMAGE='' \
+		SANDBOX_ROOTFS_TAR="$rootfs_tar" \
+		TEMPLATE_DIR="/srv/firecracker/template" \
+		bash "${SCRIPT_DIR}/build-rootfs-template.sh"
+	sudo rm -f "$rootfs_tar"
+	trap - EXIT
+}
+
+# Writes a manifest describing exactly which host and asset inputs produced the
+# local template/snapshot. This is collected with e2e failure artifacts.
+write_manifest() {
+	local manifest=$1
+	sudo tee "$manifest" >/dev/null <<EOF
+{
+  "firecracker_version": $(json_escape "${FIRECRACKER_VERSION#v}"),
+  "kernel_version": $(json_escape "$(kernel_version /srv/firecracker/template/vmlinux)"),
+  "azure_vm_size": $(json_escape "$(current_azure_vm_size)"),
+  "cpu_model": $(json_escape "$(current_cpu_model)"),
+  "cpu_flags": $(json_escape "$(current_cpu_flags)"),
+  "kvm_tsc_scaling": $(json_escape "$(current_kvm_tsc_scaling)"),
+  "kernel_file_type": $(json_escape "$(file_type /srv/firecracker/template/vmlinux)"),
+  "rootfs_file_type": $(json_escape "$(file_type /srv/firecracker/template/rootfs.ext4)"),
+  "created_at": $(json_escape "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")
+}
+EOF
+}
+
+disable_nested_kvm
+firecracker_host_preflight
+
+sudo env \
+	FIRECRACKER_VERSION="$FIRECRACKER_VERSION" \
+	FIRECRACKER_TARBALL_SHA256="$FIRECRACKER_TARBALL_SHA256" \
+	JAILER_TMPFS_SIZE="$JAILER_TMPFS_SIZE" \
+	CONFIGURE_HOST_NAT_SCRIPT="${SCRIPT_DIR}/configure-host-nat.sh" \
+	FIRECRACKER_CI_ASSETS_BIN="${SCRIPT_DIR}/firecracker-ci-assets.sh" \
+	FIRECRACKER_RELEASE_BIN="${SCRIPT_DIR}/firecracker-release.sh" \
+	bash "${SCRIPT_DIR}/install-runner-host.sh"
+
+echo "==> Installing Go ${GO_VERSION}..."
+curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+rm /tmp/go.tar.gz
+# Single quotes on purpose: $HOME must stay literal in .bashrc.
+# shellcheck disable=SC2016
+echo 'export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH' >>~/.bashrc
+export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH
+sudo ln -sf /usr/local/go/bin/go /usr/local/bin/go
+sudo ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+go version
+
+echo "==> Installing Node.js ${NODE_MAJOR} and pnpm ${PNPM_VERSION}..."
+curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | sudo -E bash -
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs
+sudo npm install -g "pnpm@${PNPM_VERSION}"
+node --version
+pnpm --version
+
+build_template_assets
+write_manifest /srv/firecracker/manifest.json
+# The template keeps the ownership build-rootfs-template.sh gave it: vmlinux is
+# shared by every jail and stays root-owned.
+sudo chown -R 1000:1000 /srv/firecracker/snapshots
+sudo chmod 0755 /srv/firecracker /srv/firecracker/template /srv/firecracker/snapshots
+
+echo "==> Building sandbox daemon for local Firecracker snapshot..."
+cd ~/project
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/sandbox-daemon ./cmd/daemon
+
+echo "==> Creating Firecracker e2e snapshot on this VM..."
+sudo env \
+	MEM_MIB="$FIRECRACKER_E2E_SNAPSHOT_MEM_MIB" \
+	VCPUS="$FIRECRACKER_E2E_SNAPSHOT_VCPUS" \
+	bash "${SCRIPT_DIR}/create-golden-snapshot.sh" \
+	--kernel /srv/firecracker/template/vmlinux \
+	--ext4 /srv/firecracker/template/rootfs.ext4 \
+	--daemon-bin ./bin/sandbox-daemon \
+	--out /srv/firecracker/snapshots
+
+sudo ln -sf snapshot_mem /srv/firecracker/snapshots/mem
+sudo ln -sf snapshot_state /srv/firecracker/snapshots/state
+sudo chown -R 1000:1000 /srv/firecracker/snapshots
+sudo chmod 0644 /srv/firecracker/snapshots/snapshot_mem /srv/firecracker/snapshots/snapshot_state
+
+echo "==> Firecracker VM setup complete"

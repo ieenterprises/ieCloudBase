@@ -1,0 +1,939 @@
+// Package metrics provides the Prometheus instrumentation shared by the API
+// and runner binaries. Each binary builds its own recorder via NewAPIRecorder
+// or NewRunnerRecorder; passing enabled=false returns a recorder whose
+// observation methods are no-ops and whose Registry is nil.
+package metrics
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+)
+
+// Namespace is the prefix applied to every metric this package emits.
+const Namespace = "sandbox"
+
+// Role label values distinguish metrics emitted by the API vs the runner.
+const (
+	RoleAPI    = "api"
+	RoleRunner = "runner"
+)
+
+// Operation label values used with ObserveSandboxOp / ObserveContainerOp.
+const (
+	OpCreate        = "create"
+	OpDelete        = "delete"
+	OpStop          = "stop"
+	OpEnsureRunning = "ensure_running"
+	// OpRecover is the wake of a sandbox whose guest died. Kept apart from
+	// ensure_running because it does different work — a cold boot instead of a
+	// snapshot restore — and mixing the two would hide both in one percentile.
+	OpRecover = "recover"
+	// OpCordonDelete is the API deleting a stopped sandbox on a cordoned runner,
+	// on the request that would have woken it.
+	OpCordonDelete = "cordon_delete"
+)
+
+// Placement label values used with ObservePlacement: how a create found a runner.
+const (
+	// PlacementFirstChoice is a create the first runner picked did not refuse.
+	PlacementFirstChoice = "first_choice"
+	// PlacementRetried is a create placed on another runner after a refusal.
+	// Counted apart so a fleet that is full but still placing creates shows up.
+	PlacementRetried = "retried"
+	// PlacementExhausted is a create every runner tried refused.
+	PlacementExhausted = "exhausted"
+	// PlacementNoRunner is a create for which no runner was eligible at all.
+	PlacementNoRunner = "no_runner"
+)
+
+// Limit label values used with ObserveRequestLimited.
+const (
+	// LimitTenant is the API's per-tenant cap.
+	LimitTenant = "tenant"
+	// LimitSandbox is the runner's per-sandbox cap.
+	LimitSandbox = "sandbox"
+)
+
+// Volume cache fetch results used with ObserveVolumeCacheFetch.
+const (
+	// VolumeFetchHit is an object served from the cache, including one a
+	// concurrent fetch downloaded.
+	VolumeFetchHit = "hit"
+	// VolumeFetchDownloaded is a download that completed and verified.
+	VolumeFetchDownloaded = "downloaded"
+	// VolumeFetchHTTP is a request that failed or got a status other than
+	// 200, a redirect included.
+	VolumeFetchHTTP = "http"
+	// VolumeFetchSize is a body longer or shorter than the recorded size,
+	// including one cut off mid-transfer.
+	VolumeFetchSize = "size"
+	// VolumeFetchDigest is a body whose sha256 is not the recorded one.
+	VolumeFetchDigest = "digest"
+	// VolumeFetchTimeout is a download that ran out of time.
+	VolumeFetchTimeout = "timeout"
+	// VolumeFetchFull is a fetch refused for want of room, including a disk
+	// that filled during the download, or because the object is larger than
+	// the whole cache.
+	VolumeFetchFull = "full"
+	// VolumeFetchIO is a download that failed writing to the local disk.
+	VolumeFetchIO = "io"
+)
+
+// Volume cache unpack results used with ObserveVolumeCacheUnpack.
+const (
+	// VolumeUnpackSuccess is a tar unpacked into the cache.
+	VolumeUnpackSuccess = "success"
+	// VolumeUnpackInvalid is a tar that breaks the volume tar rules or holds
+	// more than the API counted.
+	VolumeUnpackInvalid = "invalid"
+	// VolumeUnpackFull is an unpack the disk filled up under.
+	VolumeUnpackFull = "full"
+	// VolumeUnpackTimeout is an unpack, or its wait for a slot, that ran out
+	// of the fetch's time.
+	VolumeUnpackTimeout = "timeout"
+	// VolumeUnpackIO is an unpack that failed reading or writing the local
+	// disk.
+	VolumeUnpackIO = "io"
+)
+
+// Handler returns the http.Handler that serves the registry's metrics in
+// Prometheus exposition format.
+func Handler(reg *prometheus.Registry) http.Handler {
+	return promhttp.HandlerFor(reg, promhttp.HandlerOpts{Registry: reg})
+}
+
+// newRegistry constructs a registry pre-loaded with the standard Go runtime
+// and process collectors.
+func newRegistry() *prometheus.Registry {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
+	return reg
+}
+
+// buildHTTPMetrics registers the shared HTTP request counter / latency
+// histogram pair for the given role and returns them.
+func buildHTTPMetrics(reg *prometheus.Registry, role string) (*prometheus.CounterVec, *prometheus.HistogramVec) {
+	requests := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "http_requests_total",
+			Help:        "Total HTTP requests handled, labeled by route pattern, method, and status code.",
+			ConstLabels: prometheus.Labels{"role": role},
+		},
+		[]string{"route", "method", "status"},
+	)
+	duration := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace:   Namespace,
+			Name:        "http_request_duration_seconds",
+			Help:        "Duration of HTTP requests in seconds, labeled by route pattern and method.",
+			Buckets:     prometheus.DefBuckets,
+			ConstLabels: prometheus.Labels{"role": role},
+		},
+		[]string{"route", "method"},
+	)
+	reg.MustRegister(requests, duration)
+	return requests, duration
+}
+
+// buildLimitMetrics registers the counter of requests a concurrency limit
+// turned away. http_requests_total cannot tell which limit refused a 429: the
+// API passes the runner's per-sandbox 429 through unchanged.
+func buildLimitMetrics(reg *prometheus.Registry, role string) *prometheus.CounterVec {
+	limited := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "http_requests_limited_total",
+			Help:        "HTTP requests turned away by a concurrency limit, labeled by the limit that refused them.",
+			ConstLabels: prometheus.Labels{"role": role},
+		},
+		[]string{"limit"},
+	)
+	reg.MustRegister(limited)
+	return limited
+}
+
+// buildInflightGauge registers the gauge of HTTP requests in progress, which
+// HTTPMiddleware moves.
+func buildInflightGauge(reg *prometheus.Registry, role string) prometheus.Gauge {
+	inflight := prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace:   Namespace,
+		Name:        "http_requests_in_flight",
+		Help:        "HTTP requests in progress.",
+		ConstLabels: prometheus.Labels{"role": role},
+	})
+	reg.MustRegister(inflight)
+	return inflight
+}
+
+// tlsExpiryCollector reports, at scrape time, when each TLS certificate the
+// process presents expires, one series per certificate file.
+type tlsExpiryCollector struct {
+	desc *prometheus.Desc
+	read func() map[string]time.Time
+}
+
+func (c *tlsExpiryCollector) Describe(ch chan<- *prometheus.Desc) { ch <- c.desc }
+
+func (c *tlsExpiryCollector) Collect(ch chan<- prometheus.Metric) {
+	for path, notAfter := range c.read() {
+		// Not MustNewConstMetric: a path that is not valid UTF-8 must not panic the scrape.
+		if m, err := prometheus.NewConstMetric(c.desc, prometheus.GaugeValue, float64(notAfter.Unix()), path); err == nil {
+			ch <- m
+		}
+	}
+}
+
+func registerTLSCertificateExpiry(reg *prometheus.Registry, role string, read func() map[string]time.Time) {
+	reg.MustRegister(&tlsExpiryCollector{
+		desc: prometheus.NewDesc(
+			prometheus.BuildFQName(Namespace, "", "tls_certificate_expiry_timestamp_seconds"),
+			"Expiry (notAfter, Unix seconds) of each TLS certificate the process presents, labeled by certificate file. Renewed files are picked up before each scrape.",
+			[]string{"path"},
+			prometheus.Labels{"role": role},
+		),
+		read: read,
+	})
+}
+
+// APIRecorder owns the metric instruments emitted by the API binary.
+//
+// A recorder built with NewAPIRecorder(false) is a no-op: every observation
+// method returns immediately and Registry() returns nil.
+type APIRecorder struct {
+	reg          *prometheus.Registry
+	httpRequests *prometheus.CounterVec
+	httpDuration *prometheus.HistogramVec
+	httpInflight prometheus.Gauge
+	httpLimited  *prometheus.CounterVec
+	sandboxOps   *prometheus.CounterVec
+	placements   *prometheus.CounterVec
+}
+
+// NewAPIRecorder builds the API recorder. If enabled is false, the returned
+// recorder discards all observations and exposes a nil Registry.
+func NewAPIRecorder(enabled bool) *APIRecorder {
+	if !enabled {
+		return &APIRecorder{}
+	}
+	reg := newRegistry()
+	httpReq, httpDur := buildHTTPMetrics(reg, RoleAPI)
+	sandboxOps := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "sandbox_operations_total",
+			Help:        "Sandbox lifecycle operations performed by the API, labeled by operation and result.",
+			ConstLabels: prometheus.Labels{"role": RoleAPI},
+		},
+		[]string{"operation", "result"},
+	)
+	placements := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "create_placements_total",
+			Help:        "Sandbox creates by how they found a runner: first_choice, retried after a refusal, exhausted, or no_runner.",
+			ConstLabels: prometheus.Labels{"role": RoleAPI},
+		},
+		[]string{"result"},
+	)
+	reg.MustRegister(sandboxOps, placements)
+	return &APIRecorder{
+		reg:          reg,
+		httpRequests: httpReq,
+		httpDuration: httpDur,
+		httpInflight: buildInflightGauge(reg, RoleAPI),
+		httpLimited:  buildLimitMetrics(reg, RoleAPI),
+		sandboxOps:   sandboxOps,
+		placements:   placements,
+	}
+}
+
+// Registry returns the underlying Prometheus registry, or nil if disabled.
+func (r *APIRecorder) Registry() *prometheus.Registry { return r.reg }
+
+// Enabled reports whether metrics observations are active.
+func (r *APIRecorder) Enabled() bool { return r.reg != nil }
+
+// ObserveHTTP records a finished HTTP request.
+func (r *APIRecorder) ObserveHTTP(route, method string, status int, dur time.Duration) {
+	if r.reg == nil {
+		return
+	}
+	r.httpRequests.WithLabelValues(route, method, strconv.Itoa(status)).Inc()
+	r.httpDuration.WithLabelValues(route, method).Observe(dur.Seconds())
+}
+
+// AddHTTPInFlight moves the gauge of HTTP requests in progress by delta.
+func (r *APIRecorder) AddHTTPInFlight(delta float64) {
+	if r.reg == nil {
+		return
+	}
+	r.httpInflight.Add(delta)
+}
+
+// ObserveSandboxOp records a sandbox lifecycle operation result.
+func (r *APIRecorder) ObserveSandboxOp(operation string, success bool) {
+	if r.reg == nil {
+		return
+	}
+	r.sandboxOps.WithLabelValues(operation, resultLabel(success)).Inc()
+}
+
+// SandboxOpCount returns the counter value for a sandbox operation with the
+// given result. Intended for tests in other packages.
+func (r *APIRecorder) SandboxOpCount(operation string, success bool) float64 {
+	if r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.sandboxOps.WithLabelValues(operation, resultLabel(success)))
+}
+
+// ObservePlacement records how a create found a runner (PlacementFirstChoice,
+// PlacementRetried, PlacementExhausted, PlacementNoRunner).
+func (r *APIRecorder) ObservePlacement(result string) {
+	if r.reg == nil {
+		return
+	}
+	r.placements.WithLabelValues(result).Inc()
+}
+
+// PlacementCount returns the counter value for creates with the given placement
+// result. Intended for tests in other packages.
+func (r *APIRecorder) PlacementCount(result string) float64 {
+	if r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.placements.WithLabelValues(result))
+}
+
+// ObserveRequestLimited records a request turned away by the given limit
+// (LimitTenant).
+func (r *APIRecorder) ObserveRequestLimited(limit string) {
+	if r.reg == nil {
+		return
+	}
+	r.httpLimited.WithLabelValues(limit).Inc()
+}
+
+// RequestsLimitedCount returns the counter value for requests turned away by
+// the given limit. Intended for tests in other packages.
+func (r *APIRecorder) RequestsLimitedCount(limit string) float64 {
+	if r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.httpLimited.WithLabelValues(limit))
+}
+
+// SetActiveSandboxes registers a scrape-time gauge that calls f to read the
+// current sandbox count. Safe to call exactly once per recorder.
+func (r *APIRecorder) SetActiveSandboxes(f func() float64) {
+	if r.reg == nil {
+		return
+	}
+	r.reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace:   Namespace,
+			Name:        "sandboxes_active",
+			Help:        "Current number of sandboxes tracked by the API store.",
+			ConstLabels: prometheus.Labels{"role": RoleAPI},
+		},
+		f,
+	))
+}
+
+// SetRunnersRegistered registers a scrape-time gauge that calls f to read the
+// current count of registered runners.
+func (r *APIRecorder) SetRunnersRegistered(f func() float64) {
+	if r.reg == nil {
+		return
+	}
+	r.reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace:   Namespace,
+			Name:        "runners_registered",
+			Help:        "Current number of runners registered with the API.",
+			ConstLabels: prometheus.Labels{"role": RoleAPI},
+		},
+		f,
+	))
+}
+
+// SetTLSCertificateExpiry registers a scrape-time gauge that calls read for the
+// expiry of each TLS certificate file the API presents.
+func (r *APIRecorder) SetTLSCertificateExpiry(read func() map[string]time.Time) {
+	if r.reg == nil {
+		return
+	}
+	registerTLSCertificateExpiry(r.reg, RoleAPI, read)
+}
+
+// containerOpBuckets sizes the runner's container-op latency histogram for the
+// observed range: container creation is slow (image pull, dind warm-up) and
+// can take tens of seconds in cold cases, so the upper bound runs to 120s. The
+// lower bound has to stay well under a second because Firecracker create and
+// wake are sub-second and would otherwise all land in the first bucket.
+var containerOpBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120}
+
+// lifecycleStepBuckets sizes the per-step histogram. Individual create/wake
+// steps run from a few milliseconds (jail setup) to a couple of seconds
+// (snapshot load on a cold page cache), far below the container-op range.
+var lifecycleStepBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5}
+
+// volumeBuildBuckets covers a volume build from the tar's first byte to the
+// image's last: seconds for small volumes, minutes for large ones.
+var volumeBuildBuckets = []float64{1, 2, 5, 10, 20, 30, 60, 120, 300, 600}
+
+// volumeDownloadBuckets covers objects from megabytes to several gigabytes. 300
+// is the default fetch timeout; 600 is for a raised one.
+var volumeDownloadBuckets = []float64{0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600}
+
+// volumeUnpackBuckets covers unpacks from small tars, done in milliseconds, to
+// several gigabytes. 300 is the default fetch timeout, which the unpack shares;
+// 600 is for a raised one.
+var volumeUnpackBuckets = []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600}
+
+// RunnerRecorder owns the metric instruments emitted by the runner binary.
+type RunnerRecorder struct {
+	reg                  *prometheus.Registry
+	httpRequests         *prometheus.CounterVec
+	httpDuration         *prometheus.HistogramVec
+	httpInflight         prometheus.Gauge
+	httpLimited          *prometheus.CounterVec
+	containerOps         *prometheus.CounterVec
+	containerOpDuration  *prometheus.HistogramVec
+	lifecycleSteps       *prometheus.HistogramVec
+	guestDeaths          prometheus.Counter
+	recoveries           *prometheus.CounterVec
+	volumeMounts         *prometheus.CounterVec
+	volumeBuilds         *prometheus.CounterVec
+	volumeBuildDuration  prometheus.Histogram
+	volumeCacheFetches   *prometheus.CounterVec
+	volumeCacheDownloads prometheus.Histogram
+	volumeCacheEvictions prometheus.Counter
+	volumeCacheUnpacks   *prometheus.CounterVec
+	volumeUnpackDuration prometheus.Histogram
+	volumesLeftOut       *prometheus.CounterVec
+}
+
+// NewRunnerRecorder builds the runner recorder. If enabled is false, the
+// returned recorder discards all observations and exposes a nil Registry.
+func NewRunnerRecorder(enabled bool) *RunnerRecorder {
+	if !enabled {
+		return &RunnerRecorder{}
+	}
+	reg := newRegistry()
+	httpReq, httpDur := buildHTTPMetrics(reg, RoleRunner)
+	containerOps := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "container_operations_total",
+			Help:        "Container lifecycle operations performed by the runner, labeled by operation and result.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		[]string{"operation", "result"},
+	)
+	containerOpDuration := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace:   Namespace,
+			Name:        "container_operation_duration_seconds",
+			Help:        "Duration of runner container lifecycle operations in seconds, labeled by operation.",
+			Buckets:     containerOpBuckets,
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		[]string{"operation"},
+	)
+	lifecycleSteps := prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace:   Namespace,
+			Name:        "lifecycle_step_duration_seconds",
+			Help:        "Duration of the individual steps of a sandbox create or wake, labeled by operation and step.",
+			Buckets:     lifecycleStepBuckets,
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		[]string{"operation", "step"},
+	)
+	guestDeaths := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "guest_deaths_total",
+			Help:        "Sandbox guests that died without the runner stopping them.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+	)
+	recoveries := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "recoveries_total",
+			Help:        "Attempts to recover a sandbox whose guest died, labeled by result.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		[]string{"result"},
+	)
+	volumesLeftOut := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "volumes_left_out_total",
+			Help:        "Optional volumes a create left out of the sandbox, labeled by reason.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		[]string{"reason"},
+	)
+	reg.MustRegister(volumesLeftOut)
+	volumeMounts := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "volume_mount_requests_total",
+			Help:        "Volume mount requests sent to a guest daemon after a create or cold boot, labeled by result.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		[]string{"result"},
+	)
+	volumeBuilds := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "volume_builds_total",
+			Help:        "Volume image builds requested from the runner, labeled by result.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		[]string{"result"},
+	)
+	volumeCacheFetches := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "volume_cache_fetches_total",
+			Help:        "Volume object fetches by result: hit, downloaded, or why a download failed or was refused (http, size, digest, timeout, full, io).",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		[]string{"result"},
+	)
+	volumeBuildDuration := prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace:   Namespace,
+			Name:        "volume_build_duration_seconds",
+			Help:        "Duration of the volume image builds the runner accepted, from the tar's first byte to the end of the call.",
+			Buckets:     volumeBuildBuckets,
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+	)
+	volumeCacheDownloads := prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace:   Namespace,
+			Name:        "volume_cache_download_duration_seconds",
+			Help:        "Duration of successful volume object downloads in seconds, verification included.",
+			Buckets:     volumeDownloadBuckets,
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+	)
+	volumeCacheEvictions := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "volume_cache_evictions_total",
+			Help:        "Unused volume objects evicted from the cache to make room for a download.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+	)
+	volumeCacheUnpacks := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace:   Namespace,
+			Name:        "volume_cache_unpacks_total",
+			Help:        "Volume tars the cache unpacked, by result: success, or why the unpack failed (invalid, full, timeout, io).",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		[]string{"result"},
+	)
+	volumeUnpackDuration := prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace:   Namespace,
+			Name:        "volume_cache_unpack_duration_seconds",
+			Help:        "Duration of successful volume tar unpacks in seconds, from the unpack slot to the tree in place.",
+			Buckets:     volumeUnpackBuckets,
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+	)
+	reg.MustRegister(containerOps, containerOpDuration, lifecycleSteps, guestDeaths, recoveries, volumeMounts, volumeBuilds, volumeBuildDuration,
+		volumeCacheFetches, volumeCacheDownloads, volumeCacheEvictions, volumeCacheUnpacks, volumeUnpackDuration)
+	return &RunnerRecorder{
+		reg:                  reg,
+		httpRequests:         httpReq,
+		httpDuration:         httpDur,
+		httpInflight:         buildInflightGauge(reg, RoleRunner),
+		httpLimited:          buildLimitMetrics(reg, RoleRunner),
+		containerOps:         containerOps,
+		containerOpDuration:  containerOpDuration,
+		lifecycleSteps:       lifecycleSteps,
+		guestDeaths:          guestDeaths,
+		recoveries:           recoveries,
+		volumeMounts:         volumeMounts,
+		volumeBuilds:         volumeBuilds,
+		volumeBuildDuration:  volumeBuildDuration,
+		volumeCacheFetches:   volumeCacheFetches,
+		volumeCacheDownloads: volumeCacheDownloads,
+		volumeCacheEvictions: volumeCacheEvictions,
+		volumeCacheUnpacks:   volumeCacheUnpacks,
+		volumeUnpackDuration: volumeUnpackDuration,
+		volumesLeftOut:       volumesLeftOut,
+	}
+}
+
+// Registry returns the underlying Prometheus registry, or nil if disabled.
+func (r *RunnerRecorder) Registry() *prometheus.Registry { return r.reg }
+
+// Enabled reports whether metrics observations are active.
+func (r *RunnerRecorder) Enabled() bool { return r.reg != nil }
+
+// ObserveHTTP records a finished HTTP request.
+func (r *RunnerRecorder) ObserveHTTP(route, method string, status int, dur time.Duration) {
+	if r.reg == nil {
+		return
+	}
+	r.httpRequests.WithLabelValues(route, method, strconv.Itoa(status)).Inc()
+	r.httpDuration.WithLabelValues(route, method).Observe(dur.Seconds())
+}
+
+// AddHTTPInFlight moves the gauge of HTTP requests in progress by delta.
+func (r *RunnerRecorder) AddHTTPInFlight(delta float64) {
+	if r.reg == nil {
+		return
+	}
+	r.httpInflight.Add(delta)
+}
+
+// ObserveRequestLimited records a request turned away by the given limit
+// (LimitSandbox).
+func (r *RunnerRecorder) ObserveRequestLimited(limit string) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.httpLimited.WithLabelValues(limit).Inc()
+}
+
+// RequestsLimitedCount returns the counter value for requests turned away by
+// the given limit. Intended for tests in other packages.
+func (r *RunnerRecorder) RequestsLimitedCount(limit string) float64 {
+	if r == nil || r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.httpLimited.WithLabelValues(limit))
+}
+
+// ObserveContainerOp records the outcome and duration of a container
+// lifecycle operation.
+func (r *RunnerRecorder) ObserveContainerOp(operation string, success bool, dur time.Duration) {
+	if r.reg == nil {
+		return
+	}
+	r.containerOps.WithLabelValues(operation, resultLabel(success)).Inc()
+	r.containerOpDuration.WithLabelValues(operation).Observe(dur.Seconds())
+}
+
+// ObserveLifecycleStep records how long one step of a create or wake took.
+// Operation matches the container-op labels (OpCreate, OpEnsureRunning) so the
+// steps join the totals; step is a fixed name such as "load_snapshot".
+func (r *RunnerRecorder) ObserveLifecycleStep(operation, step string, dur time.Duration) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.lifecycleSteps.WithLabelValues(operation, step).Observe(dur.Seconds())
+}
+
+// ObserveGuestDeath records a sandbox guest that exited without the runner
+// stopping it. Unlabeled: a death has no outcome of its own, and a runner
+// process serves exactly one runtime, so which backend detected it is a property
+// of the scrape target rather than of the series.
+func (r *RunnerRecorder) ObserveGuestDeath() {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.guestDeaths.Inc()
+}
+
+// ObserveRecovery records an attempt to bring back a sandbox whose guest died.
+// Paired with guest deaths it answers the question a death count alone cannot:
+// whether the crashes clients hit are being recovered from.
+func (r *RunnerRecorder) ObserveRecovery(success bool) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.recoveries.WithLabelValues(resultLabel(success)).Inc()
+}
+
+// ObserveVolumeMount records the result of a volume mount request: "success"
+// or a failure reason.
+func (r *RunnerRecorder) ObserveVolumeMount(result string) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.volumeMounts.WithLabelValues(result).Inc()
+}
+
+// ObserveVolumeBuild records the result of a volume build request: "success",
+// a failure reason, or why the runner did not build. The caller passes fixed
+// values only.
+func (r *RunnerRecorder) ObserveVolumeBuild(result string) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.volumeBuilds.WithLabelValues(result).Inc()
+}
+
+// ObserveVolumeBuildDuration records how long a volume build the runner
+// accepted took, whatever its result, from the tar's first byte to the end of
+// the call.
+func (r *RunnerRecorder) ObserveVolumeBuildDuration(dur time.Duration) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.volumeBuildDuration.Observe(dur.Seconds())
+}
+
+// ObserveVolumeCacheFetch records the result of a volume cache fetch (one of
+// the VolumeFetch* values).
+func (r *RunnerRecorder) ObserveVolumeCacheFetch(result string) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.volumeCacheFetches.WithLabelValues(result).Inc()
+}
+
+// ObserveVolumeCacheDownload records how long a successful download took.
+func (r *RunnerRecorder) ObserveVolumeCacheDownload(dur time.Duration) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.volumeCacheDownloads.Observe(dur.Seconds())
+}
+
+// ObserveVolumeCacheEviction records one object evicted from the volume cache.
+func (r *RunnerRecorder) ObserveVolumeCacheEviction() {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.volumeCacheEvictions.Inc()
+}
+
+// ObserveVolumeCacheUnpack records the result of a volume tar unpack (one of
+// the VolumeUnpack* values).
+func (r *RunnerRecorder) ObserveVolumeCacheUnpack(result string) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.volumeCacheUnpacks.WithLabelValues(result).Inc()
+}
+
+// ObserveVolumeCacheUnpackDuration records how long a successful unpack took.
+func (r *RunnerRecorder) ObserveVolumeCacheUnpackDuration(dur time.Duration) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.volumeUnpackDuration.Observe(dur.Seconds())
+}
+
+// ObserveVolumeLeftOut records an optional volume a create left out, with one
+// of the runtime's VolumeLeftOut reasons.
+func (r *RunnerRecorder) ObserveVolumeLeftOut(reason string) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.volumesLeftOut.WithLabelValues(reason).Inc()
+}
+
+// SetVolumeCache registers scrape-time gauges for the volume cache: the bytes
+// its budget counts, its entries, and the entries a sandbox holds.
+func (r *RunnerRecorder) SetVolumeCache(bytes, entries, pinned func() float64) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.reg.MustRegister(
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace:   Namespace,
+			Name:        "volume_cache_bytes",
+			Help:        "Bytes the volume cache budget counts: allocated bytes of cached objects plus the declared size of downloads in progress.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		}, bytes),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace:   Namespace,
+			Name:        "volume_cache_entries",
+			Help:        "Volume objects in the cache.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		}, entries),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Namespace:   Namespace,
+			Name:        "volume_cache_pinned_entries",
+			Help:        "Cached volume objects held by at least one sandbox, which are never evicted.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		}, pinned),
+	)
+}
+
+// SetActiveContainers registers a scrape-time gauge that calls f to read the
+// current number of slot-blocking sandboxes on the runner.
+func (r *RunnerRecorder) SetActiveContainers(f func() float64) {
+	if r.reg == nil {
+		return
+	}
+	r.reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace:   Namespace,
+			Name:        "containers_active",
+			Help:        "Current number of slot-blocking sandboxes on the runner.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		f,
+	))
+}
+
+// SetStoppedContainers registers a scrape-time gauge for managed stopped sandboxes.
+func (r *RunnerRecorder) SetStoppedContainers(f func() float64) {
+	if r.reg == nil {
+		return
+	}
+	r.reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace:   Namespace,
+			Name:        "containers_stopped",
+			Help:        "Current number of managed stopped sandboxes not occupying a concurrent slot.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		f,
+	))
+}
+
+// SetCordoned registers a scrape-time gauge that calls f to read whether the
+// runner is cordoned (1) or not (0).
+func (r *RunnerRecorder) SetCordoned(f func() float64) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace:   Namespace,
+			Name:        "runner_cordoned",
+			Help:        "1 while an operator has cordoned the runner from new creates, 0 otherwise.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		f,
+	))
+}
+
+// SetUnwiredSlots registers a scrape-time gauge for Firecracker slots whose
+// network namespace is not built. Zero in steady state.
+func (r *RunnerRecorder) SetUnwiredSlots(f func() float64) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	r.reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{
+			Namespace:   Namespace,
+			Name:        "slots_unwired",
+			Help:        "Current number of Firecracker slots whose network namespace is not built: nonzero while the wirer is building, or after a build failed.",
+			ConstLabels: prometheus.Labels{"role": RoleRunner},
+		},
+		f,
+	))
+}
+
+// SetTLSCertificateExpiry registers a scrape-time gauge that calls read for the
+// expiry of each TLS certificate file the runner presents.
+func (r *RunnerRecorder) SetTLSCertificateExpiry(read func() map[string]time.Time) {
+	if r == nil || r.reg == nil {
+		return
+	}
+	registerTLSCertificateExpiry(r.reg, RoleRunner, read)
+}
+
+// ContainerOpCount returns the counter value for a runner container operation.
+// Intended for tests in other packages.
+func (r *RunnerRecorder) ContainerOpCount(operation string, success bool) float64 {
+	if r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.containerOps.WithLabelValues(operation, resultLabel(success)))
+}
+
+// GuestDeathCount returns the counter value for guest deaths.
+// Intended for tests in other packages.
+func (r *RunnerRecorder) GuestDeathCount() float64 {
+	if r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.guestDeaths)
+}
+
+// RecoveryCount returns the counter value for recovery attempts with the given
+// result. Intended for tests in other packages.
+func (r *RunnerRecorder) RecoveryCount(success bool) float64 {
+	if r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.recoveries.WithLabelValues(resultLabel(success)))
+}
+
+// VolumeMountCount returns the counter value for volume mount requests with the
+// given result. Intended for tests in other packages.
+func (r *RunnerRecorder) VolumeMountCount(result string) float64 {
+	if r == nil || r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.volumeMounts.WithLabelValues(result))
+}
+
+// VolumeBuildCount returns the counter value for volume build requests with
+// the given result. Intended for tests in other packages.
+func (r *RunnerRecorder) VolumeBuildCount(result string) float64 {
+	if r == nil || r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.volumeBuilds.WithLabelValues(result))
+}
+
+// VolumeCacheFetchCount returns the counter value for volume cache fetches with
+// the given result. Intended for tests in other packages.
+func (r *RunnerRecorder) VolumeCacheFetchCount(result string) float64 {
+	if r == nil || r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.volumeCacheFetches.WithLabelValues(result))
+}
+
+// VolumeCacheEvictionCount returns the counter value for volume cache
+// evictions. Intended for tests in other packages.
+func (r *RunnerRecorder) VolumeCacheEvictionCount() float64 {
+	if r == nil || r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.volumeCacheEvictions)
+}
+
+// VolumeCacheUnpackCount returns the counter value for volume tar unpacks with
+// the given result. Intended for tests in other packages.
+func (r *RunnerRecorder) VolumeCacheUnpackCount(result string) float64 {
+	if r == nil || r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.volumeCacheUnpacks.WithLabelValues(result))
+}
+
+// VolumeLeftOutCount returns the counter value for optional volumes left out
+// with the given reason. Intended for tests in other packages.
+func (r *RunnerRecorder) VolumeLeftOutCount(reason string) float64 {
+	if r == nil || r.reg == nil {
+		return 0
+	}
+	return testutil.ToFloat64(r.volumesLeftOut.WithLabelValues(reason))
+}
+
+func resultLabel(success bool) string {
+	if success {
+		return "success"
+	}
+	return "error"
+}

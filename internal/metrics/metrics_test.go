@@ -1,0 +1,565 @@
+package metrics
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+)
+
+func TestAPIRecorderDisabled(t *testing.T) {
+	r := NewAPIRecorder(false)
+	if r.Enabled() {
+		t.Fatalf("expected disabled")
+	}
+	if r.Registry() != nil {
+		t.Fatalf("expected nil registry")
+	}
+	// All observations must be safe to call and have no effect.
+	r.ObserveHTTP("/x", http.MethodGet, http.StatusOK, time.Millisecond)
+	r.ObserveSandboxOp(OpCreate, true)
+	r.ObserveRequestLimited(LimitTenant)
+	r.ObservePlacement(PlacementRetried)
+	r.SetActiveSandboxes(func() float64 { return 1 })
+	r.SetRunnersRegistered(func() float64 { return 1 })
+	r.AddHTTPInFlight(1)
+	if got := r.RequestsLimitedCount(LimitTenant); got != 0 {
+		t.Errorf("RequestsLimitedCount on a disabled recorder = %v, want 0", got)
+	}
+	if got := r.PlacementCount(PlacementRetried); got != 0 {
+		t.Errorf("PlacementCount on a disabled recorder = %v, want 0", got)
+	}
+}
+
+func TestAPIRecorderCountsPlacements(t *testing.T) {
+	r := NewAPIRecorder(true)
+	r.ObservePlacement(PlacementFirstChoice)
+	r.ObservePlacement(PlacementRetried)
+	r.ObservePlacement(PlacementRetried)
+	r.ObservePlacement(PlacementExhausted)
+
+	for result, want := range map[string]float64{
+		PlacementFirstChoice: 1,
+		PlacementRetried:     2,
+		PlacementExhausted:   1,
+		PlacementNoRunner:    0,
+	} {
+		if got := r.PlacementCount(result); got != want {
+			t.Errorf("create_placements_total{result=%q} = %v, want %v", result, got, want)
+		}
+	}
+	if body := scrape(t, r.Registry()); !strings.Contains(body, `sandbox_create_placements_total{result="retried",role="api"} 2`) {
+		t.Errorf("scrape body missing the retried placement series:\n%s", body)
+	}
+}
+
+func TestRecordersCountLimitedRequestsAndInflight(t *testing.T) {
+	api := NewAPIRecorder(true)
+	api.ObserveRequestLimited(LimitTenant)
+	api.ObserveRequestLimited(LimitTenant)
+	api.AddHTTPInFlight(1)
+	if got := api.RequestsLimitedCount(LimitTenant); got != 2 {
+		t.Errorf("api tenant limited = %v, want 2", got)
+	}
+
+	runner := NewRunnerRecorder(true)
+	runner.ObserveRequestLimited(LimitSandbox)
+	runner.AddHTTPInFlight(1)
+	if got := runner.RequestsLimitedCount(LimitSandbox); got != 1 {
+		t.Errorf("runner sandbox limited = %v, want 1", got)
+	}
+
+	for role, body := range map[string]string{"api": scrape(t, api.Registry()), "runner": scrape(t, runner.Registry())} {
+		for _, want := range []string{
+			"sandbox_http_requests_limited_total",
+			"sandbox_http_requests_in_flight",
+			`role="` + role + `"`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s scrape body missing %q", role, want)
+			}
+		}
+	}
+}
+
+func TestAPIRecorderObservations(t *testing.T) {
+	r := NewAPIRecorder(true)
+	if !r.Enabled() {
+		t.Fatalf("expected enabled")
+	}
+
+	r.ObserveHTTP("/sandboxes/{id}", http.MethodGet, http.StatusOK, 50*time.Millisecond)
+	r.ObserveHTTP("/sandboxes/{id}", http.MethodGet, http.StatusOK, 80*time.Millisecond)
+	r.ObserveSandboxOp(OpCreate, true)
+	r.ObserveSandboxOp(OpCreate, false)
+	r.ObserveSandboxOp(OpDelete, true)
+
+	if got := testutil.CollectAndCount(r.httpRequests); got != 1 {
+		t.Errorf("http_requests_total series = %d, want 1", got)
+	}
+	if got := testutil.ToFloat64(r.httpRequests.WithLabelValues("/sandboxes/{id}", http.MethodGet, "200")); got != 2 {
+		t.Errorf("http_requests_total counter = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(r.sandboxOps.WithLabelValues(OpCreate, "success")); got != 1 {
+		t.Errorf("sandbox_operations_total{create,success} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(r.sandboxOps.WithLabelValues(OpCreate, "error")); got != 1 {
+		t.Errorf("sandbox_operations_total{create,error} = %v, want 1", got)
+	}
+}
+
+func TestAPIRecorderScrapeIncludesExpectedFamilies(t *testing.T) {
+	r := NewAPIRecorder(true)
+	r.SetActiveSandboxes(func() float64 { return 3 })
+	r.SetRunnersRegistered(func() float64 { return 2 })
+	r.ObserveHTTP("/sandboxes", http.MethodGet, http.StatusOK, 10*time.Millisecond)
+	r.ObserveSandboxOp(OpCreate, true)
+
+	body := scrape(t, r.Registry())
+	for _, want := range []string{
+		"sandbox_http_requests_total",
+		"sandbox_http_request_duration_seconds",
+		"sandbox_sandbox_operations_total",
+		"sandbox_sandboxes_active",
+		"sandbox_runners_registered",
+		"go_goroutines",
+		"process_start_time_seconds",
+		`role="api"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scrape body missing %q", want)
+		}
+	}
+}
+
+func TestRunnerRecorderObservations(t *testing.T) {
+	r := NewRunnerRecorder(true)
+
+	r.ObserveContainerOp(OpCreate, true, 2*time.Second)
+	r.ObserveContainerOp(OpCreate, false, 500*time.Millisecond)
+	r.ObserveContainerOp(OpEnsureRunning, true, 100*time.Millisecond)
+	r.ObserveContainerOp(OpStop, true, 50*time.Millisecond)
+
+	if got := testutil.ToFloat64(r.containerOps.WithLabelValues(OpCreate, "success")); got != 1 {
+		t.Errorf("container_operations_total{create,success} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(r.containerOps.WithLabelValues(OpEnsureRunning, "success")); got != 1 {
+		t.Errorf("container_operations_total{ensure_running,success} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(r.containerOps.WithLabelValues(OpStop, "success")); got != 1 {
+		t.Errorf("container_operations_total{stop,success} = %v, want 1", got)
+	}
+
+	body := scrape(t, r.Registry())
+	for _, want := range []string{
+		"sandbox_container_operations_total",
+		"sandbox_container_operation_duration_seconds",
+		`role="runner"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scrape body missing %q", want)
+		}
+	}
+}
+
+func TestRunnerRecorderLifecycleSteps(t *testing.T) {
+	r := NewRunnerRecorder(true)
+
+	r.ObserveLifecycleStep(OpCreate, "clone_rootfs", 30*time.Millisecond)
+	r.ObserveLifecycleStep(OpCreate, "load_snapshot", 120*time.Millisecond)
+	r.ObserveLifecycleStep(OpEnsureRunning, "load_snapshot", 90*time.Millisecond)
+
+	if got := testutil.CollectAndCount(r.lifecycleSteps); got != 3 {
+		t.Errorf("lifecycle_step_duration_seconds series = %d, want 3", got)
+	}
+
+	body := scrape(t, r.Registry())
+	for _, want := range []string{
+		"sandbox_lifecycle_step_duration_seconds",
+		`operation="create",role="runner",step="clone_rootfs"`,
+		`operation="ensure_running",role="runner",step="load_snapshot"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scrape body missing %q", want)
+		}
+	}
+}
+
+func TestRunnerRecorderGuestDeaths(t *testing.T) {
+	r := NewRunnerRecorder(true)
+
+	r.ObserveGuestDeath()
+	r.ObserveGuestDeath()
+
+	if got := r.GuestDeathCount(); got != 2 {
+		t.Errorf("guest_deaths_total = %v, want 2", got)
+	}
+
+	body := scrape(t, r.Registry())
+	for _, want := range []string{
+		"sandbox_guest_deaths_total",
+		`role="runner"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scrape body missing %q", want)
+		}
+	}
+}
+
+func TestRunnerRecorderVolumeMounts(t *testing.T) {
+	r := NewRunnerRecorder(true)
+
+	r.ObserveVolumeMount("success")
+	r.ObserveVolumeMount("success")
+	r.ObserveVolumeMount("drive")
+
+	if got := r.VolumeMountCount("success"); got != 2 {
+		t.Errorf("volume_mount_requests_total{result=success} = %v, want 2", got)
+	}
+	body := scrape(t, r.Registry())
+	if want := `sandbox_volume_mount_requests_total{result="drive",role="runner"} 1`; !strings.Contains(body, want) {
+		t.Errorf("scrape body missing %q", want)
+	}
+}
+
+func TestRunnerRecorderVolumeBuilds(t *testing.T) {
+	recorder := NewRunnerRecorder(true)
+
+	recorder.ObserveVolumeBuild("success")
+	recorder.ObserveVolumeBuild("success")
+	recorder.ObserveVolumeBuild("tar")
+	recorder.ObserveVolumeBuildDuration(3 * time.Second)
+
+	if got := recorder.VolumeBuildCount("success"); got != 2 {
+		t.Errorf("volume_builds_total{result=success} = %v, want 2", got)
+	}
+	body := scrape(t, recorder.Registry())
+	for _, want := range []string{
+		`sandbox_volume_builds_total{result="tar",role="runner"} 1`,
+		`sandbox_volume_build_duration_seconds_bucket{role="runner",le="5"} 1`,
+		`sandbox_volume_build_duration_seconds_bucket{role="runner",le="2"} 0`,
+		`sandbox_volume_build_duration_seconds_count{role="runner"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scrape body missing %q", want)
+		}
+	}
+
+	var disabled *RunnerRecorder
+	disabled.ObserveVolumeBuild("success")
+	disabled.ObserveVolumeBuildDuration(time.Second)
+	NewRunnerRecorder(false).ObserveVolumeBuild("success")
+	NewRunnerRecorder(false).ObserveVolumeBuildDuration(time.Second)
+}
+
+func TestRunnerRecorderDisabled(t *testing.T) {
+	r := NewRunnerRecorder(false)
+	if r.Enabled() {
+		t.Fatalf("expected disabled")
+	}
+	r.ObserveHTTP("/x", http.MethodGet, http.StatusOK, time.Millisecond)
+	r.ObserveContainerOp(OpCreate, true, time.Second)
+	r.ObserveLifecycleStep(OpCreate, "clone_rootfs", time.Millisecond)
+	r.ObserveGuestDeath()
+	r.ObserveRequestLimited(LimitSandbox)
+	r.SetActiveContainers(func() float64 { return 1 })
+	r.SetUnwiredSlots(func() float64 { return 1 })
+	r.SetCordoned(func() float64 { return 1 })
+	r.AddHTTPInFlight(1)
+	r.ObserveVolumeCacheFetch(VolumeFetchHit)
+	r.ObserveVolumeCacheDownload(time.Second)
+	r.ObserveVolumeCacheEviction()
+	r.ObserveVolumeCacheUnpack(VolumeUnpackSuccess)
+	r.ObserveVolumeCacheUnpackDuration(time.Second)
+	r.SetVolumeCache(func() float64 { return 1 }, func() float64 { return 1 }, func() float64 { return 1 })
+	if got := r.VolumeCacheFetchCount(VolumeFetchHit); got != 0 {
+		t.Errorf("VolumeCacheFetchCount on a disabled recorder = %v, want 0", got)
+	}
+	if got := r.VolumeCacheUnpackCount(VolumeUnpackSuccess); got != 0 {
+		t.Errorf("VolumeCacheUnpackCount on a disabled recorder = %v, want 0", got)
+	}
+	var nilRecorder *RunnerRecorder
+	nilRecorder.ObserveVolumeCacheFetch(VolumeFetchHit)
+	nilRecorder.ObserveVolumeCacheUnpack(VolumeUnpackSuccess)
+	nilRecorder.ObserveVolumeCacheUnpackDuration(time.Second)
+	nilRecorder.SetVolumeCache(nil, nil, nil)
+}
+
+func TestRunnerRecorderVolumeCache(t *testing.T) {
+	rec := NewRunnerRecorder(true)
+	rec.ObserveVolumeCacheFetch(VolumeFetchHit)
+	rec.ObserveVolumeCacheFetch(VolumeFetchHit)
+	rec.ObserveVolumeCacheFetch(VolumeFetchDigest)
+	rec.ObserveVolumeCacheDownload(3 * time.Second)
+	rec.ObserveVolumeCacheEviction()
+	rec.ObserveVolumeCacheUnpack(VolumeUnpackSuccess)
+	rec.ObserveVolumeCacheUnpack(VolumeUnpackInvalid)
+	rec.ObserveVolumeCacheUnpackDuration(4 * time.Second)
+	rec.ObserveVolumeCacheUnpackDuration(20 * time.Millisecond)
+	rec.SetVolumeCache(func() float64 { return 4096 }, func() float64 { return 3 }, func() float64 { return 2 })
+
+	if got := rec.VolumeCacheFetchCount(VolumeFetchHit); got != 2 {
+		t.Errorf("volume_cache_fetches_total{result=hit} = %v, want 2", got)
+	}
+	if got := rec.VolumeCacheEvictionCount(); got != 1 {
+		t.Errorf("volume_cache_evictions_total = %v, want 1", got)
+	}
+	body := scrape(t, rec.Registry())
+	for _, want := range []string{
+		`sandbox_volume_cache_fetches_total{result="digest",role="runner"} 1`,
+		`sandbox_volume_cache_download_duration_seconds_count{role="runner"} 1`,
+		`sandbox_volume_cache_evictions_total{role="runner"} 1`,
+		`sandbox_volume_cache_unpacks_total{result="invalid",role="runner"} 1`,
+		`sandbox_volume_cache_unpacks_total{result="success",role="runner"} 1`,
+		`sandbox_volume_cache_unpack_duration_seconds_bucket{role="runner",le="0.01"} 0`,
+		`sandbox_volume_cache_unpack_duration_seconds_bucket{role="runner",le="0.05"} 1`,
+		`sandbox_volume_cache_unpack_duration_seconds_bucket{role="runner",le="2.5"} 1`,
+		`sandbox_volume_cache_unpack_duration_seconds_bucket{role="runner",le="5"} 2`,
+		`sandbox_volume_cache_bytes{role="runner"} 4096`,
+		`sandbox_volume_cache_entries{role="runner"} 3`,
+		`sandbox_volume_cache_pinned_entries{role="runner"} 2`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scrape body missing %q", want)
+		}
+	}
+}
+
+func TestRunnerRecorderVolumesLeftOut(t *testing.T) {
+	rec := NewRunnerRecorder(true)
+	rec.ObserveVolumeLeftOut("download")
+	rec.ObserveVolumeLeftOut("download")
+	rec.ObserveVolumeLeftOut("mount")
+
+	if got := rec.VolumeLeftOutCount("download"); got != 2 {
+		t.Errorf("volumes_left_out_total{reason=download} = %v, want 2", got)
+	}
+	body := scrape(t, rec.Registry())
+	if want := `sandbox_volumes_left_out_total{reason="mount",role="runner"} 1`; !strings.Contains(body, want) {
+		t.Errorf("scrape body missing %q", want)
+	}
+	var nilRecorder *RunnerRecorder
+	nilRecorder.ObserveVolumeLeftOut("mount")
+	NewRunnerRecorder(false).ObserveVolumeLeftOut("mount")
+}
+
+func TestRunnerRecorderStoppedGaugeScrape(t *testing.T) {
+	r := NewRunnerRecorder(true)
+	r.SetActiveContainers(func() float64 { return 2 })
+	r.SetStoppedContainers(func() float64 { return 3 })
+	r.SetUnwiredSlots(func() float64 { return 4 })
+	r.SetCordoned(func() float64 { return 1 })
+
+	body := scrape(t, r.Registry())
+	for _, want := range []string{
+		"sandbox_containers_active",
+		"sandbox_containers_stopped",
+		"sandbox_slots_unwired",
+		`sandbox_runner_cordoned{role="runner"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("scrape body missing %q", want)
+		}
+	}
+}
+
+func TestRouteFromPattern(t *testing.T) {
+	cases := map[string]string{
+		"":                                "unmatched",
+		"GET /sandboxes":                  "/sandboxes",
+		"POST /sandboxes/{id}/executions": "/sandboxes/{id}/executions",
+		"DELETE /sandboxes/{id}":          "/sandboxes/{id}",
+		"/no-method-prefix":               "/no-method-prefix",
+	}
+	for in, want := range cases {
+		if got := routeFromPattern(in); got != want {
+			t.Errorf("routeFromPattern(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestMethodLabel(t *testing.T) {
+	cases := map[string]string{
+		http.MethodGet:     http.MethodGet,
+		http.MethodHead:    http.MethodHead,
+		http.MethodPost:    http.MethodPost,
+		http.MethodPut:     http.MethodPut,
+		http.MethodPatch:   http.MethodPatch,
+		http.MethodDelete:  http.MethodDelete,
+		http.MethodConnect: http.MethodConnect,
+		http.MethodOptions: http.MethodOptions,
+		http.MethodTrace:   http.MethodTrace,
+		"FOO":              "other",
+		"get":              "other",
+		"":                 "other",
+	}
+	for in, want := range cases {
+		if got := methodLabel(in); got != want {
+			t.Errorf("methodLabel(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestHTTPMiddlewareBoundsMethodLabel(t *testing.T) {
+	r := NewAPIRecorder(true)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /x", func(http.ResponseWriter, *http.Request) {})
+	handler := HTTPMiddleware(r)(mux)
+
+	for _, method := range []string{"FOO", "BAR"} {
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(method, "/x", nil))
+	}
+
+	if got := testutil.CollectAndCount(r.httpRequests); got != 1 {
+		t.Errorf("series = %d, want 1", got)
+	}
+	if got := testutil.ToFloat64(r.httpRequests.WithLabelValues("unmatched", "other", "405")); got != 2 {
+		t.Errorf("counter for method=other = %v, want 2", got)
+	}
+}
+
+func TestHTTPMiddlewareRecordsRoutePattern(t *testing.T) {
+	r := NewAPIRecorder(true)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /things/{id}", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+	})
+	handler := HTTPMiddleware(r)(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/things/abc", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusTeapot {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusTeapot)
+	}
+	if got := testutil.ToFloat64(r.httpRequests.WithLabelValues("/things/{id}", http.MethodGet, "418")); got != 1 {
+		t.Errorf("recorded route label = wrong; counter = %v", got)
+	}
+}
+
+func TestHTTPMiddlewareCountsRequestsInProgress(t *testing.T) {
+	r := NewAPIRecorder(true)
+	inside := make(chan float64, 1)
+	handler := HTTPMiddleware(r)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		inside <- testutil.ToFloat64(r.httpInflight)
+		panic("boom")
+	}))
+
+	func() {
+		defer func() { _ = recover() }()
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+	}()
+
+	if got := <-inside; got != 1 {
+		t.Errorf("in flight during the request = %v, want 1", got)
+	}
+	// A panicking handler must not leave the gauge counting a request forever.
+	if got := testutil.ToFloat64(r.httpInflight); got != 0 {
+		t.Errorf("in flight after the request = %v, want 0", got)
+	}
+}
+
+func TestHTTPMiddlewareRecordsPanickedRequests(t *testing.T) {
+	r := NewAPIRecorder(true)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /boom", func(_ http.ResponseWriter, _ *http.Request) {
+		panic("boom")
+	})
+	handler := HTTPMiddleware(r)(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/boom", nil)
+	rr := httptest.NewRecorder()
+
+	defer func() {
+		// Recovery is handled by an outer middleware in production; here we
+		// just absorb the panic so the test process doesn't crash.
+		_ = recover()
+	}()
+
+	func() {
+		defer func() { _ = recover() }()
+		handler.ServeHTTP(rr, req)
+	}()
+
+	// The panic unwound through HTTPMiddleware's defer, so the observation
+	// must have happened. Status defaults to 200 because the handler panicked
+	// before writing a header.
+	if got := testutil.ToFloat64(r.httpRequests.WithLabelValues("/boom", http.MethodGet, "200")); got != 1 {
+		t.Errorf("panicking handler should still record; counter = %v, want 1", got)
+	}
+}
+
+func TestHTTPMiddlewareLatchesFirstStatusCode(t *testing.T) {
+	r := NewAPIRecorder(true)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /double-write", func(w http.ResponseWriter, _ *http.Request) {
+		// Mis-use: write 200 first, then try 500. net/http honors the first
+		// on the wire (logging a warning for the second). Our metric must
+		// also record the first.
+		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	handler := HTTPMiddleware(r)(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/double-write", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if got := testutil.ToFloat64(r.httpRequests.WithLabelValues("/double-write", http.MethodGet, "200")); got != 1 {
+		t.Errorf("first WriteHeader should be recorded; counter for 200 = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(r.httpRequests.WithLabelValues("/double-write", http.MethodGet, "500")); got != 0 {
+		t.Errorf("subsequent WriteHeader must NOT be recorded; counter for 500 = %v, want 0", got)
+	}
+}
+
+func TestHTTPMiddlewareLabelsUnmatchedRoutes(t *testing.T) {
+	r := NewAPIRecorder(true)
+	mux := http.NewServeMux()
+	handler := HTTPMiddleware(r)(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/nothing-here", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if got := testutil.ToFloat64(r.httpRequests.WithLabelValues("unmatched", http.MethodGet, "404")); got != 1 {
+		t.Errorf("unmatched counter = %v, want 1", got)
+	}
+}
+
+func TestTLSCertificateExpiryReadsAtScrapeTime(t *testing.T) {
+	expiry := map[string]time.Time{"/tls/a/tls.crt": time.Unix(1800000000, 0)}
+	read := func() map[string]time.Time { return expiry }
+
+	api := NewAPIRecorder(true)
+	api.SetTLSCertificateExpiry(read)
+	runner := NewRunnerRecorder(true)
+	runner.SetTLSCertificateExpiry(read)
+	NewAPIRecorder(false).SetTLSCertificateExpiry(read)
+	NewRunnerRecorder(false).SetTLSCertificateExpiry(read)
+
+	for role, reg := range map[string]*prometheus.Registry{"api": api.Registry(), "runner": runner.Registry()} {
+		want := `sandbox_tls_certificate_expiry_timestamp_seconds{path="/tls/a/tls.crt",role="` + role + `"} 1.8e+09`
+		if body := scrape(t, reg); !strings.Contains(body, want) {
+			t.Errorf("%s scrape missing %q:\n%s", role, want, body)
+		}
+	}
+
+	expiry = map[string]time.Time{"/tls/a/tls.crt": time.Unix(1900000000, 0)}
+	if body := scrape(t, runner.Registry()); !strings.Contains(body, `path="/tls/a/tls.crt",role="runner"} 1.9e+09`) {
+		t.Errorf("scrape did not read the renewed expiry:\n%s", body)
+	}
+}
+
+func scrape(t *testing.T, reg *prometheus.Registry) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	rr := httptest.NewRecorder()
+	Handler(reg).ServeHTTP(rr, req)
+	body, _ := io.ReadAll(rr.Body)
+	return string(body)
+}

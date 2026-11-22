@@ -1,0 +1,825 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/n8n-io/sandbox-service/internal/api/config"
+	"github.com/n8n-io/sandbox-service/internal/api/registry"
+	"github.com/n8n-io/sandbox-service/internal/api/runnerctl"
+	"github.com/n8n-io/sandbox-service/internal/api/store"
+	"github.com/n8n-io/sandbox-service/internal/grpctls"
+	"github.com/n8n-io/sandbox-service/internal/metrics"
+	"github.com/n8n-io/sandbox-service/internal/obs"
+	runnerruntime "github.com/n8n-io/sandbox-service/internal/runner/runtime"
+	"github.com/n8n-io/sandbox-service/internal/sandboxproxy"
+)
+
+// sandboxStore is the store of the default sandbox routes.
+type sandboxStore interface {
+	Create(record *store.SandboxRecord) error
+	GetAnyKind(id string) (*store.SandboxRecord, error)
+	GetDefaultSandbox(id string) (*store.SandboxRecord, error)
+	List(f store.SandboxFilter) ([]*store.SandboxRecord, error)
+	Delete(id string) error
+	LockSandbox(ctx context.Context, id string) (unlock func(), err error)
+}
+
+// tenantGetter reads tenants.
+type tenantGetter interface {
+	GetTenant(id string) (*store.Tenant, error)
+}
+
+// newRunnerTransport builds the transport the API uses to reach runner HTTP
+// listeners, presenting the same client certificate it uses for control gRPC.
+//
+// Build it once per process: it owns the connection pool, so a transport per
+// request would mean a fresh TLS handshake per request.
+//
+// Returns a nil RoundTripper when the control-plane material is unset, matching
+// runnerControlTLS. LoadAPI requires all three files, so that only happens in
+// tests, which then fall back to the default transport. The return type is the
+// interface rather than *http.Transport so that nil case stays a nil interface,
+// which is what ReverseProxy checks before substituting its default.
+func newRunnerTransport(cfg *config.APIConfig) (http.RoundTripper, error) {
+	if cfg.RunnerControlGRPCClientCAFile == "" {
+		return nil, nil
+	}
+	// Deliberately no ServerName: one transport serves every runner, and with
+	// ServerName empty net/http verifies each runner against the host in its own
+	// advertised base URL (docs/security-model.md, "API to runner").
+	tlsConf, err := grpctls.NewClientTLSConfig(
+		cfg.RunnerControlGRPCClientCAFile,
+		cfg.RunnerControlGRPCClientCertFile,
+		cfg.RunnerControlGRPCClientKeyFile,
+		"",
+	)
+	if err != nil {
+		return nil, err
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	// http.DefaultTransport takes a proxy from the environment.
+	tr.Proxy = nil
+	tr.TLSClientConfig = tlsConf
+	// A connection silent for runnerPingAfter is pinged and closed when no
+	// answer comes within runnerPingTimeout.
+	const (
+		runnerPingAfter   = 15 * time.Second
+		runnerPingTimeout = 30 * time.Second
+	)
+	tr.HTTP2 = &http.HTTP2Config{SendPingTimeout: runnerPingAfter, PingTimeout: runnerPingTimeout}
+	return tr, nil
+}
+
+// proxyRoute says how sandboxProxyHandler treats a route. The zero value fits
+// most routes.
+type proxyRoute struct {
+	// limitBody caps the request body at cfg.MaxFileBytes, for file uploads.
+	limitBody bool
+	// neverWakes marks a route the runner answers without starting a stopped
+	// sandbox (execution DELETE), so a stopped sandbox on a cordoned runner is
+	// proxied to rather than deleted.
+	neverWakes bool
+}
+
+// sandboxProxyHandler proxies sandbox routes to the sandbox's runner.
+func sandboxProxyHandler(s sandboxStore, reg registry.RunnerRegistry, cfg *config.APIConfig, transport http.RoundTripper, activity *ActivityRecorder, mrec *metrics.APIRecorder) func(proxyRoute) http.HandlerFunc {
+	return func(route proxyRoute) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			id := r.PathValue("id")
+			if !isValidUUID(id) {
+				writeError(w, http.StatusBadRequest, "invalid sandbox id")
+				return
+			}
+
+			rec, err := s.GetDefaultSandbox(id)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if rec == nil || !canAccessSandbox(r, rec) {
+				writeError(w, http.StatusNotFound, "sandbox not found")
+				return
+			}
+
+			// Fence before routing checks: a sandbox past its delete window is
+			// 404 regardless of whether its row still has routing information.
+			if isPastIdleDeleteWindow(rec, cfg, time.Now().Unix()) {
+				writeError(w, http.StatusNotFound, "sandbox not found")
+				return
+			}
+
+			fields := obs.FieldsFrom(r.Context())
+			fields.Add("sandbox_id", id, "runner_id", rec.RunnerID)
+
+			// Before the routing checks: the delete goes over control gRPC, not
+			// the runner's HTTP base. Status first: the registry read is a query
+			// on Postgres.
+			if !route.neverWakes && rec.Status == "stopped" && runnerCordoned(reg, rec.RunnerID) {
+				deleteStoppedOnCordonedRunner(w, r, s, reg, cfg, mrec, id)
+				return
+			}
+
+			if rec.RunnerHTTPBase == "" {
+				writeError(w, http.StatusBadGateway, "sandbox has no runner routing information")
+				return
+			}
+
+			// Re-check the scheme even though registration rejects non-https:
+			// this record may predate that rule, and proxying to an http base
+			// would send the runner API key in the clear, because
+			// Transport.TLSClientConfig applies only to https URLs.
+			u, err := url.Parse(strings.TrimRight(rec.RunnerHTTPBase, "/"))
+			if err != nil || !strings.EqualFold(u.Scheme, "https") {
+				writeError(w, http.StatusBadGateway, "sandbox runner is not reachable over https")
+				return
+			}
+
+			upstreamStart := time.Now()
+			proxy := newRunnerReverseProxy(u, cfg.RunnerAPIKey, transport, func(resp *http.Response) {
+				// Response headers are in, so for a streamed exec this is the
+				// time to first byte rather than the full round trip.
+				fields.Add("ttfb_ms", time.Since(upstreamStart).Milliseconds())
+				if reapSandboxIfRunnerGone(s, id, resp) {
+					return
+				}
+				trackSandboxActivity(activity, rec, resp)
+			})
+			if route.limitBody {
+				r.Body = http.MaxBytesReader(w, r.Body, cfg.MaxFileBytes)
+			}
+			proxy.ServeHTTP(w, r)
+		}
+	}
+}
+
+// State-managed handlers that coordinate with runner service
+
+type SandboxResponse struct {
+	ID           string `json:"id"`
+	Status       string `json:"status"`
+	CreatedAt    int64  `json:"created_at"`
+	LastActiveAt int64  `json:"last_active_at"`
+	Ephemeral    bool   `json:"ephemeral"`
+	Egress       string `json:"egress"`
+	// TenantID is the owning tenant, or store.AdminTenantID for a sandbox
+	// created with an admin key. A tenant only ever sees its own id here.
+	TenantID string `json:"tenant_id"`
+}
+
+type createSandboxRequest struct {
+	ID        *string `json:"id"`
+	Ephemeral bool    `json:"ephemeral"`
+	Egress    *string `json:"egress"` // nil when left out; "" is the default, as on create
+}
+
+func sandboxResponse(rec *store.SandboxRecord) *SandboxResponse {
+	tenantID := rec.TenantID
+	if store.IsAdminTenantID(tenantID) {
+		// Rows from before tenants exist are backfilled on startup, but keep the
+		// wire value canonical regardless of what the store holds.
+		tenantID = store.AdminTenantID
+	}
+	return &SandboxResponse{
+		ID:           rec.ID,
+		Status:       rec.Status,
+		CreatedAt:    rec.CreatedAt,
+		LastActiveAt: rec.LastActiveAt,
+		Ephemeral:    rec.Ephemeral,
+		Egress:       rec.Egress,
+		TenantID:     tenantID,
+	}
+}
+
+// listTenantFilter reads the admin-only `tenant_id` query parameter of
+// GET /sandboxes. ok is false when a response has already been written.
+func listTenantFilter(w http.ResponseWriter, r *http.Request, role authRole) (tenantID string, ok bool) {
+	values := r.URL.Query()["tenant_id"]
+	if len(values) == 0 {
+		return "", true
+	}
+	// A tenant key's listing is already scoped to itself; accepting the
+	// parameter from it would only offer a way to probe other tenants' ids.
+	if role != roleAdmin {
+		writeError(w, http.StatusForbidden, "filtering by tenant_id requires an admin API key")
+		return "", false
+	}
+	if len(values) != 1 {
+		writeError(w, http.StatusBadRequest, "tenant_id may be given once")
+		return "", false
+	}
+	tenantID = values[0]
+	if tenantID == store.AdminTenantID {
+		return tenantID, true
+	}
+	if !isValidUUID(tenantID) {
+		writeError(w, http.StatusBadRequest, "invalid tenant_id: expected a tenant UUID or "+store.AdminTenantID)
+		return "", false
+	}
+	return tenantID, true
+}
+
+func handleListSandboxes(s sandboxStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, ok := authFromContext(r.Context())
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "invalid API key")
+			return
+		}
+		// Explicit per role: a fallthrough here would hand a new role the
+		// tenant listing (or, in create, the admin pseudo-tenant).
+		if id.Role != roleAdmin && id.Role != roleTenant {
+			writeError(w, http.StatusForbidden, "sandbox access requires an admin or tenant API key")
+			return
+		}
+		filter, ok := listTenantFilter(w, r, id.Role)
+		if !ok {
+			return
+		}
+		var (
+			records []*store.SandboxRecord
+			err     error
+		)
+		f := store.KindFilter(store.KindDefault)
+		switch {
+		case id.Role == roleTenant:
+			f.TenantID = id.TenantID
+		case filter != "":
+			f.TenantID = filter
+		}
+		if id.Role == roleTenant && f.TenantID == "" {
+			writeError(w, http.StatusForbidden, "tenant API key without a tenant")
+			return
+		}
+		records, err = s.List(f)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		resp := make([]*SandboxResponse, len(records))
+		for i, rec := range records {
+			resp[i] = sandboxResponse(rec)
+		}
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+func handleGetSandbox(s sandboxStore, cfg *config.APIConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if !isValidUUID(id) {
+			writeError(w, http.StatusBadRequest, "invalid sandbox id")
+			return
+		}
+		rec, err := s.GetDefaultSandbox(id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if rec == nil || !canAccessSandbox(r, rec) {
+			writeError(w, http.StatusNotFound, "sandbox not found")
+			return
+		}
+		if isPastIdleDeleteWindow(rec, cfg, time.Now().Unix()) {
+			writeError(w, http.StatusNotFound, "sandbox not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, sandboxResponse(rec))
+	}
+}
+
+func isPastIdleDeleteWindow(rec *store.SandboxRecord, cfg *config.APIConfig, now int64) bool {
+	if rec == nil {
+		return false
+	}
+	window := cfg.IdleDeleteAfter
+	if rec.Ephemeral {
+		window = ephemeralIdleWindow(cfg)
+	}
+	return window > 0 && now > rec.LastActiveAt+idleSeconds(window)+idleSeconds(activityLag(cfg))
+}
+
+func runnerControlTLS(cfg *config.APIConfig) *runnerctl.TLS {
+	if cfg.RunnerControlGRPCClientCAFile == "" {
+		return nil
+	}
+	return &runnerctl.TLS{
+		CAFile:     cfg.RunnerControlGRPCClientCAFile,
+		CertFile:   cfg.RunnerControlGRPCClientCertFile,
+		KeyFile:    cfg.RunnerControlGRPCClientKeyFile,
+		ServerName: cfg.RunnerControlGRPCClientServerName,
+	}
+}
+
+// runnerCreateBudget is the deadline for the runner create RPC, used instead of
+// the client's request context: a client disconnect must not cancel the RPC,
+// because the runner would finish the create anyway and the resulting sandbox,
+// with no store row, would hold a slot that quota and the idle sweeper cannot
+// see. The runtime's own create budget plus a margin for the round trip.
+const runnerCreateBudget = runnerruntime.CreateBudget + time.Minute
+
+func handleCreateSandbox(s sandboxStore, tenants tenantGetter, reg registry.RunnerRegistry, cfg *config.APIConfig, rec *metrics.APIRecorder, quota *tenantQuota) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		success := false
+		defer func() { rec.ObserveSandboxOp(metrics.OpCreate, success) }()
+
+		authID, ok := authFromContext(r.Context())
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "invalid API key")
+			return
+		}
+		// Before any work: the tenant resolution below defaults to the admin
+		// pseudo-tenant, which must never apply to a role other than admin.
+		if authID.Role != roleAdmin && authID.Role != roleTenant {
+			writeError(w, http.StatusForbidden, "sandbox access requires an admin or tenant API key")
+			return
+		}
+
+		var req createSandboxRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		egressField := ""
+		if req.Egress != nil {
+			egressField = *req.Egress
+		}
+		egress, err := runnerruntime.ParseEgress(egressField)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		sandboxID := generateUUID()
+		if req.ID != nil {
+			if !isValidUUID(*req.ID) {
+				writeError(w, http.StatusBadRequest, "invalid sandbox id")
+				return
+			}
+			sandboxID = *req.ID
+
+			unlock, err := s.LockSandbox(r.Context(), sandboxID)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			defer unlock()
+
+			// Any kind: the id of a sandbox of another kind is not free.
+			existing, err := s.GetAnyKind(sandboxID)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if existing != nil {
+				if existing.Kind != store.KindDefault || !canAccessSandbox(r, existing) {
+					writeError(w, http.StatusConflict, "sandbox id unavailable")
+					return
+				}
+				if !isPastIdleDeleteWindow(existing, cfg, time.Now().Unix()) {
+					success = writeExistingSandbox(w, existing, egress, req.Egress != nil)
+					return
+				}
+				if !deleteSandboxRecord(w, r, s, cfg, existing) {
+					return
+				}
+			}
+		}
+
+		tenantID := store.AdminTenantID
+		releaseQuota := func(bool) {}
+		if authID.Role == roleTenant {
+			tenantID = authID.TenantID
+			tenant, err := tenants.GetTenant(tenantID)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if tenant == nil {
+				writeError(w, http.StatusUnauthorized, "invalid API key")
+				return
+			}
+			var ok bool
+			releaseQuota, ok, err = quota.reserve(tenantID, tenant.MaxSandboxes)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			if !ok {
+				writeError(w, http.StatusForbidden, "tenant sandbox quota exceeded")
+				return
+			}
+		}
+		// A create that is not saved frees its slot on return, after any
+		// runner rollback; a saved one right after the save, below.
+		defer releaseQuota(false)
+
+		requested := runnerruntime.CreateOptions{Egress: egress}
+		createOptionsJSON, err := json.Marshal(requested)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		obs.FieldsFrom(r.Context()).Add("sandbox_id", sandboxID)
+		now := time.Now().Unix()
+		placed, err := placeSandbox(r, reg, cfg, rec, sandboxID, string(createOptionsJSON),
+			"tenant_id", tenantID, "ephemeral", req.Ephemeral, "egress", egress)
+		if errors.Is(err, registry.ErrNoRunners) || errors.Is(err, errRunnersAtCapacity) {
+			writeNoCapacity(w, err)
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		run, gresp := placed.run, placed.resp
+		controlAddr := run.ControlGRPCAddr
+		tlsCfg := runnerControlTLS(cfg)
+		// Undoes the runner create when the sandbox cannot be tracked as asked.
+		// Fresh deadline: the create may have used up most of its own.
+		rollbackRunnerCreate := func() {
+			deleteCtx, cancelDelete := context.WithTimeout(context.WithoutCancel(r.Context()), runnerCreateBudget)
+			delErr := runnerctl.DeleteSandbox(deleteCtx, controlAddr, cfg.RunnerAPIKey, tlsCfg, sandboxID)
+			cancelDelete()
+			if delErr != nil {
+				slog.ErrorContext(
+					r.Context(),
+					"create sandbox failed: compensating runner delete, sandbox is untracked",
+					"sandbox_id", sandboxID,
+					"runner_id", run.ID,
+					"runner_control_grpc_addr", controlAddr,
+					"error", delErr,
+				)
+			}
+		}
+
+		// The runner echoes the options it applied; a runner from before egress
+		// modes echoes nothing and applied the defaults. Anything but what was
+		// asked for would leave the record saying one thing and the network
+		// another, so the sandbox is removed rather than tracked.
+		applied, err := runnerruntime.ParseCreateOptions(gresp.GetAppliedCreateOptionsJson())
+		if err != nil || applied.Egress != requested.Egress {
+			rollbackRunnerCreate()
+			slog.ErrorContext(
+				r.Context(),
+				"create sandbox failed: runner did not apply the requested egress",
+				"sandbox_id", sandboxID,
+				"runner_id", run.ID,
+				"requested_egress", egress,
+				"applied_create_options_json", gresp.GetAppliedCreateOptionsJson(),
+				"error", err,
+			)
+			writeError(w, http.StatusBadGateway, "runner did not apply the requested egress")
+			return
+		}
+		containerIP := gresp.GetContainerIp()
+
+		record := &store.SandboxRecord{
+			ID:                    sandboxID,
+			Status:                "running",
+			CreatedAt:             now,
+			LastActiveAt:          now,
+			ContainerIP:           containerIP,
+			DaemonPort:            8081,
+			RunnerID:              run.ID,
+			RunnerHTTPBase:        strings.TrimRight(run.HTTPBaseURL, "/"),
+			RunnerControlGRPCAddr: controlAddr,
+			TenantID:              tenantID,
+			Ephemeral:             req.Ephemeral,
+			Egress:                string(egress),
+			Kind:                  store.KindDefault,
+		}
+		if err := s.Create(record); err != nil {
+			rollbackRunnerCreate()
+			// Unless the store refused the row, it may have been saved anyway,
+			// say when a commit's reply was lost: count it as saved, the safe side.
+			releaseQuota(!errors.Is(err, store.ErrTenantQuotaExceeded) && !errors.Is(err, store.ErrTenantNotFound))
+			if existing, getErr := s.GetAnyKind(sandboxID); getErr == nil && existing != nil {
+				if existing.Kind != store.KindDefault || !canAccessSandbox(r, existing) {
+					writeError(w, http.StatusConflict, "sandbox id unavailable")
+					return
+				}
+				success = writeExistingSandbox(w, existing, egress, req.Egress != nil)
+				return
+			}
+			if errors.Is(err, store.ErrTenantQuotaExceeded) {
+				// Passed the check above, but creates on other API pods
+				// were saved first and filled the quota, or it was lowered.
+				slog.WarnContext(
+					r.Context(),
+					"create sandbox refused: tenant quota filled by concurrent creates",
+					"sandbox_id", sandboxID,
+					"runner_id", run.ID,
+					"tenant_id", tenantID,
+				)
+				writeError(w, http.StatusForbidden, "tenant sandbox quota exceeded")
+				return
+			}
+			slog.ErrorContext(
+				r.Context(),
+				"create sandbox failed: store record",
+				"sandbox_id", sandboxID,
+				"runner_id", run.ID,
+				"container_ip", containerIP,
+				"error", err,
+			)
+			if errors.Is(err, store.ErrTenantNotFound) {
+				writeError(w, http.StatusConflict, "tenant not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "failed to store sandbox: "+err.Error())
+			return
+		}
+		releaseQuota(true)
+		slog.InfoContext(
+			r.Context(),
+			"create sandbox succeeded",
+			"sandbox_id", sandboxID,
+			"runner_id", run.ID,
+			"container_ip", containerIP,
+		)
+
+		writeJSON(w, http.StatusCreated, sandboxResponse(record))
+		success = true
+	}
+}
+
+// writeExistingSandbox answers a create whose id the caller already owns with
+// that sandbox. Egress is fixed at creation, so a mode the request names has to
+// be the sandbox's: a caller asking for none must not get an open sandbox back
+// and take it for sealed. egress is the request's parsed mode; egressGiven is
+// false when the request left it out, in which case whatever the sandbox has
+// is fine.
+func writeExistingSandbox(w http.ResponseWriter, existing *store.SandboxRecord, egress runnerruntime.Egress, egressGiven bool) bool {
+	if egressGiven && string(egress) != existing.Egress {
+		writeError(w, http.StatusConflict, "sandbox exists with egress "+existing.Egress)
+		return false
+	}
+	writeJSON(w, http.StatusOK, sandboxResponse(existing))
+	return true
+}
+
+func deleteSandboxRecord(w http.ResponseWriter, r *http.Request, s sandboxStore, cfg *config.APIConfig, rec *store.SandboxRecord) bool {
+	if err := runnerctl.DeleteSandbox(r.Context(), rec.RunnerControlGRPCAddr, cfg.RunnerAPIKey, runnerControlTLS(cfg), rec.ID); err != nil {
+		writeError(w, http.StatusBadGateway, "failed to delete container: "+err.Error())
+		return false
+	}
+	if err := s.Delete(rec.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return false
+	}
+	return true
+}
+
+func handleDeleteSandbox(s sandboxStore, cfg *config.APIConfig, mrec *metrics.APIRecorder) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		success := false
+		defer func() { mrec.ObserveSandboxOp(metrics.OpDelete, success) }()
+
+		id := r.PathValue("id")
+		if !isValidUUID(id) {
+			writeError(w, http.StatusBadRequest, "invalid sandbox id")
+			return
+		}
+
+		unlock, err := s.LockSandbox(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		defer unlock()
+
+		rec, err := s.GetDefaultSandbox(id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if rec == nil || !canAccessSandbox(r, rec) {
+			// Same 404 as GET for missing and inaccessible — do not leak
+			// cross-tenant existence via 204 vs 404.
+			writeError(w, http.StatusNotFound, "sandbox not found")
+			return
+		}
+
+		if !deleteSandboxRecord(w, r, s, cfg, rec) {
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+		success = true
+	}
+}
+
+var uuidRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+func generateUUID() string {
+	return uuid.New().String()
+}
+
+func isValidUUID(id string) bool {
+	return id != "" && uuidRegex.MatchString(id)
+}
+
+// errRunnerRedirect marks a 3xx from the runner, which the proxy refuses: no
+// runner route redirects, and relaying one would send a client, and the API key
+// it holds, wherever a compromised runner points.
+var errRunnerRedirect = errors.New("runner returned a redirect")
+
+func newRunnerReverseProxy(runnerURL *url.URL, runnerAPIKey string, transport http.RoundTripper, onResponse func(*http.Response)) *httputil.ReverseProxy {
+	target := *runnerURL
+	return &httputil.ReverseProxy{
+		Transport: transport,
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(&target)
+			pr.Out.URL.Path = pr.In.URL.Path
+			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
+			pr.Out.Host = target.Host
+			if runnerAPIKey != "" {
+				pr.Out.Header.Set("X-Api-Key", runnerAPIKey)
+			} else {
+				pr.Out.Header.Del("X-Api-Key")
+			}
+			// Forward the trace context we established, never the caller's raw
+			// header, which LoggingMiddleware has already validated or replaced.
+			if tp := obs.Traceparent(pr.In.Context()); tp != "" {
+				pr.Out.Header.Set(obs.HeaderTraceparent, tp)
+			} else {
+				pr.Out.Header.Del(obs.HeaderTraceparent)
+			}
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			// Before the redirect check: a refused redirect still came from a
+			// runner that authenticated with this certificate.
+			if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
+				grpctls.NotePeer(resp.TLS.PeerCertificates[0])
+			}
+			// Before onResponse, so a redirect never counts as sandbox activity.
+			if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+				loc := resp.Header.Get("Location")
+				if len(loc) > 200 {
+					loc = loc[:200]
+				}
+				obs.FieldsFrom(resp.Request.Context()).Add("runner_redirect_status", resp.StatusCode, "runner_redirect_location", loc)
+				return errRunnerRedirect
+			}
+			if onResponse != nil {
+				onResponse(resp)
+			}
+			return nil
+		},
+		FlushInterval: -1,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if errors.Is(err, errRunnerRedirect) {
+				writeError(w, http.StatusBadGateway, err.Error())
+				return
+			}
+			if maxBytesErr, ok := errors.AsType[*http.MaxBytesError](err); ok {
+				writeError(w, http.StatusBadRequest, "failed to read request body: "+maxBytesErr.Error())
+				return
+			}
+			if strings.Contains(err.Error(), "request body too large") {
+				writeError(w, http.StatusBadRequest, "failed to read request body: http: request body too large")
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, "runner unavailable")
+		},
+	}
+}
+
+// reapSandboxIfRunnerGone deletes the store record when the runner's response
+// says it no longer knows the sandbox.
+//
+// It returns the runner's verdict, not the outcome of the delete: true means
+// "the runner says this sandbox is gone", so a failed delete still returns
+// true. Callers use that to skip trackSandboxActivity, because a gone response is
+// never evidence of a working sandbox — counting it as activity would let a
+// retrying client refresh last_active_at and keep the idle sweeper from ever
+// reclaiming the row left behind.
+func reapSandboxIfRunnerGone(s sandboxStore, sandboxID string, resp *http.Response) bool {
+	if !sandboxproxy.RunnerReportsSandboxGone(resp) {
+		return false
+	}
+	if err := s.Delete(sandboxID); err != nil {
+		slog.Error("remove sandbox after runner not-found", "sandbox_id", sandboxID, "err", err)
+		return true
+	}
+	slog.Info("removed sandbox record after runner not-found", "sandbox_id", sandboxID)
+	return true
+}
+
+// trackSandboxActivity counts a response as sandbox activity until its body is
+// closed. Server errors deliberately do not count. The idle sweeper only stops
+// a sandbox once last_active_at has gone stale, and only deletes one it has
+// already stopped, so a client retrying a broken sandbox must not be able to
+// refresh last_active_at or flip the status back to running — either would
+// keep the sweeper from ever reclaiming it.
+func trackSandboxActivity(activity *ActivityRecorder, rec *store.SandboxRecord, resp *http.Response) {
+	if resp.StatusCode >= http.StatusInternalServerError {
+		return
+	}
+	end := activity.trackResponse(rec)
+	// The upgrade path needs the body unwrapped. No runner route upgrades.
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		end()
+		return
+	}
+	resp.Body = activityBody{ReadCloser: resp.Body, end: end}
+}
+
+// silentRunnerDeleteBudget bounds the delete on a cordoned runner the registry
+// no longer hears from. Such a runner is usually gone, and a live one finishes
+// a delete it has received regardless. Var so tests can shrink it.
+var silentRunnerDeleteBudget = 5 * time.Second
+
+// runnerCordoned reports whether the registry has the runner cordoned.
+func runnerCordoned(reg registry.RunnerRegistry, runnerID string) bool {
+	run, ok := reg.Get(runnerID)
+	return ok && run.Cordoned
+}
+
+// deleteStoppedOnCordonedRunner answers a request for a stopped sandbox on a
+// cordoned runner instead of letting the runner wake it. A cordoned runner is
+// usually about to be reimaged or removed, which takes the sandbox anyway, and a
+// wake would put a running sandbox back on a runner a drain may already have
+// counted empty. So the sandbox is deleted and the request gets 404: the client
+// creates it again, and placement skips cordoned runners.
+//
+// A cordoned runner that can't be reached is taken to be in its reimage or
+// already removed, so only the row is deleted: waiting for the runner would
+// answer 503 until the idle delete. If the runner is still up, it keeps its
+// copy of the sandbox until it restarts.
+//
+// It decides again under the sandbox lock, on a fresh read. Requests queued
+// behind the delete find the row gone and get the same 404. One that finds the
+// sandbox no longer stopped on a cordoned runner gets a 503, and its retry is
+// proxied as usual. A delete that the runner fails keeps the row and answers
+// 503 too, so the retry tries again.
+func deleteStoppedOnCordonedRunner(writer http.ResponseWriter, req *http.Request, s sandboxStore, reg registry.RunnerRegistry, cfg *config.APIConfig, mrec *metrics.APIRecorder, id string) {
+	unlock, err := s.LockSandbox(req.Context(), id)
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer unlock()
+
+	rec, err := s.GetDefaultSandbox(id)
+	if err != nil {
+		writeError(writer, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if rec == nil || !canAccessSandbox(req, rec) {
+		writeError(writer, http.StatusNotFound, "sandbox not found")
+		return
+	}
+	run, known := reg.Get(rec.RunnerID)
+	if rec.Status != "stopped" || !known || !run.Cordoned {
+		writeError(writer, http.StatusServiceUnavailable, "sandbox temporarily unavailable")
+		return
+	}
+
+	slog.InfoContext(req.Context(), "refused wake on cordoned runner", "sandbox_id", id, "runner_id", rec.RunnerID)
+	// The Postgres registry keeps the row, and the cordon, of a runner that is
+	// long gone, so a silent runner gets only a short time to answer.
+	silent := time.Since(run.LastSeen) > cfg.HeartbeatGrace
+	budget := runnerLifecycleBudget
+	if silent {
+		budget = silentRunnerDeleteBudget
+	}
+	// Detached so a client that hangs up cannot cut the delete short.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), budget)
+	defer cancel()
+	reason := "cordoned_runner"
+	err = runnerctl.DeleteSandbox(ctx, resolveControlAddr(rec, reg), cfg.RunnerAPIKey, runnerControlTLS(cfg), id)
+	if runnerUnreachable(&runnerCallError{err: err}) || (silent && err != nil && ctx.Err() != nil) {
+		slog.WarnContext(req.Context(), "cordoned runner unreachable, deleting the sandbox row only", "sandbox_id", id, "runner_id", rec.RunnerID, "silent", silent, "err", err)
+		reason, err = "cordoned_runner_unreachable", nil
+	}
+	if err == nil {
+		err = s.Delete(id)
+	}
+	mrec.ObserveSandboxOp(metrics.OpCordonDelete, err == nil)
+	if err != nil {
+		slog.WarnContext(req.Context(), "delete stopped sandbox on cordoned runner failed", "sandbox_id", id, "runner_id", rec.RunnerID, "err", err)
+		writeError(writer, http.StatusServiceUnavailable, "sandbox temporarily unavailable")
+		return
+	}
+	logSandboxDeleted(id, rec.RunnerID, reason)
+	writeError(writer, http.StatusNotFound, "sandbox not found")
+}

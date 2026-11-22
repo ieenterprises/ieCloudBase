@@ -1,0 +1,381 @@
+package runner
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/n8n-io/sandbox-service/internal/api/grpc/pb"
+	"github.com/n8n-io/sandbox-service/internal/api/runnerctl"
+	"github.com/n8n-io/sandbox-service/internal/metrics"
+	"github.com/n8n-io/sandbox-service/internal/runner/config"
+	"github.com/n8n-io/sandbox-service/internal/runner/cordon"
+	runnerruntime "github.com/n8n-io/sandbox-service/internal/runner/runtime"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+type stopWakeRuntime struct {
+	fakeRuntime
+	stopCalls int
+}
+
+func (s *stopWakeRuntime) StopSandbox(_ context.Context, sandboxID string) error {
+	s.stopCalls++
+	if sandboxID != "11111111-1111-4111-8111-111111111111" {
+		return runnerruntime.ErrSandboxNotFound
+	}
+	return nil
+}
+
+type deleteContextRuntime struct {
+	fakeRuntime
+	deleteCtx context.Context
+}
+
+func (d *deleteContextRuntime) DeleteSandbox(ctx context.Context, _ string) error {
+	d.deleteCtx = ctx
+	return nil
+}
+
+// The API gives a silent runner only seconds before it drops its record of the
+// sandbox, so a delete the runner has received must run to its end on the
+// runtime's own budget, not stop with the caller.
+func TestSandboxControlGRPCDeleteOutlivesTheCaller(t *testing.T) {
+	rt := &deleteContextRuntime{}
+	srv := &SandboxControlGRPC{
+		Runtime: rt,
+		Cfg:     &config.Config{APIKeys: map[string]struct{}{"runner-key": {}}},
+		Rec:     metrics.NewRunnerRecorder(false),
+		Cordon:  cordon.New(),
+	}
+	incoming := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", "runner-key"))
+	ctx, cancel := context.WithTimeout(incoming, time.Hour)
+	cancel()
+
+	if _, err := srv.DeleteSandbox(ctx, &pb.DeleteSandboxRequest{SandboxId: "11111111-1111-4111-8111-111111111111"}); err != nil {
+		t.Fatalf("DeleteSandbox() failed: %v", err)
+	}
+	if _, ok := rt.deleteCtx.Deadline(); ok {
+		t.Error("the runtime got the caller's deadline")
+	}
+	if err := rt.deleteCtx.Err(); err != nil {
+		t.Errorf("the runtime got the caller's cancellation: %v", err)
+	}
+}
+
+type createOptsRuntime struct {
+	fakeRuntime
+	opts *runnerruntime.CreateOptions
+}
+
+func (c *createOptsRuntime) CreateSandbox(_ context.Context, sandboxID string, opts *runnerruntime.CreateOptions) (*runnerruntime.SandboxInfo, error) {
+	c.opts = opts
+	return &runnerruntime.SandboxInfo{ID: sandboxID, IP: "10.0.0.2"}, nil
+}
+
+// create_options_json reaches the runtime as CreateOptions and the response echoes what
+// was applied; an empty field is the default policy and an unknown egress is
+// refused, not defaulted.
+func TestSandboxControlGRPCCreateSandboxParsesOptions(t *testing.T) {
+	const id = "11111111-1111-4111-8111-111111111111"
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", "runner-key"))
+
+	for _, tc := range []struct {
+		name              string
+		createOptionsJSON string
+		want              runnerruntime.Egress
+		wantApplied       string
+		wantErr           bool
+	}{
+		{name: "empty", createOptionsJSON: "", want: runnerruntime.EgressPublic, wantApplied: `{"egress":"public"}`},
+		{name: "empty object", createOptionsJSON: "{}", want: runnerruntime.EgressPublic, wantApplied: `{"egress":"public"}`},
+		{name: "none", createOptionsJSON: `{"egress":"none"}`, want: runnerruntime.EgressNone, wantApplied: `{"egress":"none"}`},
+		{name: "unknown egress", createOptionsJSON: `{"egress":"allow-all"}`, wantErr: true},
+		{name: "malformed", createOptionsJSON: `{"egress":`, wantErr: true},
+		{name: "null", createOptionsJSON: "null", wantErr: true},
+		{name: "not an object", createOptionsJSON: "[]", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &createOptsRuntime{}
+			srv := &SandboxControlGRPC{
+				Runtime: rt,
+				Cfg:     &config.Config{APIKeys: map[string]struct{}{"runner-key": {}}},
+				Rec:     metrics.NewRunnerRecorder(true),
+				Cordon:  cordon.New(),
+			}
+			resp, err := srv.CreateSandbox(ctx, &pb.CreateSandboxRequest{SandboxId: id, CreateOptionsJson: tc.createOptionsJSON})
+			if tc.wantErr {
+				if status.Code(err) != codes.InvalidArgument {
+					t.Fatalf("CreateSandbox() error = %v, want InvalidArgument", err)
+				}
+				if rt.opts != nil {
+					t.Fatal("runtime was called despite invalid options")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("CreateSandbox() failed: %v", err)
+			}
+			if rt.opts == nil || rt.opts.Egress != tc.want {
+				t.Fatalf("runtime options = %+v, want egress %q", rt.opts, tc.want)
+			}
+			if got := resp.GetAppliedCreateOptionsJson(); got != tc.wantApplied {
+				t.Fatalf("applied_create_options_json = %q, want %q", got, tc.wantApplied)
+			}
+		})
+	}
+}
+
+type volumesRuntime struct {
+	fakeRuntime
+	opts    *runnerruntime.CreateOptions
+	leftOut map[int]string
+}
+
+func (v *volumesRuntime) CreateSandbox(_ context.Context, sandboxID string, opts *runnerruntime.CreateOptions) (*runnerruntime.SandboxInfo, error) {
+	v.opts = opts
+	return &runnerruntime.SandboxInfo{ID: sandboxID, IP: "10.0.0.2", VolumesLeftOut: v.leftOut}, nil
+}
+
+// The echo says per volume whether the sandbox has it, and never repeats the
+// read URL, which carries a token.
+func TestSandboxControlGRPCCreateSandboxEchoesVolumes(t *testing.T) {
+	const (
+		id     = "11111111-1111-4111-8111-111111111111"
+		token  = "sig=secret-token"
+		digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	)
+	volumeJSON := func(digest, mountPath string, optional bool) string {
+		return fmt.Sprintf(`{"scope":"shared","sha256":%q,"size":4096,"kind":"ext4","url":"https://objects.example/x?%s","mount_path":%q,"optional":%t}`,
+			digest, token, mountPath, optional)
+	}
+	otherDigest := strings.Repeat("f", 64)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", "runner-key"))
+	rt := &volumesRuntime{leftOut: map[int]string{1: runnerruntime.VolumeLeftOutMount}}
+	srv := &SandboxControlGRPC{
+		Runtime: rt,
+		Cfg:     &config.Config{APIKeys: map[string]struct{}{"runner-key": {}}},
+		Rec:     metrics.NewRunnerRecorder(false),
+		Cordon:  cordon.New(),
+	}
+
+	resp, err := srv.CreateSandbox(ctx, &pb.CreateSandboxRequest{
+		SandboxId:         id,
+		CreateOptionsJson: `{"volumes":[` + volumeJSON(digest, "/mnt/a", false) + `,` + volumeJSON(otherDigest, "/mnt/b", true) + `]}`,
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+	if len(rt.opts.Volumes) != 2 || !strings.Contains(rt.opts.Volumes[0].URL, token) {
+		t.Fatalf("runtime got volumes %v, want both with their URLs", rt.opts.Volumes)
+	}
+	want := `{"egress":"public","volumes":[` +
+		`{"scope":"shared","sha256":"` + digest + `","size":4096,"kind":"ext4","mount_path":"/mnt/a","attached":true},` +
+		`{"scope":"shared","sha256":"` + otherDigest + `","size":4096,"kind":"ext4","mount_path":"/mnt/b","optional":true,"attached":false,"reason":"mount"}]}`
+	if got := resp.GetAppliedCreateOptionsJson(); got != want {
+		t.Fatalf("applied_create_options_json =\n%s\nwant\n%s", got, want)
+	}
+
+	_, err = srv.CreateSandbox(ctx, &pb.CreateSandboxRequest{
+		SandboxId:         id,
+		CreateOptionsJson: `{"volumes":[` + volumeJSON(digest, "/etc", false) + `]}`,
+	})
+	if status.Code(err) != codes.InvalidArgument || strings.Contains(err.Error(), token) {
+		t.Fatalf("CreateSandbox() error = %v, want InvalidArgument without the URL", err)
+	}
+}
+
+type createErrRuntime struct {
+	fakeRuntime
+	err error
+}
+
+func (c *createErrRuntime) CreateSandbox(context.Context, string, *runnerruntime.CreateOptions) (*runnerruntime.SandboxInfo, error) {
+	return nil, c.err
+}
+
+// The API moves a create to another runner only on a capacity refusal, so that
+// must arrive marked as one and any other failure must not.
+func TestSandboxControlGRPCCreateSandboxErrorCodes(t *testing.T) {
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", "runner-key"))
+	for _, tc := range []struct {
+		name    string
+		err     error
+		want    codes.Code
+		refusal bool
+	}{
+		{name: "capacity", err: fmt.Errorf("firecracker %w", runnerruntime.ErrCapacityExhausted), want: codes.ResourceExhausted, refusal: true},
+		{name: "other", err: errors.New("clone sandbox rootfs: no space left on device"), want: codes.Internal},
+		{name: "deadline", err: context.DeadlineExceeded, want: codes.DeadlineExceeded},
+		{name: "volumes unsupported", err: fmt.Errorf("no volume cache: %w", runnerruntime.ErrVolumesUnsupported), want: codes.FailedPrecondition},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := &SandboxControlGRPC{
+				Runtime: &createErrRuntime{err: tc.err},
+				Cfg:     &config.Config{APIKeys: map[string]struct{}{"runner-key": {}}},
+				Rec:     metrics.NewRunnerRecorder(true),
+				Cordon:  cordon.New(),
+			}
+			_, err := srv.CreateSandbox(ctx, &pb.CreateSandboxRequest{SandboxId: "11111111-1111-4111-8111-111111111111"})
+			if got := status.Code(err); got != tc.want {
+				t.Fatalf("CreateSandbox() code = %v (%v), want %v", got, err, tc.want)
+			}
+			if got := runnerctl.IsCapacityRefusal(err); got != tc.refusal {
+				t.Fatalf("IsCapacityRefusal(%v) = %v, want %v", err, got, tc.refusal)
+			}
+		})
+	}
+}
+
+// A cordoned runner refuses creates as a capacity refusal, before the runtime is
+// asked, so the API retries on another runner; uncordoning lets them through.
+func TestSandboxControlGRPCCreateSandboxRefusedWhileCordoned(t *testing.T) {
+	const id = "11111111-1111-4111-8111-111111111111"
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", "runner-key"))
+	rt := &createOptsRuntime{}
+	cd := cordon.New()
+	srv := &SandboxControlGRPC{
+		Runtime: rt,
+		Cfg:     &config.Config{APIKeys: map[string]struct{}{"runner-key": {}}},
+		Rec:     metrics.NewRunnerRecorder(true),
+		Cordon:  cd,
+	}
+
+	cd.Set(true)
+	_, err := srv.CreateSandbox(ctx, &pb.CreateSandboxRequest{SandboxId: id})
+	if !runnerctl.IsCapacityRefusal(err) {
+		t.Fatalf("CreateSandbox() while cordoned = %v, want a capacity refusal", err)
+	}
+	if rt.opts != nil {
+		t.Fatal("runtime was asked to create while cordoned")
+	}
+
+	cd.Set(false)
+	if _, err := srv.CreateSandbox(ctx, &pb.CreateSandboxRequest{SandboxId: id}); err != nil {
+		t.Fatalf("CreateSandbox() after uncordon failed: %v", err)
+	}
+}
+
+func TestSandboxControlGRPCCordon(t *testing.T) {
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", "runner-key"))
+	cd := cordon.New()
+	srv := &SandboxControlGRPC{
+		Runtime: &fakeRuntime{},
+		Cfg:     &config.Config{RunnerID: "runner-a", APIKeys: map[string]struct{}{"runner-key": {}}},
+		Rec:     metrics.NewRunnerRecorder(false),
+		Cordon:  cd,
+	}
+
+	for _, step := range []struct {
+		set  *bool
+		want bool
+	}{
+		{nil, false},
+		{new(true), true},
+		{new(true), true},
+		{nil, true},
+		{new(false), false},
+		{new(false), false},
+		{nil, false},
+	} {
+		var got bool
+		if step.set == nil {
+			resp, err := srv.GetCordon(ctx, &pb.GetCordonRequest{})
+			if err != nil {
+				t.Fatalf("GetCordon() failed: %v", err)
+			}
+			got = resp.GetCordoned()
+		} else {
+			resp, err := srv.SetCordon(ctx, &pb.SetCordonRequest{Cordoned: *step.set})
+			if err != nil {
+				t.Fatalf("SetCordon(%v) failed: %v", *step.set, err)
+			}
+			got = resp.GetCordoned()
+		}
+		if got != step.want || cd.Cordoned() != step.want {
+			t.Fatalf("cordoned: response %v, state %v, want %v", got, cd.Cordoned(), step.want)
+		}
+	}
+}
+
+// A request naming another runner, which used to be at this address, is
+// refused; naming this runner, or no runner, is not.
+func TestSandboxControlGRPCCordonChecksRunnerID(t *testing.T) {
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", "runner-key"))
+	cd := cordon.New()
+	srv := &SandboxControlGRPC{
+		Runtime: &fakeRuntime{},
+		Cfg:     &config.Config{RunnerID: "runner-a", APIKeys: map[string]struct{}{"runner-key": {}}},
+		Rec:     metrics.NewRunnerRecorder(false),
+		Cordon:  cd,
+	}
+
+	if _, err := srv.SetCordon(ctx, &pb.SetCordonRequest{Cordoned: true, RunnerId: "runner-b"}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("SetCordon for runner-b: error = %v, want FailedPrecondition", err)
+	}
+	if cd.Cordoned() {
+		t.Fatal("a request for another runner cordoned this one")
+	}
+	for _, id := range []string{"runner-a", ""} {
+		if _, err := srv.SetCordon(ctx, &pb.SetCordonRequest{Cordoned: true, RunnerId: id}); err != nil || !cd.Cordoned() {
+			t.Fatalf("SetCordon for runner %q: error = %v, cordoned = %v; want cordoned", id, err, cd.Cordoned())
+		}
+		cd.Set(false)
+	}
+}
+
+// Cordoning stops placement on the runner, so it takes the same API key as the
+// lifecycle calls; the listener has already required a client certificate.
+func TestSandboxControlGRPCCordonRequiresAPIKey(t *testing.T) {
+	cd := cordon.New()
+	srv := &SandboxControlGRPC{
+		Runtime: &fakeRuntime{},
+		Cfg:     &config.Config{APIKeys: map[string]struct{}{"runner-key": {}}},
+		Rec:     metrics.NewRunnerRecorder(false),
+		Cordon:  cd,
+	}
+	for name, ctx := range map[string]context.Context{
+		"no metadata": context.Background(),
+		"no key":      metadata.NewIncomingContext(context.Background(), metadata.Pairs()),
+		"wrong key":   metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", "wrong")),
+	} {
+		if _, err := srv.SetCordon(ctx, &pb.SetCordonRequest{Cordoned: true}); status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("SetCordon with %s: error = %v, want Unauthenticated", name, err)
+		}
+		if _, err := srv.GetCordon(ctx, &pb.GetCordonRequest{}); status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("GetCordon with %s: error = %v, want Unauthenticated", name, err)
+		}
+	}
+	if cd.Cordoned() {
+		t.Fatal("an unauthenticated call cordoned the runner")
+	}
+}
+
+func TestSandboxControlGRPCStopSandboxRecordsMetric(t *testing.T) {
+	rec := metrics.NewRunnerRecorder(true)
+	rt := &stopWakeRuntime{}
+	srv := &SandboxControlGRPC{
+		Runtime: rt,
+		Cfg: &config.Config{
+			APIKeys: map[string]struct{}{"runner-key": {}},
+		},
+		Rec: rec,
+	}
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", "runner-key"))
+	_, err := srv.StopSandbox(ctx, &pb.StopSandboxRequest{SandboxId: "11111111-1111-4111-8111-111111111111"})
+	if err != nil {
+		t.Fatalf("StopSandbox() failed: %v", err)
+	}
+	if rt.stopCalls != 1 {
+		t.Fatalf("stopCalls = %d, want 1", rt.stopCalls)
+	}
+	if got := rec.ContainerOpCount(metrics.OpStop, true); got != 1 {
+		t.Fatalf("stop metric = %v, want 1", got)
+	}
+}

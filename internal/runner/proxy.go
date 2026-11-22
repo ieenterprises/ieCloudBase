@@ -1,0 +1,239 @@
+package runner
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/n8n-io/sandbox-service/internal/metrics"
+	"github.com/n8n-io/sandbox-service/internal/runner/config"
+	runnerruntime "github.com/n8n-io/sandbox-service/internal/runner/runtime"
+	"github.com/n8n-io/sandbox-service/internal/sandboxproxy"
+)
+
+// errDaemonRedirect marks a 3xx from the daemon, which the proxies answer with
+// 502 rather than relay; see runnerruntime.RefuseRedirect.
+var errDaemonRedirect = errors.New("daemon returned a redirect")
+
+type proxyContextKey struct{}
+
+type proxyTarget struct {
+	url  *url.URL
+	path string
+}
+
+// ProxyHandler returns a handler that reverse-proxies requests to the sandbox daemon.
+func ProxyHandler(rt runnerruntime.Runtime, cfg *config.Config, rec *metrics.RunnerRecorder) http.HandlerFunc {
+	return proxyHandler(rt, cfg, rec, false, true)
+}
+
+// UploadProxyHandler is like ProxyHandler but enforces cfg.MaxFileBytes on the request body.
+func UploadProxyHandler(rt runnerruntime.Runtime, cfg *config.Config, rec *metrics.RunnerRecorder) http.HandlerFunc {
+	return proxyHandler(rt, cfg, rec, true, true)
+}
+
+// deleteExecutionTimeout bounds an execution DELETE. The daemon answers one at
+// once when it is healthy; without a bound, a guest that starves its daemon
+// would let each DELETE hold its request slot for as long as the client waits.
+var deleteExecutionTimeout = 10 * time.Second
+
+// DeleteExecutionHandler serves DELETE /sandboxes/{id}/executions/{exec_id}, the
+// one sandbox route that answers without waking: a stopped or crashed sandbox has
+// already lost the execution, so the delete gets 204 (writeExecutionGone) and does
+// not spend the one-shot 409 restart report. Rationale in docs/API.md under DELETE /sandboxes/{id}/executions/{exec_id}.
+func DeleteExecutionHandler(rt runnerruntime.Runtime, cfg *config.Config, rec *metrics.RunnerRecorder) http.HandlerFunc {
+	proxy := proxyHandler(rt, cfg, rec, false, false)
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), deleteExecutionTimeout)
+		defer cancel()
+		proxy(w, r.WithContext(ctx))
+	}
+}
+
+// wake says whether a sandbox that is not running is started for the request. Only
+// DeleteExecutionHandler passes false; see there for why.
+func proxyHandler(rt runnerruntime.Runtime, cfg *config.Config, rec *metrics.RunnerRecorder, limitBody bool, wake bool) http.HandlerFunc {
+	proxy := &httputil.ReverseProxy{
+		Transport: runnerruntime.NoProxyTransport,
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			// The daemon runs in the guest and reads no request headers, so of the
+			// incoming ones it gets Content-Type alone: never the fleet X-Api-Key
+			// the API sends, nor anything else a caller set.
+			pr.Out.Header = http.Header{}
+			pr.Out.Trailer = nil
+			if ct := pr.In.Header.Get("Content-Type"); ct != "" {
+				pr.Out.Header.Set("Content-Type", ct)
+			}
+
+			// Comma-ok assertion: the context key is missing when
+			// httputil.ReverseProxy replays Rewrite on a internally-constructed
+			// request (e.g. 100-continue handshake, connection-level retry after
+			// an idle-connection reset). Bail out so the request fails at the
+			// transport layer and is handled by ErrorHandler instead of panicking.
+			pt, ok := pr.In.Context().Value(proxyContextKey{}).(*proxyTarget)
+			if !ok || pt == nil {
+				return
+			}
+			pr.SetURL(pt.url)
+			pr.Out.URL.Path = pt.path
+			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			if daemonRedirected(resp.Request, resp, "proxy") {
+				return errDaemonRedirect
+			}
+			sandboxproxy.StripSignals(resp.Header)
+			return nil
+		},
+		FlushInterval: -1,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if errors.Is(err, errDaemonRedirect) {
+				writeError(w, http.StatusBadGateway, err.Error())
+				return
+			}
+			if maxBytesErr, ok := errors.AsType[*http.MaxBytesError](err); ok {
+				writeError(w, http.StatusBadRequest, "failed to read request body: "+maxBytesErr.Error())
+				return
+			}
+			if strings.Contains(err.Error(), "request body too large") {
+				writeError(w, http.StatusBadRequest, "failed to read request body: http: request body too large")
+				return
+			}
+			logDaemonUnreachable(r, "proxy", err)
+			writeError(w, http.StatusServiceUnavailable, "daemon temporarily unavailable")
+		},
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		daemonBaseURL, ok := resolveDaemonURL(w, r, rt, rec, wake)
+		if !ok {
+			return
+		}
+
+		target, err := url.Parse(daemonBaseURL)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("invalid daemon url: %v", err))
+			return
+		}
+
+		if limitBody {
+			r.Body = http.MaxBytesReader(w, r.Body, cfg.MaxFileBytes)
+		}
+
+		// Strip /sandboxes/{id} prefix to get the daemon path.
+		id := r.PathValue("id")
+		prefix := "/sandboxes/" + id
+		daemonPath := strings.TrimPrefix(r.URL.Path, prefix)
+		if daemonPath == "" {
+			daemonPath = "/"
+		}
+
+		ctx := context.WithValue(r.Context(), proxyContextKey{}, &proxyTarget{
+			url:  target,
+			path: daemonPath,
+		})
+		proxy.ServeHTTP(w, r.WithContext(ctx))
+	}
+}
+
+// logDaemonUnreachable records why a request the runtime considered proxyable
+// still failed to reach the guest daemon, since the 503 it turns into carries no
+// detail. It logs under the request's context so the line joins the runner's
+// request event on trace id, and with the sandbox id, which the runtime's own
+// diagnostics key on. A client that has already gone is not a daemon that could
+// not be reached, so that case is left out rather than counted as an incident.
+func logDaemonUnreachable(r *http.Request, component string, err error) {
+	if r.Context().Err() != nil {
+		return
+	}
+	slog.WarnContext(r.Context(), component+": daemon request failed", "sandbox_id", r.PathValue("id"), "err", err)
+}
+
+// daemonRedirected reports whether the daemon answered r with a 3xx, and logs
+// it when it did. The daemon chooses the Location, so only a prefix is logged.
+func daemonRedirected(r *http.Request, resp *http.Response, component string) bool {
+	if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+		return false
+	}
+	loc := resp.Header.Get("Location")
+	if len(loc) > 200 {
+		loc = loc[:200]
+	}
+	slog.WarnContext(r.Context(), component+": daemon returned a redirect", "sandbox_id", r.PathValue("id"), "status", resp.StatusCode, "location", loc)
+	return true
+}
+
+// resolveDaemonURL validates the sandbox ID, looks up the daemon URL, and
+// wakes the sandbox if necessary. On error it writes an HTTP response and
+// returns ("", false).
+//
+// wake=false is for a route that must not start a stopped sandbox. It answers the
+// request here rather than leaving the caller to check first and proxy after: the
+// lookup below is a docker ps and inspect, so a caller that decided on its own
+// lookup and then reached a handler that repeats it leaves a window a crash fits
+// inside — one wide enough to have failed in CI. One lookup, one decision.
+func resolveDaemonURL(w http.ResponseWriter, r *http.Request, rt runnerruntime.Runtime, rec *metrics.RunnerRecorder, wake bool) (string, bool) {
+	id := r.PathValue("id")
+	if !isValidID(id) {
+		writeError(w, http.StatusBadRequest, "invalid sandbox id")
+		return "", false
+	}
+
+	daemonBaseURL, err := rt.DaemonURL(r.Context(), id)
+	if err != nil && errors.Is(err, runnerruntime.ErrSandboxNotRunning) {
+		if !wake {
+			writeExecutionGone(w)
+			return "", false
+		}
+		wakeStart := time.Now()
+		wake, wakeErr := rt.EnsureSandboxRunning(r.Context(), id)
+		if rec != nil {
+			// Under the operation the wake actually was, so a cold boot's latency does
+			// not land in the wake percentiles and the totals agree with the per-step
+			// timings the runtime records under the same label.
+			op := metrics.OpEnsureRunning
+			if wake.Recovered {
+				op = metrics.OpRecover
+			}
+			rec.ObserveContainerOp(op, wakeErr == nil, time.Since(wakeStart))
+		}
+		if wakeErr != nil {
+			if errors.Is(wakeErr, runnerruntime.ErrSandboxNotFound) {
+				writeSandboxNotFound(w)
+			} else {
+				writeError(w, http.StatusServiceUnavailable, "sandbox start: "+wakeErr.Error())
+			}
+			return "", false
+		}
+		// Recover first, then refuse. The sandbox is up by the time this runs, so the
+		// client's retry succeeds deterministically; proxying instead would hand back a
+		// healthy-looking sandbox whose processes are gone and leave the client to
+		// discover that as a bug in its own code. Every request coalesced into this one
+		// recovery lands here, so a burst after a crash tells all of them, once.
+		if wake.Recovered {
+			writeSandboxRestarted(w)
+			return "", false
+		}
+		daemonBaseURL, err = rt.DaemonURL(r.Context(), id)
+	}
+	if err != nil {
+		if errors.Is(err, runnerruntime.ErrSandboxNotFound) {
+			writeSandboxNotFound(w)
+		} else if errors.Is(err, runnerruntime.ErrSandboxNotRunning) {
+			writeError(w, http.StatusBadGateway, runnerruntime.ErrSandboxNotRunning.Error())
+		} else if errors.Is(err, runnerruntime.ErrSandboxNetworkUnavailable) {
+			writeError(w, http.StatusServiceUnavailable, "sandbox temporarily unavailable")
+		} else {
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return "", false
+	}
+
+	return daemonBaseURL, true
+}

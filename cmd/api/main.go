@@ -1,0 +1,294 @@
+// Command api runs the sandbox service API gateway: the tenant-facing REST API,
+// the runner registration gRPC server and the idle sweeper.
+package main
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/n8n-io/sandbox-service/internal/api"
+	"github.com/n8n-io/sandbox-service/internal/api/config"
+	grpcapi "github.com/n8n-io/sandbox-service/internal/api/grpc"
+	"github.com/n8n-io/sandbox-service/internal/api/grpc/pb"
+	"github.com/n8n-io/sandbox-service/internal/api/registry"
+	"github.com/n8n-io/sandbox-service/internal/api/store"
+	"github.com/n8n-io/sandbox-service/internal/api/volumestore"
+	"github.com/n8n-io/sandbox-service/internal/grpctls"
+	"github.com/n8n-io/sandbox-service/internal/metrics"
+	"github.com/n8n-io/sandbox-service/internal/obs"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+)
+
+func main() {
+	var logLevel slog.LevelVar
+	logLevel.Set(slog.LevelInfo)
+	logger := slog.New(obs.TraceHandler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: &logLevel})))
+	slog.SetDefault(logger)
+
+	cfg, err := config.LoadAPI()
+	if err != nil {
+		slog.Error("failed to load api config", "error", err)
+		os.Exit(1)
+	}
+	logLevel.Set(cfg.LogLevel)
+
+	var (
+		sandboxStore store.SandboxStore
+		runnerReg    registry.RunnerRegistry
+		sweepLockDB  *sql.DB
+	)
+
+	switch cfg.Store {
+	case config.StorePostgres:
+		pgStore, err := store.NewPostgres(cfg.Postgres)
+		if err != nil {
+			slog.Error("open postgres store", "error", err)
+			os.Exit(1)
+		}
+		sandboxStore = pgStore
+		runnerReg = registry.NewPostgres(pgStore.DB(), cfg.HeartbeatGrace)
+		sweepLockDB = pgStore.DB()
+		slog.Info("using postgres store", "host", cfg.Postgres.Host, "db", cfg.Postgres.Database)
+	default:
+		if info, err := os.Stat(cfg.DataDir); err != nil {
+			slog.Error("data dir not accessible", "path", cfg.DataDir, "error", err)
+			os.Exit(1)
+		} else if !info.IsDir() {
+			slog.Error("data dir is not a directory", "path", cfg.DataDir)
+			os.Exit(1)
+		}
+
+		dbPath := filepath.Join(cfg.DataDir, "api.db")
+		sqliteStore, err := store.NewSQLite(dbPath, cfg.SQLiteWAL)
+		if err != nil {
+			slog.Error("open sqlite store", "error", err)
+			os.Exit(1)
+		}
+		sandboxStore = sqliteStore
+		runnerReg = registry.NewMemory(cfg.HeartbeatGrace)
+		slog.Info("using sqlite store", "path", dbPath, "wal", cfg.SQLiteWAL)
+	}
+	defer sandboxStore.Close()
+
+	volumes, err := newVolumeStore(cfg)
+	if err != nil {
+		slog.Error("open volume store", "error", err)
+		os.Exit(1)
+	}
+	if closer, ok := volumes.(io.Closer); ok {
+		defer closer.Close()
+	}
+
+	mrec := metrics.NewAPIRecorder(cfg.MetricsEnabled)
+	if mrec.Enabled() {
+		mrec.SetActiveSandboxes(func() float64 {
+			n, err := sandboxStore.Count(store.KindFilter(store.AllKinds()...))
+			if err != nil {
+				slog.Warn("metrics: count sandboxes", "error", err)
+				return 0
+			}
+			return float64(n)
+		})
+		mrec.SetRunnersRegistered(func() float64 { return float64(runnerReg.Len()) })
+		mrec.SetTLSCertificateExpiry(grpctls.CertificateExpiryByCertPath)
+		slog.Info("metrics endpoint enabled",
+			"path", "/metrics",
+			"addr", cfg.ResolvedMetricsListenAddr(),
+			"dedicated_listener", !cfg.MetricsOnMainListener())
+	} else if cfg.MetricsListenAddr != "" {
+		slog.Warn("metrics listen addr set but SANDBOX_API_METRICS_ENABLED is false; no metrics listener will start",
+			"addr", cfg.MetricsListenAddr)
+	}
+
+	api.LogIdleSweepConfig(cfg)
+
+	sweepCtx, sweepCancel := context.WithCancel(context.Background())
+	defer sweepCancel()
+	api.StartIdleSweeper(sweepCtx, sandboxStore, runnerReg, cfg, sweepLockDB)
+
+	// Stopped after the HTTP server has drained, so open streams count until
+	// then; on stop it writes the activity it has collected once more.
+	activity := api.NewActivityRecorder(sandboxStore, cfg)
+	activityCtx, activityCancel := context.WithCancel(context.Background())
+	defer activityCancel()
+	activityDone := make(chan struct{})
+	go func() {
+		defer close(activityDone)
+		activity.Run(activityCtx)
+	}()
+
+	handler, err := api.NewGatewayRouter(sandboxStore, cfg, runnerReg, mrec, activity)
+	if err != nil {
+		slog.Error("failed to create api router", "error", err)
+		os.Exit(1)
+	}
+
+	srv := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           handler,
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      0,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	metricsSrv, metricsLis, err := newMetricsServer(cfg, mrec)
+	if err != nil {
+		slog.Error("metrics listen", "addr", cfg.MetricsListenAddr, "error", err)
+		os.Exit(1)
+	}
+
+	volumeObjectsSrv, volumeObjectsLis, err := newVolumeObjectsServer(cfg, volumes, api.VolumeObjectStallTimeout, mrec)
+	if err != nil {
+		slog.Error("volume objects listener", "addr", cfg.VolumeLocalListenAddr, "error", err)
+		os.Exit(1)
+	}
+
+	grpcLis, err := net.Listen("tcp", cfg.GRPCListenAddr)
+	if err != nil {
+		slog.Error("grpc listen", "addr", cfg.GRPCListenAddr, "error", err)
+		os.Exit(1)
+	}
+	creds, err := grpctls.NewServerTransportCredentials(
+		cfg.GRPCServerCertFile,
+		cfg.GRPCServerKeyFile,
+		cfg.GRPCClientCAFile,
+	)
+	if err != nil {
+		slog.Error("grpc tls credentials", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("runner registry grpc mTLS enabled")
+	// Runners ping a silent stream every 20 s. The default policy closes a
+	// connection that pings more often than every 5 minutes.
+	const runnerKeepaliveMinTime = 10 * time.Second
+	grpcSrv := grpc.NewServer(
+		grpc.Creds(creds),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: runnerKeepaliveMinTime}),
+	)
+	pb.RegisterRunnerRegistryServer(grpcSrv, &grpcapi.RunnerRegistryServer{
+		Token: cfg.RegistrationToken,
+		Reg:   runnerReg,
+	})
+
+	// One slot per listener, so a second failure never blocks its goroutine.
+	serverErr := make(chan error, 4)
+	go func() {
+		slog.Info("api listening",
+			"addr", cfg.ListenAddr,
+			"grpc_addr", cfg.GRPCListenAddr,
+			"store", cfg.Store,
+			"max_inflight_per_tenant", cfg.MaxInflightPerTenant)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+	}()
+
+	go func() {
+		slog.Info("runner registry grpc listening", "addr", cfg.GRPCListenAddr)
+		if err := grpcSrv.Serve(grpcLis); err != nil {
+			slog.Error("grpc server error", "error", err)
+			serverErr <- err
+		}
+	}()
+
+	if metricsSrv != nil {
+		go func() {
+			slog.Info("metrics listening", "addr", cfg.MetricsListenAddr, "path", "/metrics")
+			if err := metricsSrv.Serve(metricsLis); err != nil && err != http.ErrServerClosed {
+				serverErr <- err
+			}
+		}()
+	}
+
+	if volumeObjectsSrv != nil {
+		go func() {
+			slog.Info("volume objects listening", "addr", cfg.VolumeLocalListenAddr, "tls", true)
+			// Certificate and key come from volumeObjectsSrv.TLSConfig.
+			if err := volumeObjectsSrv.ServeTLS(volumeObjectsLis, "", ""); err != nil && err != http.ErrServerClosed {
+				serverErr <- err
+			}
+		}()
+	}
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+
+	select {
+	case sig := <-quit:
+		slog.Info("received signal, shutting down api", "signal", sig)
+		sweepCancel()
+	case err := <-serverErr:
+		sweepCancel()
+		slog.Error("server error", "error", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	grpcSrv.Stop()
+	if err := srv.Shutdown(ctx); err != nil {
+		slog.Error("graceful shutdown failed", "error", err)
+	}
+	activityCancel()
+	// Within the same deadline: a write cut off here is lost with the pod.
+	select {
+	case <-activityDone:
+	case <-ctx.Done():
+	}
+	// After the API server has drained, so read URLs it handed out while
+	// draining still work, and after the activity write, which a long download
+	// would otherwise cut off. A download still running when the shared
+	// deadline passes is expected, so that is not logged as an error.
+	if volumeObjectsSrv != nil {
+		if err := volumeObjectsSrv.Shutdown(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			slog.Error("volume objects graceful shutdown failed", "error", err)
+		}
+	}
+	// Metrics last, so a scrape in flight during a normal drain still completes.
+	// The deadline above is deliberately shared: once it is spent the kubelet is
+	// at terminationGracePeriodSeconds and about to SIGKILL us, so that case is
+	// expected rather than an error worth logging.
+	if metricsSrv != nil {
+		if err := metricsSrv.Shutdown(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			slog.Error("metrics graceful shutdown failed", "error", err)
+		}
+	}
+
+	slog.Info("api stopped")
+}
+
+// newVolumeStore contacts nothing, so startup never waits on the store helper.
+func newVolumeStore(cfg *config.APIConfig) (volumestore.Store, error) {
+	switch cfg.VolumeStore {
+	case config.VolumeStoreLocal:
+		vs, err := volumestore.NewLocal(cfg.DataDir, cfg.VolumeLocalURL)
+		if err != nil {
+			return nil, err
+		}
+		slog.Info("using local volume store",
+			"dir", filepath.Join(cfg.DataDir, "volumes"),
+			"url", cfg.VolumeLocalURL,
+			"listen_addr", cfg.VolumeLocalListenAddr)
+		return vs, nil
+	case config.VolumeStoreRemote:
+		vs, err := volumestore.NewRemote(cfg.VolumeRemoteSocket)
+		if err != nil {
+			return nil, err
+		}
+		slog.Info("using remote volume store", "socket", cfg.VolumeRemoteSocket)
+		return vs, nil
+	}
+	return nil, nil
+}

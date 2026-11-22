@@ -1,0 +1,973 @@
+package firecracker
+
+import (
+	"context"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/n8n-io/sandbox-service/internal/daemon/volumedrives"
+	"github.com/n8n-io/sandbox-service/internal/runner/config"
+	runnerruntime "github.com/n8n-io/sandbox-service/internal/runner/runtime"
+)
+
+type fakeProcess struct {
+	killed bool
+}
+
+func (p *fakeProcess) Kill() error {
+	p.killed = true
+	return nil
+}
+
+type fakeProxy struct {
+	stopped bool
+}
+
+func (p *fakeProxy) Stop() error {
+	p.stopped = true
+	return nil
+}
+
+type recordedCommand struct {
+	name string
+	args []string
+}
+
+func testRunnerConfig(capacity int32) *config.Config {
+	return &config.Config{
+		CapacityTotal: capacity,
+		DataDir:       "/var/sandboxes",
+	}
+}
+
+func stubCreateDeps(rt *Runtime) {
+	rt.deps.run = func(context.Context, string, ...string) error { return nil }
+	rt.deps.start = func(context.Context, func(error), string, ...string) (process, error) {
+		return &fakeProcess{}, nil
+	}
+	rt.deps.pathExists = func(string) bool { return true }
+	rt.deps.cloneRootfs = func(context.Context, string, string) error { return nil }
+	rt.deps.cloneGoldenSnapshot = func(_ context.Context, _, _, dataDir string) error {
+		if err := os.MkdirAll(dataDir, 0o755); err != nil {
+			return err
+		}
+		for _, name := range []string{"snapshot_mem", "snapshot_state"} {
+			if err := os.WriteFile(filepath.Join(dataDir, name), []byte{0}, 0o644); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	rt.deps.pauseVM = func(context.Context, string) error { return nil }
+	rt.deps.resumeVM = func(context.Context, string) error { return nil }
+	rt.deps.createSnapshot = func(context.Context, string) error { return nil }
+	rt.deps.loadSnapshot = func(context.Context, string, Config) error { return nil }
+	rt.deps.coldBoot = func(context.Context, string, *bootParams) error { return nil }
+	rt.deps.newProxy = func(context.Context, string, string, string, string) (daemonProxy, error) { return &fakeProxy{}, nil }
+	rt.deps.probeDaemon = func(context.Context, string) error { return nil }
+}
+
+func testConfig() Config {
+	return Config{
+		JailerBin:          "/opt/firecracker/bin/jailer",
+		FirecrackerBin:     "/opt/firecracker/bin/firecracker",
+		JailerBaseDir:      "/srv/jailer",
+		TemplateDir:        "/srv/firecracker/template",
+		SnapshotMemPath:    "/srv/firecracker/snapshots/mem",
+		SnapshotStatePath:  "/srv/firecracker/snapshots/state",
+		GuestIP:            "172.16.0.10",
+		HostTapDeviceName:  "fc-tap-0",
+		HostTapIPCIDR:      "172.16.0.1/24",
+		DaemonPort:         8081,
+		ProxyListenIP:      "127.0.0.1",
+		ProxyPortStart:     18081,
+		SocketWaitAttempts: 1,
+		SocketWaitInterval: time.Nanosecond,
+		DaemonWaitTimeout:  time.Second,
+	}
+}
+
+func testRuntime(capacity int32) *Runtime {
+	return newTestRuntime(capacity)
+}
+
+func testRuntimeT(t *testing.T, capacity int32) *Runtime {
+	t.Helper()
+	rt := newTestRuntime(capacity)
+	rt.runnerConfig.DataDir = t.TempDir()
+	return rt
+}
+
+// newTestRuntime constructs a runtime without startup reconcile (unit tests only).
+// ReadyCh stays open and admissionOK is false until markAdmissionOK is called.
+func newTestRuntime(capacity int32) *Runtime {
+	rt := &Runtime{
+		runnerConfig: testRunnerConfig(capacity),
+		config:       testConfig(),
+		deps:         defaultDependencies(testConfig()),
+		slots:        make([]slotState, capacity),
+		sandboxes:    make(map[string]*sandboxState),
+		readyCh:      make(chan struct{}),
+		wireCh:       make(chan struct{}, 1),
+	}
+	// Part of the runtime's environment rather than a per-test stub: every sandbox
+	// is reserved against the sidecar of the snapshot it is created from, so without
+	// this no create reaches the behaviour under test.
+	rt.deps.loadBootParams = func(string) (*bootParams, error) {
+		params := testBootParams(rt.config)
+		return &params, nil
+	}
+	// Environment for the same reason: every sandbox is also reserved against the
+	// template kernel it would cold boot from, and no test has one on disk.
+	rt.deps.statTemplateKernel = func(string) (kernelPin, error) { return testKernelPin, nil }
+	rt.deps.checkTemplateKernel = func(string) error { return nil }
+	// And a data volume with room to spare, rather than whatever disk the tests
+	// happen to run on.
+	rt.deps.volumeSpace = func(string) (volumeSpace, error) { return testVolumeSpace, nil }
+	// And no guest behind the daemon URL to send the volume mount request to.
+	rt.deps.mountVolumeDrives = func(context.Context, string, []volumedrives.Volume) (map[int]string, error) { return nil, nil }
+	// And no Firecracker to patch drives on.
+	rt.deps.patchVolumeDrive = func(context.Context, string, volumeDrive) error { return nil }
+	return rt
+}
+
+var testVolumeSpace = volumeSpace{free: 400 << 30, total: 440 << 30}
+
+// testKernelPin is what the template kernel stats as under test, so a test that
+// rebuilds the template only has to return something other than this.
+var testKernelPin = kernelPin{size: 42 << 20, modTime: time.Unix(1700000000, 0)}
+
+func TestRuntimeReadyChecksFirecrackerAssets(t *testing.T) {
+	rt := testRuntime(1)
+	rt.markAdmissionOK()
+	rt.deps.pathExists = func(path string) bool {
+		return path != "/srv/firecracker/snapshots/state"
+	}
+
+	if err := rt.Ready(context.Background()); err == nil || !strings.Contains(err.Error(), "snapshot state") {
+		t.Fatalf("Ready() error = %v, want missing snapshot state", err)
+	}
+}
+
+func TestRuntimeReadyRequiresVmlinux(t *testing.T) {
+	rt := testRuntime(1)
+	rt.markAdmissionOK()
+	rt.deps.pathExists = func(path string) bool {
+		return path != "/srv/firecracker/template/vmlinux"
+	}
+	if err := rt.Ready(context.Background()); err == nil || !strings.Contains(err.Error(), "vmlinux") {
+		t.Fatalf("Ready() error = %v, want missing vmlinux", err)
+	}
+}
+
+func TestRuntimeReadyRequiresAdmission(t *testing.T) {
+	rt := testRuntime(1)
+	rt.deps.pathExists = func(string) bool { return true }
+	if err := rt.Ready(context.Background()); err == nil || !strings.Contains(err.Error(), "admission canary") {
+		t.Fatalf("Ready() error = %v, want admission canary failure", err)
+	}
+}
+
+func TestRuntimeCreateSandboxStartsFirecrackerAndProxy(t *testing.T) {
+	rt := testRuntime(2)
+	proc := &fakeProcess{}
+	proxy := &fakeProxy{}
+	var commands []recordedCommand
+	var started []recordedCommand
+	var loadedSocket string
+	var proxyListenAddr string
+	var proxyNetNS string
+	var proxyGuestAddr string
+	var clonedTemplate string
+	var clonedDest string
+	rt.deps.run = func(_ context.Context, name string, args ...string) error {
+		commands = append(commands, recordedCommand{name: name, args: args})
+		return nil
+	}
+	rt.deps.start = func(_ context.Context, _ func(error), name string, args ...string) (process, error) {
+		started = append(started, recordedCommand{name: name, args: args})
+		return proc, nil
+	}
+	rt.deps.pathExists = func(string) bool { return true }
+	rt.deps.cloneRootfs = func(_ context.Context, templatePath, destPath string) error {
+		clonedTemplate = templatePath
+		clonedDest = destPath
+		return nil
+	}
+	rt.deps.cloneGoldenSnapshot = func(context.Context, string, string, string) error { return nil }
+	rt.deps.loadSnapshot = func(_ context.Context, socketPath string, _ Config) error {
+		loadedSocket = socketPath
+		return nil
+	}
+	rt.deps.newProxy = func(_ context.Context, _ string, listenAddr string, netnsName string, guestAddr string) (daemonProxy, error) {
+		proxyListenAddr = listenAddr
+		proxyNetNS = netnsName
+		proxyGuestAddr = guestAddr
+		return proxy, nil
+	}
+	rt.deps.probeDaemon = func(_ context.Context, baseURL string) error {
+		if baseURL != "http://127.0.0.1:18081" {
+			t.Fatalf("probeDaemon baseURL = %s", baseURL)
+		}
+		return nil
+	}
+
+	info, err := rt.CreateSandbox(context.Background(), "sandbox-id-123456", nil)
+	if err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+	if info.ID != "sandbox-id-123456" || info.IP != "172.16.0.10" {
+		t.Fatalf("CreateSandbox() info = %+v", info)
+	}
+	if clonedTemplate != "/srv/firecracker/template/rootfs.ext4" {
+		t.Fatalf("cloned template = %s", clonedTemplate)
+	}
+	if clonedDest != "/var/sandboxes/sandbox-id-123456/rootfs.ext4" {
+		t.Fatalf("cloned dest = %s", clonedDest)
+	}
+	if len(commands) != 3 {
+		t.Fatalf("run commands = %d, want prepare jail, host NAT, and network setup", len(commands))
+	}
+	prepareScript := commands[0].args[len(commands[0].args)-1]
+	networkScript := commands[2].args[len(commands[2].args)-1]
+	if !strings.Contains(prepareScript, "/var/sandboxes/sandbox-id-123456/rootfs.ext4") {
+		t.Fatalf("prepare jail script = %q, want per-sandbox rootfs bind mount", prepareScript)
+	}
+	if !strings.Contains(prepareScript, "/var/sandboxes/sandbox-id-123456/snapshot_mem") {
+		t.Fatalf("prepare jail script = %q, want per-sandbox snapshot mem bind mount", prepareScript)
+	}
+	if !strings.Contains(prepareScript, "chown 1000:1000") || !strings.Contains(prepareScript, "snapshot_mem") {
+		t.Fatalf("prepare jail script = %q, want snapshot files chowned for jailer uid", prepareScript)
+	}
+	if !strings.Contains(networkScript, "fc-veth-0") || !strings.Contains(networkScript, "fc-uplink") {
+		t.Fatalf("network script = %q, want veth uplink setup", networkScript)
+	}
+	if !strings.Contains(networkScript, "172.16.0.0/12") {
+		t.Fatalf("network script = %q, want private CIDR egress drop", networkScript)
+	}
+	if strings.Contains(prepareScript, "/srv/firecracker/snapshots/mem") {
+		t.Fatalf("prepare jail script still references shared golden snapshot mem")
+	}
+	if len(started) != 1 {
+		t.Fatalf("start commands = %d, want jailer start", len(started))
+	}
+	if !containsArg(started[0].args, "--netns") || !containsArg(started[0].args, "/run/netns/fc-sb-0") {
+		t.Fatalf("jailer args = %v, want per-slot netns", started[0].args)
+	}
+	if loadedSocket != "/srv/jailer/firecracker/"+info.Name+"/root/firecracker.socket" {
+		t.Fatalf("loaded socket = %s", loadedSocket)
+	}
+	if proxyListenAddr != "127.0.0.1:18081" || proxyNetNS != "fc-sb-0" || proxyGuestAddr != "172.16.0.10:8081" {
+		t.Fatalf("proxy = listen %s netns %s guest %s", proxyListenAddr, proxyNetNS, proxyGuestAddr)
+	}
+
+	url, err := rt.DaemonURL(context.Background(), "sandbox-id-123456")
+	if err != nil {
+		t.Fatalf("DaemonURL() failed: %v", err)
+	}
+	if url != "http://127.0.0.1:18081" {
+		t.Fatalf("DaemonURL() = %s", url)
+	}
+
+	capacity, err := rt.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("Capacity() failed: %v", err)
+	}
+	if capacity.Used != 1 || capacity.Total != 2 {
+		t.Fatalf("Capacity() = %+v, want used=1 total=2", capacity)
+	}
+
+	if err := rt.DeleteSandbox(context.Background(), "sandbox-id-123456"); err != nil {
+		t.Fatalf("DeleteSandbox() failed: %v", err)
+	}
+	if !proc.killed {
+		t.Fatal("expected process to be killed")
+	}
+	if !proxy.stopped {
+		t.Fatal("expected proxy to be stopped")
+	}
+}
+
+func TestRuntimeCreateSandboxEnforcesCapacity(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	if _, err := rt.CreateSandbox(context.Background(), "sandbox-id-123456", nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+	if _, err := rt.CreateSandbox(context.Background(), "sandbox-id-abcdef", nil); !errors.Is(err, runnerruntime.ErrCapacityExhausted) {
+		t.Fatalf("CreateSandbox() error = %v, want ErrCapacityExhausted", err)
+	}
+
+	// The API retries a refused create on another runner, so the refusal must
+	// leave nothing here.
+	rt.mu.Lock()
+	_, tracked := rt.sandboxes["sandbox-id-abcdef"]
+	occupied := rt.occupiedSlotsLocked()
+	rt.mu.Unlock()
+	if tracked || occupied != 1 {
+		t.Fatalf("after the refusal: refused sandbox tracked = %v, occupied slots = %d; want false and 1", tracked, occupied)
+	}
+	if _, err := os.Stat(sandboxDataDir(rt.runnerConfig.DataDir, "sandbox-id-abcdef")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused sandbox data dir: stat error = %v, want it absent", err)
+	}
+}
+
+func TestRuntimeDeleteHoldsSlotUntilCleanupCompletes(t *testing.T) {
+	rt := testRuntime(1)
+	proc := &fakeProcess{}
+	proxy := &fakeProxy{}
+	cleanupStarted := make(chan struct{})
+	allowCleanup := make(chan struct{})
+	var runCount int
+	rt.deps.run = func(context.Context, string, ...string) error {
+		runCount++
+		if runCount == 4 {
+			close(cleanupStarted)
+			<-allowCleanup
+		}
+		return nil
+	}
+	rt.deps.start = func(context.Context, func(error), string, ...string) (process, error) { return proc, nil }
+	rt.deps.pathExists = func(string) bool { return true }
+	rt.deps.cloneRootfs = func(context.Context, string, string) error { return nil }
+	rt.deps.cloneGoldenSnapshot = func(context.Context, string, string, string) error { return nil }
+	rt.deps.loadSnapshot = func(context.Context, string, Config) error { return nil }
+	rt.deps.newProxy = func(context.Context, string, string, string, string) (daemonProxy, error) { return proxy, nil }
+	rt.deps.probeDaemon = func(context.Context, string) error { return nil }
+
+	if _, err := rt.CreateSandbox(context.Background(), "sandbox-id-123456", nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- rt.DeleteSandbox(context.Background(), "sandbox-id-123456")
+	}()
+
+	<-cleanupStarted
+
+	rt.mu.Lock()
+	occupied := rt.occupiedSlotsLocked()
+	slotOwner := rt.slots[0].sandboxID
+	rt.mu.Unlock()
+	if occupied != 1 {
+		t.Fatalf("occupied slots = %d, want 1 while cleanup still owns the slot", occupied)
+	}
+	if slotOwner != "sandbox-id-123456" {
+		t.Fatalf("slot owner = %q, want deleting sandbox to keep slot until cleanup", slotOwner)
+	}
+	if _, err := rt.CreateSandbox(context.Background(), "sandbox-id-abcdef", nil); err == nil {
+		t.Fatal("expected capacity exhausted while cleanup still owns the slot")
+	}
+
+	close(allowCleanup)
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("DeleteSandbox() failed: %v", err)
+	}
+	if _, err := rt.CreateSandbox(context.Background(), "sandbox-id-abcdef", nil); err != nil {
+		t.Fatalf("CreateSandbox() after cleanup failed: %v", err)
+	}
+}
+
+func TestRuntimeDeleteSandboxWaitsForCreate(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	proc := &fakeProcess{}
+	proxy := &fakeProxy{}
+	rt.deps.start = func(context.Context, func(error), string, ...string) (process, error) { return proc, nil }
+	rt.deps.newProxy = func(context.Context, string, string, string, string) (daemonProxy, error) { return proxy, nil }
+
+	createReachedSnapshot := make(chan struct{})
+	allowCreateSnapshot := make(chan struct{})
+	rt.deps.loadSnapshot = func(context.Context, string, Config) error {
+		close(createReachedSnapshot)
+		<-allowCreateSnapshot
+		return nil
+	}
+
+	const sandboxID = "sandbox-id-123456"
+	createDone := make(chan error, 1)
+	go func() {
+		_, err := rt.CreateSandbox(context.Background(), sandboxID, nil)
+		createDone <- err
+	}()
+
+	select {
+	case <-createReachedSnapshot:
+	case <-time.After(time.Second):
+		t.Fatal("create did not reach snapshot restore")
+	}
+
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- rt.DeleteSandbox(context.Background(), sandboxID)
+	}()
+
+	select {
+	case err := <-deleteDone:
+		t.Fatalf("DeleteSandbox returned while create was still restoring: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(allowCreateSnapshot)
+	if err := <-createDone; err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("DeleteSandbox() failed: %v", err)
+	}
+
+	if !proc.killed || !proxy.stopped {
+		t.Fatalf("process killed = %v, proxy stopped = %v, want both true", proc.killed, proxy.stopped)
+	}
+	capacity, err := rt.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("Capacity() failed: %v", err)
+	}
+	if capacity.Used != 0 {
+		t.Fatalf("Capacity().Used = %d, want slot released after delete", capacity.Used)
+	}
+}
+
+func TestRuntimeReleaseSlotPanicsForInvalidSlot(t *testing.T) {
+	rt := testRuntime(1)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected releaseSlotLocked to panic for invalid slot")
+		}
+	}()
+
+	rt.releaseSlotLocked(1)
+}
+
+func TestRuntimeDeleteSandboxDoesNotReleaseReassignedSlot(t *testing.T) {
+	rt := testRuntime(1)
+	rt.deps.run = func(context.Context, string, ...string) error { return nil }
+
+	// bootParams as reserveSandbox would have set it: the teardown below reads the
+	// jail paths from it, and no sandbox exists without one.
+	params := testBootParams(rt.config)
+	oldState := &sandboxState{id: "sandbox-id-old123", slot: 0, bootParams: &params}
+	newState := &sandboxState{id: "sandbox-id-new456", slot: 0, bootParams: &params}
+	rt.sandboxes[newState.id] = newState
+	rt.slots[0].sandboxID = newState.id
+
+	if err := rt.deleteSandbox(context.Background(), oldState); err != nil {
+		t.Fatalf("deleteSandbox() failed: %v", err)
+	}
+
+	capacity, err := rt.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("Capacity() failed: %v", err)
+	}
+	if capacity.Used != 1 {
+		t.Fatalf("Capacity().Used = %d, want reassigned slot to remain occupied", capacity.Used)
+	}
+	if rt.slots[0].sandboxID != newState.id {
+		t.Fatalf("slot owner = %q, want %q", rt.slots[0].sandboxID, newState.id)
+	}
+}
+
+func TestRuntimeCreateSandboxCleansUpOnFailure(t *testing.T) {
+	rt := testRuntime(1)
+	proc := &fakeProcess{}
+	proxy := &fakeProxy{}
+	var runCount int
+	rt.deps.run = func(context.Context, string, ...string) error {
+		runCount++
+		return nil
+	}
+	rt.deps.start = func(context.Context, func(error), string, ...string) (process, error) { return proc, nil }
+	rt.deps.pathExists = func(string) bool { return true }
+	rt.deps.cloneRootfs = func(context.Context, string, string) error { return nil }
+	rt.deps.cloneGoldenSnapshot = func(context.Context, string, string, string) error { return nil }
+	rt.deps.loadSnapshot = func(context.Context, string, Config) error { return nil }
+	rt.deps.newProxy = func(context.Context, string, string, string, string) (daemonProxy, error) { return proxy, nil }
+	rt.deps.probeDaemon = func(context.Context, string) error { return errors.New("daemon down") }
+
+	if _, err := rt.CreateSandbox(context.Background(), "sandbox-id-123456", nil); err == nil {
+		t.Fatal("expected CreateSandbox() failure")
+	}
+	if !proc.killed {
+		t.Fatal("expected process to be killed during cleanup")
+	}
+	if !proxy.stopped {
+		t.Fatal("expected proxy to be stopped during cleanup")
+	}
+	if runCount != 5 {
+		t.Fatalf("runCount = %d, want prepare, host NAT, network, jail cleanup, and network cleanup", runCount)
+	}
+
+	capacity, err := rt.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("Capacity() failed: %v", err)
+	}
+	if capacity.Used != 0 {
+		t.Fatalf("Capacity().Used = %d, want 0 after cleanup", capacity.Used)
+	}
+	if _, err := rt.GetSandboxInfo(context.Background(), "sandbox-id-123456"); !errors.Is(err, runnerruntime.ErrSandboxNotFound) {
+		t.Fatalf("GetSandboxInfo() error = %v, want ErrSandboxNotFound", err)
+	}
+}
+
+// A failed delete normally keeps its slot so a delete retry can reclaim it, but a
+// failed create is the one caller with no retry behind it: it returns an error, so
+// the API stores no record and nothing can name the sandbox again. Its slot has to
+// come back here or it is stranded until the runner restarts.
+func TestRuntimeCreateSandboxReleasesSlotWhenCleanupFails(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	// cleanupHost is the only script that removes the jail directory, so a busy
+	// mount under it fails the create's cleanup and nothing else.
+	rt.deps.run = func(_ context.Context, _ string, args ...string) error {
+		if len(args) > 0 && strings.Contains(args[len(args)-1], "rm -rf") {
+			return errors.New("rm: cannot remove jail dir: Device or resource busy")
+		}
+		return nil
+	}
+	rt.deps.probeDaemon = func(context.Context, string) error { return errors.New("daemon down") }
+
+	const sandboxID = "sandbox-id-123456"
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err == nil {
+		t.Fatal("expected CreateSandbox() failure")
+	}
+
+	capacity, err := rt.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("Capacity() failed: %v", err)
+	}
+	if capacity.Used != 0 {
+		t.Fatalf("Capacity().Used = %d, want the slot back even though cleanup failed", capacity.Used)
+	}
+	if _, err := rt.GetSandboxInfo(context.Background(), sandboxID); !errors.Is(err, runnerruntime.ErrSandboxNotFound) {
+		t.Fatalf("GetSandboxInfo() error = %v, want ErrSandboxNotFound", err)
+	}
+	// The id has to be free too, or a retry of the same create is refused forever.
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err == nil {
+		t.Fatal("expected CreateSandbox() failure")
+	} else if strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("CreateSandbox() error = %v, want the id to be reusable", err)
+	}
+}
+
+// The kernel is bound into every jail, including one that will restore a snapshot
+// and never read it: which path an activation takes is not known when the jail is
+// built, and a sandbox created from its snapshot can be cold booted later on the
+// same jail. It comes from the template, at the jail path the sandbox's own sidecar
+// records, read-only and with the template's ownership, because a bind mount shares
+// the inode with an asset every sandbox on the host uses.
+//
+// The teardown has to unmount it too. rm cannot delete a live mountpoint, so a
+// kernel left mounted fails the whole cleanup, and the sandbox keeps its slot: on
+// a capacity-1 host that is an admission canary that can never be reclaimed and a
+// runner that stays unhealthy for the rest of its life.
+func TestPrepareJailBindsTheKernelForALaterColdBoot(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	var prepareScript, cleanupScript string
+	rt.deps.run = func(_ context.Context, _ string, args ...string) error {
+		switch script := args[len(args)-1]; {
+		case strings.Contains(script, "mount --bind") && prepareScript == "":
+			prepareScript = script
+		case strings.Contains(script, "umount -l") && cleanupScript == "":
+			cleanupScript = script
+		}
+		return nil
+	}
+
+	const sandboxID = "sandbox-id-123456"
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+
+	jailRoot := filepath.Join(rt.config.JailerBaseDir, "firecracker", "sandbox-"+shortID(sandboxID), "root")
+	wantMount := "mount --bind -o ro '" + filepath.Join(rt.config.TemplateDir, "vmlinux") + "' '" + filepath.Join(jailRoot, "vmlinux") + "'"
+	if !strings.Contains(prepareScript, wantMount) {
+		t.Errorf("prepare jail script does not bind the kernel read-only:\nwant %s\ngot\n%s", wantMount, prepareScript)
+	}
+	if strings.Contains(prepareScript, "chown 1000:1000 "+filepath.Join(jailRoot, "vmlinux")) {
+		t.Error("prepare jail chowns the shared template kernel through its bind mount")
+	}
+
+	if err := rt.DeleteSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("DeleteSandbox() failed: %v", err)
+	}
+	if want := "umount -l '" + filepath.Join(jailRoot, "vmlinux") + "'"; !strings.Contains(cleanupScript, want) {
+		t.Errorf("cleanup script does not unmount the kernel the jail prep mounted:\nwant %s\ngot\n%s", want, cleanupScript)
+	}
+}
+
+// The rootfs goes in at the jail path the sandbox's own sidecar records, because
+// that is the path both of its readers name: the snapshot was built with the drive
+// there, and a cold boot asks Firecracker to open whatever the sidecar says. A
+// mount anywhere else is a file neither of them finds. The teardown has to undo
+// the same path, or a delete leaves the sandbox's rootfs pinned under the jail.
+func TestJailMountsTheRootfsWhereTheSidecarRecordsIt(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	// A snapshot built with its drive somewhere other than the default.
+	params := testBootParams(rt.config)
+	params.RootfsDrivePath = "/data/rootfs.ext4"
+	rt.deps.loadBootParams = func(string) (*bootParams, error) {
+		p := params
+		return &p, nil
+	}
+
+	var prepareScript, cleanupScript string
+	rt.deps.run = func(_ context.Context, _ string, args ...string) error {
+		switch script := args[len(args)-1]; {
+		case strings.Contains(script, "mount --bind") && prepareScript == "":
+			prepareScript = script
+		case strings.Contains(script, "umount -l") && cleanupScript == "":
+			cleanupScript = script
+		}
+		return nil
+	}
+
+	const sandboxID = "sandbox-id-123456"
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+
+	jailRoot := filepath.Join(rt.config.JailerBaseDir, "firecracker", "sandbox-"+shortID(sandboxID), "root")
+	target := filepath.Join(jailRoot, "data", "rootfs.ext4")
+	wantMount := "mount --bind '" + sandboxRootfsPath(rt.runnerConfig.DataDir, sandboxID) + "' '" + target + "'"
+	if !strings.Contains(prepareScript, wantMount) {
+		t.Errorf("prepare jail script does not bind the rootfs where the sidecar records it:\nwant %s\ngot\n%s", wantMount, prepareScript)
+	}
+
+	if err := rt.DeleteSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("DeleteSandbox() failed: %v", err)
+	}
+	if want := "umount -l '" + target + "'"; !strings.Contains(cleanupScript, want) {
+		t.Errorf("cleanup script does not unmount the rootfs the jail prep mounted:\nwant %s\ngot\n%s", want, cleanupScript)
+	}
+}
+
+// A stop whose host cleanup failed still marks the sandbox stopped and drops its
+// process and proxy handles. The delete that follows has to clean up regardless, or
+// the jail's bind mounts go on pinning the snapshot files the delete removes, with
+// nothing left able to free them.
+func TestRuntimeDeleteRunsHostCleanupForAStoppedSandbox(t *testing.T) {
+	rt := testRuntimeT(t, 1)
+	stubCreateDeps(rt)
+
+	const sandboxID = "sandbox-id-123456"
+	if _, err := rt.CreateSandbox(context.Background(), sandboxID, nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+	if err := rt.StopSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("StopSandbox() failed: %v", err)
+	}
+
+	unmounts := 0
+	rt.deps.run = func(_ context.Context, _ string, args ...string) error {
+		if len(args) > 0 && strings.Contains(args[len(args)-1], "umount") {
+			unmounts++
+		}
+		return nil
+	}
+	if err := rt.DeleteSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("DeleteSandbox() failed: %v", err)
+	}
+	if unmounts == 0 {
+		t.Error("delete skipped host cleanup, so the jail mounts still pin the deleted snapshot files")
+	}
+}
+
+// Once a process has been reaped its pid is the kernel's to reuse, and signalling a
+// whole process group by a recycled id would kill unrelated processes. A live group
+// stands in for that here: if Kill signalled despite the reap, it would die.
+func TestProcessGroupKillSkipsAReapedPid(t *testing.T) {
+	exited := make(chan struct{})
+	proc, err := startCommand(context.Background(), func(error) { close(exited) }, "sh", "-c", "sleep 30")
+	if err != nil {
+		t.Fatalf("startCommand() failed: %v", err)
+	}
+	group, ok := proc.(*processGroup)
+	if !ok {
+		t.Fatalf("startCommand() returned %T, want *processGroup", proc)
+	}
+	t.Cleanup(func() {
+		group.reaped.Store(false)
+		_ = group.Kill()
+	})
+
+	group.reaped.Store(true)
+	if err := group.Kill(); !errors.Is(err, os.ErrProcessDone) {
+		t.Errorf("Kill() = %v, want os.ErrProcessDone", err)
+	}
+	select {
+	case <-exited:
+		t.Error("Kill signalled a process group it had already recorded as reaped")
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func TestProbeDaemonRejectsUnhealthyStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.NotFound(w, nil)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := probeDaemon(ctx, server.URL, time.Second); err == nil {
+		t.Fatal("expected unhealthy status to fail readiness probe")
+	}
+}
+
+// redirectingDaemon redirects every request to a healthy-looking target, with a
+// 307 so a followed POST would carry its body along. Both count the requests
+// they serve, so a test can tell a refused redirect from one never served.
+type redirectingDaemon struct {
+	url        string
+	daemonHits atomic.Int32
+	targetHits atomic.Int32
+}
+
+func newRedirectingDaemon(t *testing.T) *redirectingDaemon {
+	t.Helper()
+	d := &redirectingDaemon{}
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		d.targetHits.Add(1)
+	}))
+	t.Cleanup(target.Close)
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		d.daemonHits.Add(1)
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(daemon.Close)
+	d.url = daemon.URL
+	return d
+}
+
+func (d *redirectingDaemon) assertRefused(t *testing.T) {
+	t.Helper()
+	if got := d.daemonHits.Load(); got == 0 {
+		t.Fatal("daemon served no request, so no redirect was refused")
+	}
+	if got := d.targetHits.Load(); got != 0 {
+		t.Fatalf("redirect target hits = %d, want 0", got)
+	}
+}
+
+func TestProbeDaemonRefusesRedirects(t *testing.T) {
+	d := newRedirectingDaemon(t)
+
+	err := probeDaemon(context.Background(), d.url, time.Nanosecond)
+	if err == nil || !strings.Contains(err.Error(), "did not become healthy") {
+		t.Fatalf("probeDaemon() error = %v, want the daemon's 307 read as unhealthy", err)
+	}
+	d.assertRefused(t)
+}
+
+func TestStartCommandRunsInOwnProcessGroup(t *testing.T) {
+	proc, err := startCommand(context.Background(), nil, "sh", "-c", "sleep 10")
+	if err != nil {
+		t.Fatalf("startCommand() failed: %v", err)
+	}
+	defer proc.Kill()
+
+	groupProc, ok := proc.(*processGroup)
+	if !ok {
+		t.Fatalf("startCommand() returned %T, want *processGroup", proc)
+	}
+	pgid, err := syscall.Getpgid(groupProc.process.Pid)
+	if err != nil {
+		t.Fatalf("Getpgid() failed: %v", err)
+	}
+	if pgid != groupProc.process.Pid {
+		t.Fatalf("process group = %d, want process pid %d", pgid, groupProc.process.Pid)
+	}
+}
+
+func TestTCPDaemonProxyStopCancelsActiveGuestDial(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() failed: %v", err)
+	}
+	proxyCtx, cancel := context.WithCancel(context.Background())
+	dialStarted := make(chan struct{})
+	proxy := &tcpDaemonProxy{
+		listener: listener,
+		done:     make(chan struct{}),
+		ctx:      proxyCtx,
+		cancel:   cancel,
+		dial: func(ctx context.Context, _ string, _ string, _ string) (net.Conn, error) {
+			close(dialStarted)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	go proxy.serve("fc-sb-0", "172.16.0.10:8081")
+	clientConn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() failed: %v", err)
+	}
+	defer clientConn.Close()
+
+	select {
+	case <-dialStarted:
+	case <-time.After(time.Second):
+		t.Fatal("guest dial did not start")
+	}
+
+	stopped := make(chan error, 1)
+	go func() {
+		stopped <- proxy.Stop()
+	}()
+
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("Stop() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop() did not cancel active guest dial")
+	}
+}
+
+func containsArg(args []string, want string) bool {
+	return slices.Contains(args, want)
+}
+
+func TestRuntimeStopSandboxKeepsSandboxStopped(t *testing.T) {
+	rt := testRuntimeT(t, 2)
+	stubCreateDeps(rt)
+	var paused, snapshotted bool
+	rt.deps.pauseVM = func(_ context.Context, _ string) error {
+		paused = true
+		return nil
+	}
+	rt.deps.createSnapshot = func(_ context.Context, _ string) error {
+		snapshotted = true
+		return nil
+	}
+
+	if _, err := rt.CreateSandbox(context.Background(), "sandbox-id-123456", nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+	if err := rt.StopSandbox(context.Background(), "sandbox-id-123456"); err != nil {
+		t.Fatalf("StopSandbox() failed: %v", err)
+	}
+	if !paused || !snapshotted {
+		t.Fatalf("paused=%v snapshotted=%v, want both true", paused, snapshotted)
+	}
+
+	if _, err := rt.DaemonURL(context.Background(), "sandbox-id-123456"); !errors.Is(err, runnerruntime.ErrSandboxNotRunning) {
+		t.Fatalf("DaemonURL() error = %v, want ErrSandboxNotRunning", err)
+	}
+	capacity, err := rt.Capacity(context.Background())
+	if err != nil {
+		t.Fatalf("Capacity() failed: %v", err)
+	}
+	if capacity.Used != 0 {
+		t.Fatalf("Capacity().Used = %d, want slot released after stop", capacity.Used)
+	}
+	if capacity.Stopped != 1 {
+		t.Fatalf("Capacity().Stopped = %d, want 1 stopped sandbox", capacity.Stopped)
+	}
+	rt.mu.Lock()
+	occupied := rt.occupiedSlotsLocked()
+	rt.mu.Unlock()
+	if occupied != 0 {
+		t.Fatalf("occupied slots = %d, want slot released after stop", occupied)
+	}
+}
+
+func TestRuntimeEnsureSandboxRunningWakesStoppedSandbox(t *testing.T) {
+	rt := testRuntimeT(t, 2)
+	stubCreateDeps(rt)
+	var pauseCount, loadCount int
+	rt.deps.pauseVM = func(context.Context, string) error {
+		pauseCount++
+		return nil
+	}
+	rt.deps.createSnapshot = func(context.Context, string) error { return nil }
+	rt.deps.loadSnapshot = func(context.Context, string, Config) error {
+		loadCount++
+		return nil
+	}
+
+	if _, err := rt.CreateSandbox(context.Background(), "sandbox-id-123456", nil); err != nil {
+		t.Fatalf("CreateSandbox() failed: %v", err)
+	}
+	if err := rt.StopSandbox(context.Background(), "sandbox-id-123456"); err != nil {
+		t.Fatalf("StopSandbox() failed: %v", err)
+	}
+	wake, err := rt.EnsureSandboxRunning(context.Background(), "sandbox-id-123456")
+	if err != nil {
+		t.Fatalf("EnsureSandboxRunning() failed: %v", err)
+	}
+	// An idle-stop wake stays transparent. Reporting it as a recovery would fail a
+	// request whose sandbox lost nothing, on every wake.
+	if wake.Recovered {
+		t.Error("an ordinary wake reported itself as a recovery")
+	}
+	if pauseCount != 1 {
+		t.Fatalf("pauseCount = %d, want 1", pauseCount)
+	}
+	if loadCount != 2 {
+		t.Fatalf("loadCount = %d, want create + wake", loadCount)
+	}
+	url, err := rt.DaemonURL(context.Background(), "sandbox-id-123456")
+	if err != nil {
+		t.Fatalf("DaemonURL() failed: %v", err)
+	}
+	if url != "http://127.0.0.1:18081" {
+		t.Fatalf("DaemonURL() = %s", url)
+	}
+}
+
+// The egress mode is fixed at creation and follows the sandbox: a blocked sandbox
+// re-applies its DROP on every wake, since the slot it wakes on is freshly built
+// and not the one it left; a default sandbox never runs it.
+func TestRuntimeBlockedEgressIsReappliedOnWake(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		opts      *runnerruntime.CreateOptions
+		wantDrops int
+	}{
+		{name: "default", opts: nil, wantDrops: 0},
+		{name: "egress none", opts: &runnerruntime.CreateOptions{Egress: runnerruntime.EgressNone}, wantDrops: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := testRuntimeT(t, 1)
+			stubCreateDeps(rt)
+			log := &scriptLog{}
+			rt.deps.run = log.run
+
+			const sandboxID = "sandbox-id-123456"
+			if _, err := rt.CreateSandbox(context.Background(), sandboxID, tc.opts); err != nil {
+				t.Fatalf("CreateSandbox() failed: %v", err)
+			}
+			if err := rt.StopSandbox(context.Background(), sandboxID); err != nil {
+				t.Fatalf("StopSandbox() failed: %v", err)
+			}
+			if _, err := rt.EnsureSandboxRunning(context.Background(), sandboxID); err != nil {
+				t.Fatalf("EnsureSandboxRunning() failed: %v", err)
+			}
+			drops := log.matching("-I FORWARD 1 -i 'fc-tap-0' -j DROP")
+			if len(drops) != tc.wantDrops {
+				t.Fatalf("egress block scripts = %d, want %d (create + wake)", len(drops), tc.wantDrops)
+			}
+		})
+	}
+}

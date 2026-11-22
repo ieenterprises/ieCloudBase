@@ -1,0 +1,258 @@
+/** Configuration for creating a SandboxClient instance. */
+export interface SandboxClientOptions {
+  /** API key for authenticating with the sandbox service. */
+  apiKey?: string;
+  /** Base URL of the sandbox service API. Required at runtime: the client throws if it is empty. */
+  baseUrl?: string;
+  /**
+   * Retry policy for **transient** HTTP failures (see README).
+   * Omit to use defaults; set `{ attempts: 0 }` to disable retries entirely.
+   */
+  retry?: RetryOptions;
+}
+
+/**
+ * Outbound network policy of a sandbox.
+ * - `public`: the public internet; private and link-local ranges are blocked.
+ * - `none`: no guest-initiated connection leaves the sandbox, DNS included.
+ */
+export type EgressMode = "public" | "none";
+
+/** Options for creating a sandbox. */
+export interface CreateSandboxOptions {
+  /** UUID to create or reuse. The service generates one when omitted. */
+  id?: string;
+  /**
+   * Delete the sandbox instead of stopping it when idle: it never reports
+   * `stopped`, and requests past its idle window return 404. Defaults to false;
+   * fixed at creation. Windows are documented under `POST /sandboxes` in API.md.
+   */
+  ephemeral?: boolean;
+  /**
+   * Outbound network policy, fixed at creation. Required so the choice is made
+   * deliberately: code that runs untrusted input should ask for `none`.
+   * Reconnecting to an existing `id` keeps the mode it was created with.
+   */
+  egress: EgressMode;
+}
+
+/** Runtime of a code sandbox. */
+export type CodeRuntime = "n8n-js" | "n8n-python";
+
+/** Options for creating a code sandbox. */
+export interface CreateCodeSandboxOptions {
+  /**
+   * Chosen by the caller: 1 to 128 characters from `A-Z`, `a-z`, `0-9`, `.`,
+   * `_`, `:` and `-`. Creates of one name return the same sandbox while its
+   * settings are equal; other settings fail with `409`.
+   */
+  name: string;
+  runtime: CodeRuntime;
+  /** Version of the runtime image. Should match the n8n version. */
+  runtimeVersion: string;
+  /** Number of lanes: each lane runs one task at a time. */
+  maxConcurrency: number;
+  /** Total sandbox memory in MB. */
+  memoryMb: number;
+  idleTimeoutMs?: number;
+  maxAgeMs?: number;
+}
+
+/** A code sandbox, as returned by `createCodeSandbox`. */
+export interface CodeSandbox {
+  id: string;
+  name: string;
+  /** True only for the create that made the sandbox. */
+  created: boolean;
+  state: string;
+}
+
+/** Retry policy for transient HTTP failures. */
+export interface RetryOptions {
+  /**
+   * Number of retry attempts after the initial request.
+   * Example: 3 means at most 4 total attempts. Defaults to 3; set to 0 to turn off retries.
+   */
+  attempts?: number;
+  /** Initial backoff delay in milliseconds. Defaults to 200. */
+  baseDelayMs?: number;
+  /** Maximum backoff delay in milliseconds. Defaults to 10000. */
+  maxDelayMs?: number;
+  /**
+   * HTTP statuses that should be retried. Defaults to [429, 503] (transient; see API.md).
+   * Network/transport errors (status 0) are always considered retryable.
+   */
+  retryOnStatuses?: number[];
+  /** Enable delay jitter (0.5x..1.5x). Defaults to true. */
+  jitter?: boolean;
+}
+
+/** Metadata for a sandbox instance. */
+export interface SandboxRecord {
+  id: string;
+  /** `running` or `stopped` (idle-stopped; the next request wakes it). */
+  status: string;
+  /** Unix timestamp (seconds) when the sandbox was created. */
+  createdAt: number;
+  /** Unix timestamp (seconds) of last activity. */
+  lastActiveAt: number;
+  /** Whether the sandbox is deleted, rather than stopped, when it goes idle. */
+  ephemeral: boolean;
+  /** Outbound network policy the sandbox was created with. */
+  egress: EgressMode;
+  /**
+   * Owning tenant id, or `__admin__` for a sandbox created with an admin key.
+   * A tenant key only ever sees its own id. Undefined against services that
+   * predate the field.
+   */
+  tenantId?: string;
+}
+
+/** Directory entry returned by the file listing API. */
+export interface FileEntry {
+  name: string;
+  size: number;
+  isDir: boolean;
+  type: "file" | "directory";
+  /** ISO 8601 last-modified timestamp. */
+  modTime: string;
+}
+
+/** File or directory metadata returned by the stat API. */
+export interface FileStat {
+  name: string;
+  path: string;
+  type: "file" | "directory";
+  size: number;
+  /** ISO 8601 creation timestamp. */
+  createdAt: string;
+  /** ISO 8601 last-modified timestamp. */
+  modifiedAt: string;
+}
+
+/** Request payload for executing a command in a sandbox. */
+export interface ExecRequest {
+  /** Shell command to execute (run via `/bin/sh -c`). */
+  command: string;
+  /** Environment variables to set for the command. */
+  env?: Record<string, string | undefined>;
+  /** Working directory for the command. */
+  workdir?: string;
+  /** Maximum execution time in milliseconds. Defaults to 5 minutes. */
+  timeoutMs?: number;
+  /** Signal to abort the running command. */
+  abortSignal?: AbortSignal;
+  /** Called with each chunk of stdout data as it arrives. */
+  onStdout?: (data: string) => void;
+  /** Called with each chunk of stderr data as it arrives. */
+  onStderr?: (data: string) => void;
+}
+
+/** Aggregated result of a completed command execution. */
+export interface ExecResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  /** Wall-clock execution time in milliseconds. */
+  executionTimeMs: number;
+  /** Whether the command was killed due to timeout. */
+  timedOut: boolean;
+  /** Whether the command was terminated by a signal. */
+  killed: boolean;
+  /** True when exitCode is 0. */
+  success: boolean;
+}
+
+/** Accepted content types for file write operations. */
+export type FileContent = string | Buffer | Uint8Array;
+
+/** Options for listing files in a sandbox directory. */
+export interface ListFilesOptions {
+  /** Directory path to list. Defaults to root. */
+  path?: string;
+  /** List files recursively. */
+  recursive?: boolean;
+  /** Filter by file extension (e.g. `.ts`). */
+  extension?: string;
+}
+
+/** Request payload for copying a file or directory. */
+export interface CopyFileRequest {
+  src: string;
+  dest: string;
+  recursive?: boolean;
+  overwrite?: boolean;
+}
+
+/** Request payload for moving or renaming a file or directory. */
+export interface MoveFileRequest {
+  src: string;
+  dest: string;
+  overwrite?: boolean;
+}
+
+/** Options for deleting a file or directory. */
+export interface DeleteFileOptions {
+  /** Remove non-empty directories. */
+  recursive?: boolean;
+  /** Ignore "not found" errors. */
+  force?: boolean;
+}
+
+// Wire-format types (snake_case from the API)
+
+export type SandboxWireResponse = {
+  id: string;
+  status: string;
+  created_at: number;
+  last_active_at: number;
+  /** Absent from services that predate the ephemeral flag; mapped to `false`. */
+  ephemeral?: boolean;
+  /** Absent from services that predate egress modes; mapped to `public`, the only policy they had. */
+  egress?: EgressMode;
+  /** Absent from services that predate sandbox ownership in responses. */
+  tenant_id?: string;
+};
+
+export type FileEntryWireResponse = {
+  name: string;
+  size: number;
+  is_dir: boolean;
+  type: "file" | "directory";
+  mod_time: string;
+};
+
+export type FileStatWireResponse = {
+  name: string;
+  path: string;
+  type: "file" | "directory";
+  size: number;
+  created_at: string;
+  modified_at: string;
+};
+
+/** Initial event emitted at the start of every exec stream. */
+export type ExecStartedEvent = { type: "started"; seq: number; exec_id: string };
+/** Streamed stdout chunk from exec. */
+export type ExecStdoutEvent = { type: "stdout"; data: string; seq: number };
+/** Streamed stderr chunk from exec. */
+export type ExecStderrEvent = { type: "stderr"; data: string; seq: number };
+/** Final exit event from exec with process metadata. */
+export type ExecExitEvent = {
+  type: "exit";
+  exit_code: number;
+  success: boolean;
+  execution_time_ms: number;
+  timed_out: boolean;
+  killed: boolean;
+  seq: number;
+};
+/** Error event — may originate from the server (with seq) or from client-side parsing (without). */
+export type ExecErrorEvent = { type: "error"; error: string; seq?: number };
+/** Discriminated union of all NDJSON exec stream events. */
+export type ExecEvent =
+  | ExecStartedEvent
+  | ExecStdoutEvent
+  | ExecStderrEvent
+  | ExecExitEvent
+  | ExecErrorEvent;

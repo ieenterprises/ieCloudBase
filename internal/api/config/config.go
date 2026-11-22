@@ -1,0 +1,713 @@
+// Package config loads the API configuration from SANDBOX_API_* environment
+// variables (defaults and semantics: docs/configuration.md).
+package config
+
+import (
+	"fmt"
+	"log/slog"
+	"math"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/n8n-io/sandbox-service/internal/logging"
+)
+
+const (
+	defaultListenAddr       = ":8080"
+	defaultGRPCListenAddr   = ":9090"
+	defaultVolumeLocalAddr  = ":8443"
+	defaultMaxFileBytes     = 10 * 1024 * 1024 // 10 MB
+	defaultHeartbeatGrace   = 45 * time.Second
+	defaultOrphanReapBuffer = 5 * time.Minute
+	defaultIdleStopAfter    = time.Hour
+	defaultIdleDeleteAfter  = 24 * time.Hour
+	defaultLogLevel         = slog.LevelInfo
+	defaultPostgresPort     = 5432
+	defaultPostgresSSLMode  = "require"
+	defaultMaxSandboxes     = 50
+
+	defaultMaxInflightPerTenant = 512
+
+	DefaultActivityWriteInterval = 5 * time.Second
+	maxActivityWriteInterval     = time.Minute
+	DefaultMaxResponseActivity   = 30 * time.Minute
+	minMaxResponseActivity       = time.Minute
+
+	defaultAPIKeyCacheTTL = 15 * time.Second
+	maxAPIKeyCacheTTL     = time.Minute
+)
+
+const (
+	defaultIdleSweepConcurrency = 8
+	// Caps sweep connections per replica. The documented two-replica
+	// deployment stays under the default max_connections=100 with 8 left for
+	// other clients: 2 * (25 store + 5 lock headroom + 16) = 92.
+	maxIdleSweepConcurrency = 16
+	// Postgres sandbox-lock connections kept free for the request path while
+	// the sweeper holds its full concurrency worth.
+	sandboxLockRequestHeadroom = 5
+)
+
+// StoreBackend selects the API sandbox store implementation.
+type StoreBackend string
+
+const (
+	StoreSQLite   StoreBackend = "sqlite"
+	StorePostgres StoreBackend = "postgres"
+)
+
+// VolumeStoreBackend selects where volume objects are stored.
+type VolumeStoreBackend string
+
+const (
+	VolumeStoreNone   VolumeStoreBackend = ""
+	VolumeStoreLocal  VolumeStoreBackend = "local"
+	VolumeStoreRemote VolumeStoreBackend = "remote"
+)
+
+// PostgresConfig holds connection settings for the Postgres store backend.
+type PostgresConfig struct {
+	Host     string
+	Port     int
+	User     string
+	Password string
+	Database string
+	SSLMode  string
+	// LockPoolSize caps the per-sandbox advisory lock pool (0 = store default).
+	LockPoolSize int
+}
+
+// DSN returns a libpq connection string for pgx/stdlib.
+func (p PostgresConfig) DSN() string {
+	return fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		p.Host, p.Port, p.User, p.Password, p.Database, p.SSLMode,
+	)
+}
+
+// APIConfig contains configuration for the public API gateway.
+type APIConfig struct {
+	// APIKeys is the set of admin API keys: full access to every route.
+	APIKeys map[string]struct{}
+
+	// ProvisionerKeys is parsed from SANDBOX_API_PROVISIONER_KEYS; may be
+	// empty. See docs/security-model.md, "Provisioner keys".
+	ProvisionerKeys map[string]struct{}
+
+	// ScalerKeys is parsed from SANDBOX_API_SCALER_KEYS; may be empty.
+	ScalerKeys map[string]struct{}
+
+	// ListenAddr is the TCP address the API gateway listens on.
+	ListenAddr string
+
+	// GRPCListenAddr is the TCP address for the private runner registration gRPC server.
+	GRPCListenAddr string
+
+	// RegistrationToken is the shared secret runners present as Bearer token on the gRPC stream.
+	RegistrationToken string
+
+	// MaxFileBytes is the maximum size of file upload requests accepted by API.
+	MaxFileBytes int64
+
+	// DefaultMaxSandboxes is the default per-tenant sandbox quota when
+	// POST /admin/tenants omits max_sandboxes (0 = unlimited).
+	DefaultMaxSandboxes int
+
+	// MaxInflightPerTenant caps a tenant's sandbox requests in progress on this
+	// replica (0 = no cap). Parsed from SANDBOX_API_MAX_INFLIGHT_PER_TENANT.
+	MaxInflightPerTenant int
+
+	// RunnerAPIKey is the optional API key sent to runner via X-Api-Key.
+	RunnerAPIKey string
+
+	// DataDir is the directory for storing API state (SQLite file when Store=sqlite).
+	DataDir string
+
+	// SQLiteWAL opens the SQLite file in WAL mode with synchronous=NORMAL.
+	// Parsed from SANDBOX_API_SQLITE_WAL (default true).
+	SQLiteWAL bool
+
+	// Store selects sqlite (default) or postgres for multi-pod deployments.
+	Store StoreBackend
+
+	// Postgres connection settings when Store=postgres.
+	Postgres PostgresConfig
+
+	// HeartbeatGrace is how long after the last gRPC heartbeat a runner may still be chosen for placement.
+	HeartbeatGrace time.Duration
+
+	// EnableCORS enables CORS headers (allow all origins). Default false.
+	EnableCORS bool
+
+	// MetricsEnabled controls whether the Prometheus /metrics endpoint is served.
+	// Parsed from SANDBOX_API_METRICS_ENABLED (default false). When true, /metrics
+	// bypasses X-Api-Key authentication on whichever listener serves it; operators
+	// are expected to firewall that port or front it with a private LB.
+	MetricsEnabled bool
+
+	// MetricsListenAddr is the TCP address for a dedicated Prometheus listener.
+	// Parsed from SANDBOX_API_METRICS_LISTEN_ADDR (default empty). Empty, or the
+	// same port as ListenAddr, keeps /metrics on the public API listener.
+	// Ignored when MetricsEnabled is false.
+	MetricsListenAddr string
+
+	// Runner registration gRPC mTLS (required). All three must be set.
+	GRPCServerCertFile string
+	GRPCServerKeyFile  string
+	GRPCClientCAFile   string
+
+	// IdleStopAfter is how long after last activity the API asks the runner to stop
+	// the sandbox (0 = disabled).
+	IdleStopAfter time.Duration
+	// IdleDeleteAfter is how long after last activity the API deletes the sandbox
+	// (0 = disabled). Wakes are refused after this window until the row is removed.
+	IdleDeleteAfter time.Duration
+	// IdleDeleteSafetyBuffer is added to a sandbox's idle window before the sweeper
+	// deletes it (race guard). Ephemeral sandboxes use IdleStopAfter as their window
+	// (IdleDeleteAfter when idle stop is disabled), so when either window is > 0 and
+	// this is unset, it defaults to 1m.
+	IdleDeleteSafetyBuffer time.Duration
+	// IdleSweepInterval is how often the idle stop/delete sweeper runs (default 1m).
+	IdleSweepInterval time.Duration
+	// IdleSweepConcurrency is how many runner calls one sweep keeps in flight (default 8).
+	IdleSweepConcurrency int
+	// OrphanReapBuffer is how long after a runner deregisters before the idle
+	// sweeper removes its orphaned sandbox rows from the store.
+	OrphanReapBuffer time.Duration
+	// ActivityWriteInterval is how often each API pod writes the
+	// last_active_at of the sandboxes it served, in one statement.
+	// last_active_at can trail the last request by twice this, so the stop
+	// window and the request-path fence are extended by twice this, and deletes
+	// by four times (docs/architecture.md, "Sandbox activity").
+	// Parsed from SANDBOX_API_ACTIVITY_WRITE_INTERVAL (1s–1m, default 5s).
+	ActivityWriteInterval time.Duration
+	// MaxResponseActivity is how long a response that is still open, such as an
+	// exec stream, keeps its sandbox from going idle. Keep it at least the
+	// runner's max exec timeout. Parsed from SANDBOX_API_MAX_RESPONSE_ACTIVITY
+	// (at least 1m, default 30m).
+	MaxResponseActivity time.Duration
+
+	// APIKeyCacheTTL is how long each API pod remembers a tenant key lookup,
+	// unknown keys included, so a revoked key keeps working on other pods for
+	// up to this long (docs/architecture.md, "Tenant key cache"). Parsed from
+	// SANDBOX_API_KEY_CACHE_TTL (0–1m, default 15s; 0 = no cache).
+	APIKeyCacheTTL time.Duration
+
+	// LogLevel controls the minimum log severity.
+	// Parsed from SANDBOX_API_LOG_LEVEL (default info).
+	LogLevel slog.Level
+
+	// API as mTLS client dialing runner SandboxControl (required). All three must be set.
+	RunnerControlGRPCClientCAFile     string
+	RunnerControlGRPCClientCertFile   string
+	RunnerControlGRPCClientKeyFile    string
+	RunnerControlGRPCClientServerName string // optional; defaults to runner dial host
+
+	// ScalerURL is the base URL of the externally-operated Runner Scaler.
+	// Empty disables GET /admin/scaler (it returns 503).
+	ScalerURL string
+
+	// VolumeStore selects where volume objects are stored; empty means no
+	// store. Parsed from SANDBOX_API_VOLUME_STORE.
+	VolumeStore VolumeStoreBackend
+	// VolumeLocalListenAddr is the TCP address of the mTLS listener that
+	// serves volume objects to runners (VolumeStoreLocal). Parsed from
+	// SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR (default :8443).
+	VolumeLocalListenAddr string
+	// VolumeLocalURL is the https base URL at which runners reach
+	// VolumeLocalListenAddr, which signed object URLs point at
+	// (VolumeStoreLocal).
+	VolumeLocalURL string
+	// VolumeRemoteSocket is the Unix socket of the store helper
+	// (VolumeStoreRemote).
+	VolumeRemoteSocket string
+}
+
+// LoadAPI reads API gateway configuration from environment variables.
+func LoadAPI() (*APIConfig, error) {
+	cfg := &APIConfig{
+		ListenAddr:            defaultListenAddr,
+		GRPCListenAddr:        defaultGRPCListenAddr,
+		MaxFileBytes:          defaultMaxFileBytes,
+		DefaultMaxSandboxes:   defaultMaxSandboxes,
+		MaxInflightPerTenant:  defaultMaxInflightPerTenant,
+		DataDir:               "/var/lib/n8n-sandbox-api",
+		SQLiteWAL:             true,
+		Store:                 StoreSQLite,
+		Postgres:              PostgresConfig{Port: defaultPostgresPort, SSLMode: defaultPostgresSSLMode},
+		HeartbeatGrace:        defaultHeartbeatGrace,
+		OrphanReapBuffer:      defaultOrphanReapBuffer,
+		IdleStopAfter:         defaultIdleStopAfter,
+		IdleDeleteAfter:       defaultIdleDeleteAfter,
+		ActivityWriteInterval: DefaultActivityWriteInterval,
+		MaxResponseActivity:   DefaultMaxResponseActivity,
+		APIKeyCacheTTL:        defaultAPIKeyCacheTTL,
+		LogLevel:              defaultLogLevel,
+	}
+
+	// SANDBOX_API_LOG_LEVEL (optional)
+	if v := os.Getenv("SANDBOX_API_LOG_LEVEL"); v != "" {
+		lvl, err := logging.ParseLevel(v)
+		if err != nil {
+			return nil, fmt.Errorf("SANDBOX_API_LOG_LEVEL: %w", err)
+		}
+		cfg.LogLevel = lvl
+	}
+
+	rawKeys := os.Getenv("SANDBOX_API_KEYS")
+	if rawKeys == "" {
+		return nil, fmt.Errorf("SANDBOX_API_KEYS must be set")
+	}
+	cfg.APIKeys = parseKeySet(rawKeys)
+	if len(cfg.APIKeys) == 0 {
+		return nil, fmt.Errorf("SANDBOX_API_KEYS contains no valid keys")
+	}
+
+	// A key in two sets would silently get the role checked first: admin,
+	// then provisioner, then scaler.
+	cfg.ProvisionerKeys = parseKeySet(os.Getenv("SANDBOX_API_PROVISIONER_KEYS"))
+	for k := range cfg.ProvisionerKeys {
+		if _, isAdmin := cfg.APIKeys[k]; isAdmin {
+			return nil, fmt.Errorf("SANDBOX_API_PROVISIONER_KEYS must not share a key with SANDBOX_API_KEYS")
+		}
+	}
+	cfg.ScalerKeys = parseKeySet(os.Getenv("SANDBOX_API_SCALER_KEYS"))
+	for k := range cfg.ScalerKeys {
+		if _, isAdmin := cfg.APIKeys[k]; isAdmin {
+			return nil, fmt.Errorf("SANDBOX_API_SCALER_KEYS must not share a key with SANDBOX_API_KEYS")
+		}
+		if _, isProvisioner := cfg.ProvisionerKeys[k]; isProvisioner {
+			return nil, fmt.Errorf("SANDBOX_API_SCALER_KEYS must not share a key with SANDBOX_API_PROVISIONER_KEYS")
+		}
+	}
+
+	if v := os.Getenv("SANDBOX_API_LISTEN_ADDR"); v != "" {
+		cfg.ListenAddr = v
+	}
+
+	if v := os.Getenv("SANDBOX_API_GRPC_LISTEN_ADDR"); v != "" {
+		cfg.GRPCListenAddr = v
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SANDBOX_API_METRICS_LISTEN_ADDR")); v != "" {
+		if err := validateListenAddr(v); err != nil {
+			return nil, fmt.Errorf("SANDBOX_API_METRICS_LISTEN_ADDR must be host:port (e.g. :9100), got %q: %w", v, err)
+		}
+		cfg.MetricsListenAddr = v
+	}
+	if cfg.MetricsListenAddr != "" {
+		// Caught here rather than as an EADDRINUSE crash loop that names neither var.
+		if listenPort(cfg.MetricsListenAddr) == listenPort(cfg.GRPCListenAddr) {
+			return nil, fmt.Errorf("SANDBOX_API_METRICS_LISTEN_ADDR (%q) must not use the same port as SANDBOX_API_GRPC_LISTEN_ADDR (%q)", cfg.MetricsListenAddr, cfg.GRPCListenAddr)
+		}
+		// The API listener wins the shared port, so accepting a different host
+		// here would quietly bind metrics somewhere the operator did not ask for.
+		if cfg.MetricsOnMainListener() && !sameListenHost(cfg.MetricsListenAddr, cfg.ListenAddr) {
+			return nil, fmt.Errorf("SANDBOX_API_METRICS_LISTEN_ADDR (%q) uses the port of SANDBOX_API_LISTEN_ADDR (%q) but a different host; leave it unset to serve /metrics on the API listener", cfg.MetricsListenAddr, cfg.ListenAddr)
+		}
+	}
+
+	cfg.RegistrationToken = os.Getenv("SANDBOX_API_RUNNER_REGISTRATION_TOKEN")
+	if cfg.RegistrationToken == "" {
+		return nil, fmt.Errorf("SANDBOX_API_RUNNER_REGISTRATION_TOKEN must be set")
+	}
+
+	if v := os.Getenv("SANDBOX_API_MAX_FILE_BYTES"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("SANDBOX_API_MAX_FILE_BYTES must be a positive integer, got %q", v)
+		}
+		cfg.MaxFileBytes = n
+	}
+
+	if v := os.Getenv("SANDBOX_API_DEFAULT_MAX_SANDBOXES"); v != "" {
+		n, err := strconv.Atoi(v)
+		// tenants.max_sandboxes is INTEGER (signed 32-bit) in SQLite/Postgres.
+		if err != nil || n < 0 || n > math.MaxInt32 {
+			return nil, fmt.Errorf("SANDBOX_API_DEFAULT_MAX_SANDBOXES must be an integer between 0 and %d, got %q", math.MaxInt32, v)
+		}
+		cfg.DefaultMaxSandboxes = n
+	}
+	// Provisioner tenants are bounded to 1..DefaultMaxSandboxes; with 0
+	// (unlimited) an omitted max_sandboxes would yield an unlimited tenant.
+	if len(cfg.ProvisionerKeys) > 0 && cfg.DefaultMaxSandboxes == 0 {
+		return nil, fmt.Errorf("SANDBOX_API_PROVISIONER_KEYS requires SANDBOX_API_DEFAULT_MAX_SANDBOXES to be at least 1")
+	}
+
+	if err := parseLimit("SANDBOX_API_MAX_INFLIGHT_PER_TENANT", &cfg.MaxInflightPerTenant); err != nil {
+		return nil, err
+	}
+
+	cfg.RunnerAPIKey = os.Getenv("SANDBOX_API_RUNNER_API_KEY")
+
+	if v := os.Getenv("SANDBOX_API_DATA_DIR"); v != "" {
+		cfg.DataDir = v
+	}
+
+	if v := os.Getenv("SANDBOX_API_SQLITE_WAL"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("SANDBOX_API_SQLITE_WAL must be a boolean, got %q", v)
+		}
+		cfg.SQLiteWAL = b
+	}
+
+	if v := os.Getenv("SANDBOX_API_METRICS_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("SANDBOX_API_METRICS_ENABLED must be a boolean, got %q", v)
+		}
+		cfg.MetricsEnabled = b
+	}
+
+	if v := os.Getenv("SANDBOX_API_ENABLE_CORS"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("SANDBOX_API_ENABLE_CORS must be a boolean, got %q", v)
+		}
+		cfg.EnableCORS = b
+	}
+
+	if v := os.Getenv("SANDBOX_API_RUNNER_HEARTBEAT_GRACE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("SANDBOX_API_RUNNER_HEARTBEAT_GRACE must be a positive duration (e.g. 45s, 2m), got %q", v)
+		}
+		cfg.HeartbeatGrace = d
+	}
+
+	cfg.GRPCServerCertFile = strings.TrimSpace(os.Getenv("SANDBOX_API_GRPC_TLS_CERT_FILE"))
+	cfg.GRPCServerKeyFile = strings.TrimSpace(os.Getenv("SANDBOX_API_GRPC_TLS_KEY_FILE"))
+	cfg.GRPCClientCAFile = strings.TrimSpace(os.Getenv("SANDBOX_API_GRPC_TLS_CLIENT_CA_FILE"))
+
+	tlsN := 0
+	if cfg.GRPCServerCertFile != "" {
+		tlsN++
+	}
+	if cfg.GRPCServerKeyFile != "" {
+		tlsN++
+	}
+	if cfg.GRPCClientCAFile != "" {
+		tlsN++
+	}
+	if tlsN != 3 {
+		return nil, fmt.Errorf("SANDBOX_API_GRPC_TLS_CERT_FILE, SANDBOX_API_GRPC_TLS_KEY_FILE, and SANDBOX_API_GRPC_TLS_CLIENT_CA_FILE are required for runner-registry mTLS")
+	}
+
+	cfg.RunnerControlGRPCClientCAFile = strings.TrimSpace(os.Getenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CA_FILE"))
+	cfg.RunnerControlGRPCClientCertFile = strings.TrimSpace(os.Getenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CERT_FILE"))
+	cfg.RunnerControlGRPCClientKeyFile = strings.TrimSpace(os.Getenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_KEY_FILE"))
+	cfg.RunnerControlGRPCClientServerName = strings.TrimSpace(os.Getenv("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_SERVER_NAME"))
+
+	ctlN := 0
+	if cfg.RunnerControlGRPCClientCAFile != "" {
+		ctlN++
+	}
+	if cfg.RunnerControlGRPCClientCertFile != "" {
+		ctlN++
+	}
+	if cfg.RunnerControlGRPCClientKeyFile != "" {
+		ctlN++
+	}
+	if ctlN != 3 {
+		return nil, fmt.Errorf("SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CA_FILE, SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_CERT_FILE, and SANDBOX_API_RUNNER_CONTROL_GRPC_TLS_KEY_FILE are required for control-plane mTLS")
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SANDBOX_API_IDLE_STOP_AFTER")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return nil, fmt.Errorf("SANDBOX_API_IDLE_STOP_AFTER must be unset, 0, or a positive duration, got %q", v)
+		}
+		cfg.IdleStopAfter = d
+	}
+	if v := strings.TrimSpace(os.Getenv("SANDBOX_API_IDLE_DELETE_AFTER")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return nil, fmt.Errorf("SANDBOX_API_IDLE_DELETE_AFTER must be unset, 0, or a positive duration, got %q", v)
+		}
+		cfg.IdleDeleteAfter = d
+	}
+	if v := strings.TrimSpace(os.Getenv("SANDBOX_API_IDLE_DELETE_SAFETY_BUFFER")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return nil, fmt.Errorf("SANDBOX_API_IDLE_DELETE_SAFETY_BUFFER must be a non-negative duration, got %q", v)
+		}
+		cfg.IdleDeleteSafetyBuffer = d
+	}
+	if (cfg.IdleDeleteAfter > 0 || cfg.IdleStopAfter > 0) && cfg.IdleDeleteSafetyBuffer <= 0 {
+		cfg.IdleDeleteSafetyBuffer = time.Minute
+	}
+
+	cfg.IdleSweepInterval = time.Minute
+	if v := strings.TrimSpace(os.Getenv("SANDBOX_API_IDLE_SWEEP_INTERVAL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("SANDBOX_API_IDLE_SWEEP_INTERVAL must be a positive duration, got %q", v)
+		}
+		cfg.IdleSweepInterval = d
+	}
+
+	cfg.IdleSweepConcurrency = defaultIdleSweepConcurrency
+	if v := strings.TrimSpace(os.Getenv("SANDBOX_API_IDLE_SWEEP_CONCURRENCY")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > maxIdleSweepConcurrency {
+			return nil, fmt.Errorf("SANDBOX_API_IDLE_SWEEP_CONCURRENCY must be an integer between 1 and %d, got %q", maxIdleSweepConcurrency, v)
+		}
+		cfg.IdleSweepConcurrency = n
+	}
+	cfg.Postgres.LockPoolSize = cfg.IdleSweepConcurrency + sandboxLockRequestHeadroom
+
+	if v := strings.TrimSpace(os.Getenv("SANDBOX_API_ORPHAN_REAP_BUFFER")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("SANDBOX_API_ORPHAN_REAP_BUFFER must be a positive duration, got %q", v)
+		}
+		cfg.OrphanReapBuffer = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SANDBOX_API_ACTIVITY_WRITE_INTERVAL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < time.Second || d > maxActivityWriteInterval {
+			return nil, fmt.Errorf("SANDBOX_API_ACTIVITY_WRITE_INTERVAL must be a duration between 1s and %s, got %q", maxActivityWriteInterval, v)
+		}
+		cfg.ActivityWriteInterval = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SANDBOX_API_MAX_RESPONSE_ACTIVITY")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < minMaxResponseActivity {
+			return nil, fmt.Errorf("SANDBOX_API_MAX_RESPONSE_ACTIVITY must be a duration of at least %s, got %q", minMaxResponseActivity, v)
+		}
+		cfg.MaxResponseActivity = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SANDBOX_API_KEY_CACHE_TTL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 || d > maxAPIKeyCacheTTL {
+			return nil, fmt.Errorf("SANDBOX_API_KEY_CACHE_TTL must be 0 or a duration up to %s, got %q", maxAPIKeyCacheTTL, v)
+		}
+		cfg.APIKeyCacheTTL = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SANDBOX_API_STORE")); v != "" {
+		switch StoreBackend(strings.ToLower(v)) {
+		case StoreSQLite, StorePostgres:
+			cfg.Store = StoreBackend(strings.ToLower(v))
+		default:
+			return nil, fmt.Errorf("SANDBOX_API_STORE must be sqlite or postgres, got %q", v)
+		}
+	}
+
+	if cfg.Store == StorePostgres {
+		cfg.Postgres.Host = strings.TrimSpace(os.Getenv("SANDBOX_API_POSTGRES_HOST"))
+		cfg.Postgres.User = strings.TrimSpace(os.Getenv("SANDBOX_API_POSTGRES_USER"))
+		cfg.Postgres.Password = os.Getenv("SANDBOX_API_POSTGRES_PASSWORD")
+		cfg.Postgres.Database = strings.TrimSpace(os.Getenv("SANDBOX_API_POSTGRES_DB"))
+		if v := strings.TrimSpace(os.Getenv("SANDBOX_API_POSTGRES_PORT")); v != "" {
+			port, err := strconv.Atoi(v)
+			if err != nil || port <= 0 {
+				return nil, fmt.Errorf("SANDBOX_API_POSTGRES_PORT must be a positive integer, got %q", v)
+			}
+			cfg.Postgres.Port = port
+		}
+		if v := strings.TrimSpace(os.Getenv("SANDBOX_API_POSTGRES_SSLMODE")); v != "" {
+			cfg.Postgres.SSLMode = v
+		}
+		if cfg.Postgres.Host == "" {
+			return nil, fmt.Errorf("SANDBOX_API_POSTGRES_HOST must be set when SANDBOX_API_STORE=postgres")
+		}
+		if cfg.Postgres.User == "" {
+			return nil, fmt.Errorf("SANDBOX_API_POSTGRES_USER must be set when SANDBOX_API_STORE=postgres")
+		}
+		if cfg.Postgres.Password == "" {
+			return nil, fmt.Errorf("SANDBOX_API_POSTGRES_PASSWORD must be set when SANDBOX_API_STORE=postgres")
+		}
+		if cfg.Postgres.Database == "" {
+			return nil, fmt.Errorf("SANDBOX_API_POSTGRES_DB must be set when SANDBOX_API_STORE=postgres")
+		}
+	}
+
+	cfg.ScalerURL = strings.TrimRight(strings.TrimSpace(os.Getenv("SANDBOX_API_SCALER_URL")), "/")
+
+	if err := loadVolumeStore(cfg); err != nil {
+		return nil, err
+	}
+
+	return cfg, nil
+}
+
+func loadVolumeStore(cfg *APIConfig) error {
+	backend := strings.TrimSpace(os.Getenv("SANDBOX_API_VOLUME_STORE"))
+	switch VolumeStoreBackend(strings.ToLower(backend)) {
+	case VolumeStoreNone:
+		return nil
+	case VolumeStoreLocal:
+		cfg.VolumeStore = VolumeStoreLocal
+		localURL, err := parseLocalURL()
+		if err != nil {
+			return err
+		}
+		cfg.VolumeLocalURL = localURL
+		listenAddr, err := parseVolumeLocalListenAddr(cfg)
+		if err != nil {
+			return err
+		}
+		cfg.VolumeLocalListenAddr = listenAddr
+	case VolumeStoreRemote:
+		cfg.VolumeStore = VolumeStoreRemote
+		socket := strings.TrimSpace(os.Getenv("SANDBOX_API_VOLUME_REMOTE_SOCKET"))
+		// 107 bytes is the most a Unix socket address holds on Linux.
+		if !filepath.IsAbs(socket) || len(socket) > 107 {
+			return fmt.Errorf("SANDBOX_API_VOLUME_REMOTE_SOCKET must be an absolute path of at most 107 bytes when SANDBOX_API_VOLUME_STORE=remote, got %q", socket)
+		}
+		cfg.VolumeRemoteSocket = socket
+	default:
+		return fmt.Errorf("SANDBOX_API_VOLUME_STORE must be empty, local or remote, got %q", backend)
+	}
+	return nil
+}
+
+// parseLocalURL reads SANDBOX_API_VOLUME_LOCAL_URL without its trailing
+// slash. It takes no path: the object route is served at the root. Errors
+// leave the value out, since a rejected one may hold a secret.
+func parseLocalURL() (string, error) {
+	raw := strings.TrimSpace(os.Getenv("SANDBOX_API_VOLUME_LOCAL_URL"))
+	if raw == "" {
+		return "", fmt.Errorf("SANDBOX_API_VOLUME_LOCAL_URL must be set when SANDBOX_API_VOLUME_STORE=local")
+	}
+	parsed, err := url.Parse(raw)
+	if err == nil && parsed.Scheme == "http" {
+		return "", fmt.Errorf("SANDBOX_API_VOLUME_LOCAL_URL must be an https URL: volume objects are served only on the listener at SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR, which requires TLS with a client certificate")
+	}
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" ||
+		parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || strings.ContainsAny(raw, "?#") {
+		return "", fmt.Errorf("SANDBOX_API_VOLUME_LOCAL_URL must be an https URL with a host and port only: no credentials, path, query or fragment")
+	}
+	return strings.TrimRight(raw, "/"), nil
+}
+
+// parseVolumeLocalListenAddr reads SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR. One
+// port is one socket, so it refuses the port of any other listener here
+// rather than as an EADDRINUSE crash loop that names no variable.
+func parseVolumeLocalListenAddr(cfg *APIConfig) (string, error) {
+	const name = "SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR"
+	addr := defaultVolumeLocalAddr
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		addr = v
+	}
+	if err := validateListenAddr(addr); err != nil {
+		return "", fmt.Errorf("%s must be host:port (e.g. %s), got %q: %w", name, defaultVolumeLocalAddr, addr, err)
+	}
+	for _, other := range []struct{ name, addr string }{
+		{"SANDBOX_API_LISTEN_ADDR", cfg.ListenAddr},
+		{"SANDBOX_API_GRPC_LISTEN_ADDR", cfg.GRPCListenAddr},
+		{"SANDBOX_API_METRICS_LISTEN_ADDR", cfg.MetricsListenAddr},
+	} {
+		if other.addr != "" && listenPort(addr) == listenPort(other.addr) {
+			return "", fmt.Errorf("%s (%q) must not use the same port as %s (%q)", name, addr, other.name, other.addr)
+		}
+	}
+	return addr, nil
+}
+
+// MetricsOnMainListener reports whether /metrics is served by the public API
+// listener rather than by a dedicated one. One port is one socket, so naming
+// the ListenAddr port counts as sharing it.
+func (c *APIConfig) MetricsOnMainListener() bool {
+	if c.MetricsListenAddr == "" {
+		return true
+	}
+	return listenPort(c.MetricsListenAddr) == listenPort(c.ListenAddr)
+}
+
+// ResolvedMetricsListenAddr returns the address /metrics is reachable on.
+func (c *APIConfig) ResolvedMetricsListenAddr() string {
+	if c.MetricsOnMainListener() {
+		return c.ListenAddr
+	}
+	return c.MetricsListenAddr
+}
+
+// validateListenAddr leaves the host unconstrained: empty (":9100"), loopback
+// and an explicit interface are all bindable.
+func validateListenAddr(v string) error {
+	_, port, err := net.SplitHostPort(strings.TrimSpace(v))
+	if err != nil {
+		return err
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p <= 0 || p > 65535 {
+		return fmt.Errorf("invalid port %q", port)
+	}
+	return nil
+}
+
+// listenPort resolves a port the way net.Listen will, so addresses that name
+// one socket compare equal. That covers a padded number (":08080") and a
+// service name (":http"), either of which would otherwise look like a port of
+// its own and start a second server that cannot bind. Metrics and volume
+// addresses are numeric by validateListenAddr, but ListenAddr and
+// GRPCListenAddr are not.
+func listenPort(addr string) string {
+	_, port, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return ""
+	}
+	if n, err := net.LookupPort("tcp", port); err == nil {
+		return strconv.Itoa(n)
+	}
+	return port
+}
+
+// sameListenHost treats every spelling of "all interfaces" as one host, so
+// ":8080" and "[::]:8080" are not a conflict.
+func sameListenHost(a, b string) bool {
+	hostA, _, errA := net.SplitHostPort(strings.TrimSpace(a))
+	hostB, _, errB := net.SplitHostPort(strings.TrimSpace(b))
+	if errA != nil || errB != nil {
+		return false
+	}
+	if isWildcardHost(hostA) && isWildcardHost(hostB) {
+		return true
+	}
+	return hostA == hostB
+}
+
+func isWildcardHost(host string) bool {
+	switch strings.TrimSpace(host) {
+	case "", "0.0.0.0", "::":
+		return true
+	}
+	return false
+}
+
+// parseLimit reads a concurrency limit from the environment into dst, leaving
+// the default when the variable is unset. 0 means no limit.
+func parseLimit(name string, dst *int) error {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 || n > math.MaxInt32 {
+		return fmt.Errorf("%s must be an integer between 0 and %d, got %q", name, math.MaxInt32, v)
+	}
+	*dst = n
+	return nil
+}
+
+// parseKeySet splits a comma-separated list of API keys, dropping blanks.
+func parseKeySet(raw string) map[string]struct{} {
+	keys := make(map[string]struct{})
+	for k := range strings.SplitSeq(raw, ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			keys[k] = struct{}{}
+		}
+	}
+	return keys
+}

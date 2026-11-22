@@ -1,0 +1,53 @@
+services:
+  - type: web
+    name: iecloudbase
+    env: image
+    image:
+      url: ghcr.io/ieenterprises/iecloudbase:main
+    region: eu-north-1
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: PORT
+        value: "4000"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: iecloudbase-db
+          property: connectionString
+      - key: DOKPLOY_API_BASE
+        value: https://paas.iecloudbase.com
+      - key: DOKPLOY_APPS_DOMAIN
+        value: apps.iecloudbase.com
+      - key: STALWART_API_BASE
+        value: https://mail-admin.iecloudbase.com
+      - key: SANDBOX_API_BASE
+        value: https://sandbox.iecloudbase.com
+      - key: RECALL_VAULT_PUBLIC_URL
+        value: https://mail.iecloudbase.com
+      - key: NAMECOM_API_BASE
+        value: https://api.dev.name.com
+      - key: MARKUP_USD
+        value: "3.00"
+      - key: DOKPLOY_API_KEY
+        sync: false
+      - key: STALWART_ADMIN_USER
+        sync: false
+      - key: STALWART_ADMIN_PASS
+        sync: false
+      - key: SANDBOX_API_KEY
+        sync: false
+      - key: COMPOSIO_API_KEY
+        sync: false
+      - key: NAMECOM_USERNAME
+        sync: false
+      - key: NAMECOM_TOKEN
+        sync: false
+      - key: RECALL_VAULT_SECRET
+        sync: false
+
+databases:
+  - name: iecloudbase-db
+    databaseName: iecloudbase
+    user: iecloudbase
+    region: eu-north-1
+    plan: free

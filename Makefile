@@ -1,0 +1,182 @@
+SHELL := /bin/bash
+
+MODULE  := github.com/n8n-io/sandbox-service
+BINDIR  := bin
+
+# The gofmt of the Go that go.mod selects. The go command switches to that
+# version on its own; a gofmt found on PATH does not.
+GOFMT = $(shell go env GOROOT)/bin/gofmt
+
+SHELL_FILES := $(shell git ls-files '*.sh')
+
+.PHONY: all daemon runner runner-docker runner-firecracker api test test-integration proto-volumestore clean docker docker-local docker-arm64 docker-amd64 docker-api-arm64 docker-api-amd64 docker-runner-arm64 docker-runner-amd64 docker-firecracker-runner-amd64 docker-sandbox-arm64 docker-sandbox-amd64 fmt fmt-check vet shell-fmt shell-fmt-check shell-lint check-shell-files playground up down smoke sdk sdk-install sdk-build sdk-typecheck sdk-test sdk-fmt sdk-fmt-check sdk-lint
+
+all: daemon runner api
+
+## fmt: Format all Go files.
+fmt:
+	$(GOFMT) -w .
+
+## fmt-check: Check that all Go files are gofmt-formatted.
+fmt-check:
+	@unformatted=$$($(GOFMT) -l .); status=$$?; \
+	if [ $$status -ne 0 ]; then \
+		exit $$status; \
+	fi; \
+	if [ -n "$$unformatted" ]; then \
+		echo "Files not formatted:"; \
+		echo "$$unformatted"; \
+		exit 1; \
+	fi
+
+## vet: Run go vet on all packages.
+vet:
+	go vet ./...
+
+## shell-fmt: Format all shell scripts with shfmt.
+shell-fmt: check-shell-files
+	shfmt -w $(SHELL_FILES)
+
+## shell-fmt-check: Check that all shell scripts are shfmt-formatted.
+shell-fmt-check: check-shell-files
+	shfmt -d $(SHELL_FILES)
+
+## shell-lint: Run shellcheck on all shell scripts.
+shell-lint: check-shell-files
+	shellcheck -x $(SHELL_FILES)
+
+# shfmt reads stdin when given no paths, so fail loudly instead of hanging.
+check-shell-files:
+	@test -n "$(SHELL_FILES)" || { echo "No shell files found; run from a git checkout."; exit 1; }
+
+## daemon: Build the sandbox daemon (static, Linux).
+daemon:
+	CGO_ENABLED=0 GOOS=linux go build -o $(BINDIR)/daemon ./cmd/daemon
+
+## runner: Build the runner services (Linux).
+runner: runner-docker runner-firecracker
+
+## runner-docker: Build the Docker/sysbox runner service (Linux).
+runner-docker:
+	GOOS=linux go build -o $(BINDIR)/runner-docker ./cmd/runner-docker
+
+## runner-firecracker: Build the Firecracker runner service (Linux).
+runner-firecracker:
+	GOOS=linux go build -o $(BINDIR)/runner-firecracker ./cmd/runner-firecracker.ee
+
+## api: Build the public API gateway server (Linux).
+api:
+	GOOS=linux go build -o $(BINDIR)/api ./cmd/api
+
+## playground: Start the playground UI (http://localhost:5173).
+playground: sdk-install sdk-build
+	cd playground && npm install && npm start
+
+## test: Run all tests with the race detector.
+test:
+	go test -race ./...
+
+# -count=1: the test cache cannot see the database, so a cached pass would not
+# contact it at all.
+# -p 1: each package creates the schema on first use, and Postgres can fail two
+# concurrent CREATE TABLE IF NOT EXISTS for the same table.
+## test-integration: Run the Postgres store and registry tests (needs SANDBOX_TEST_POSTGRES_HOST, see docs/development.md).
+test-integration:
+	@if [ -z "$$SANDBOX_TEST_POSTGRES_HOST" ]; then \
+		echo "SANDBOX_TEST_POSTGRES_HOST is not set; the tests would all skip. See docs/development.md." >&2; \
+		exit 1; \
+	fi
+	go test -race -count=1 -tags integration -p 1 ./internal/api/store/ ./internal/api/registry/
+
+## proto-volumestore: Regenerate the volume store helper's gRPC code (needs protoc, protoc-gen-go and protoc-gen-go-grpc on PATH).
+proto-volumestore:
+	protoc -I proto --go_out=. --go_opt=module=$(MODULE) --go-grpc_out=. --go-grpc_opt=module=$(MODULE) volumestore/v1/volumestore.proto
+
+## clean: Remove compiled binaries.
+clean:
+	rm -rf $(BINDIR)
+
+ARCH := $(shell uname -m | sed 's/aarch64/arm64/' | sed 's/x86_64/amd64/')
+
+## docker: Build API + runner images for linux/amd64.
+docker: docker-api-amd64 docker-runner-amd64 docker-firecracker-runner-amd64
+
+## docker-local: Build API, runner, and sandbox images for current architecture.
+docker-local: docker-api-$(ARCH) docker-runner-$(ARCH) docker-sandbox-$(ARCH)
+
+## docker-arm64: Build API, runner, and sandbox images for linux/arm64.
+docker-arm64: docker-api-arm64 docker-runner-arm64 docker-sandbox-arm64
+
+## docker-amd64: Build API, Docker runner, Firecracker runner, and sandbox images for linux/amd64.
+docker-amd64: docker-api-amd64 docker-runner-amd64 docker-firecracker-runner-amd64 docker-sandbox-amd64
+
+## docker-api-arm64: Build the API image for linux/arm64.
+docker-api-arm64:
+	docker buildx build -f Dockerfile.api --platform linux/arm64 -t n8n-sandbox-service-api:latest-arm64 --load .
+
+## docker-api-amd64: Build the API image for linux/amd64.
+docker-api-amd64:
+	docker buildx build -f Dockerfile.api --platform linux/amd64 -t n8n-sandbox-service-api:latest-amd64 --load .
+
+## docker-runner-arm64: Build the runner image for linux/arm64.
+docker-runner-arm64:
+	docker buildx build -f Dockerfile.runner-dind --platform linux/arm64 -t n8n-sandbox-service-runner-dind:latest-arm64 --load .
+
+## docker-runner-amd64: Build the runner image for linux/amd64.
+docker-runner-amd64:
+	docker buildx build -f Dockerfile.runner-dind --platform linux/amd64 -t n8n-sandbox-service-runner-dind:latest-amd64 --load .
+
+## docker-firecracker-runner-amd64: Build the Firecracker runner image for linux/amd64.
+docker-firecracker-runner-amd64:
+	docker buildx build -f Dockerfile.ee.runner-firecracker --platform linux/amd64 -t n8n-sandbox-service-runner-firecracker:latest-amd64 --load .
+
+## docker-sandbox-arm64: Build the sandbox image for linux/arm64.
+docker-sandbox-arm64:
+	docker buildx build -f Dockerfile.sandbox --platform linux/arm64 -t n8n-sandbox:latest-arm64 --load .
+
+## docker-sandbox-amd64: Build the sandbox image for linux/amd64.
+docker-sandbox-amd64:
+	docker buildx build -f Dockerfile.sandbox --platform linux/amd64 -t n8n-sandbox:latest-amd64 --load .
+
+## sdk: Install, build, typecheck, and test the SDK.
+sdk: sdk-install sdk-build sdk-typecheck sdk-test
+
+## sdk-install: Install SDK dependencies.
+sdk-install:
+	cd sdk && pnpm install
+
+## sdk-build: Build the SDK.
+sdk-build:
+	cd sdk && pnpm build
+
+## sdk-typecheck: Typecheck the SDK.
+sdk-typecheck:
+	cd sdk && pnpm typecheck
+
+## sdk-test: Run SDK tests.
+sdk-test:
+	cd sdk && pnpm test
+
+## sdk-fmt: Format SDK code with oxfmt.
+sdk-fmt:
+	cd sdk && pnpm fmt
+
+## sdk-fmt-check: Check SDK code formatting.
+sdk-fmt-check:
+	cd sdk && pnpm fmt:check
+
+## sdk-lint: Lint SDK code with oxlint.
+sdk-lint:
+	cd sdk && pnpm lint
+
+## up: Bootstrap local .tls/ if needed, build images, start Compose (mTLS required).
+up:
+	./scripts/run-locally.sh
+
+## down: Stop and remove all local Compose services (same compose files as make up).
+down:
+	bash scripts/docker-compose-local.sh down
+
+## smoke: Core API smoke test against local compose (create, exec, DNS, HTTPS, files, egress public/none).
+smoke:
+	sh scripts/smoke-local-sandbox.sh

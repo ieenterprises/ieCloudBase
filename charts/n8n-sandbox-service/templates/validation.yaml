@@ -1,0 +1,305 @@
+{{- if hasKey .Values "sysboxRunner" -}}
+{{- $old := .Values.sysboxRunner -}}
+{{- if and (kindIs "map" $old) (hasKey $old "enabled") (not $old.enabled) -}}
+{{- fail "sysboxRunner.enabled=false was replaced: set dataPlane.mode=external to disable the in-cluster runner. See the chart README section 'Migrating from 0.3.x'" -}}
+{{- end -}}
+{{- fail "sysboxRunner was replaced by the runner block: shared keys keep their names under runner.*; runtime and scheduling moved to runner.sysbox.*. See the chart README section 'Migrating from 0.3.x'" -}}
+{{- end -}}
+{{- if hasKey .Values "dindRunner" -}}
+{{- fail "dindRunner is not a chart value: use the runner block with runner.isolation=privileged. See the chart README section 'Migrating from 0.3.x'" -}}
+{{- end -}}
+{{- if eq .Values.dataPlane.mode "sysbox" -}}
+{{- fail "dataPlane.mode=sysbox was renamed: set dataPlane.mode=in-cluster. sysbox is the default runner.isolation. See the chart README section 'Migrating from 0.3.x'" -}}
+{{- end -}}
+{{- if eq .Values.dataPlane.mode "dind" -}}
+{{- fail "dataPlane.mode=dind was renamed: set dataPlane.mode=in-cluster and runner.isolation=privileged. See the chart README section 'Migrating from 0.3.x'" -}}
+{{- end -}}
+{{- if not (has .Values.dataPlane.mode (list "in-cluster" "external")) -}}
+{{- fail "dataPlane.mode must be one of: in-cluster, external" -}}
+{{- end -}}
+{{- if not (has .Values.tls.mode (list "existingSecret" "certManager")) -}}
+{{- fail "tls.mode must be one of: existingSecret, certManager" -}}
+{{- end -}}
+{{- if hasKey .Values.runner "enabled" -}}
+{{- fail "runner.enabled was removed: set dataPlane.mode=external to disable the in-cluster runner" -}}
+{{- end -}}
+{{- if hasKey .Values.networkPolicy "sysboxRunner" -}}
+{{- fail "networkPolicy.sysboxRunner was renamed: set networkPolicy.runner instead" -}}
+{{- end -}}
+{{- if hasKey .Values.monitoring.serviceMonitor "sysboxRunner" -}}
+{{- fail "monitoring.serviceMonitor.sysboxRunner was renamed: set monitoring.serviceMonitor.runner instead" -}}
+{{- end -}}
+{{- if not (has .Values.runner.isolation (list "sysbox" "privileged")) -}}
+{{- fail "runner.isolation must be one of: sysbox, privileged" -}}
+{{- end -}}
+{{- if eq .Values.runner.isolation "privileged" -}}
+{{- if ne .Values.runner.acknowledgePrivileged true -}}
+{{- fail "runner.isolation=privileged runs the runner container with privileged: true. An escape from the runner container reaches the node. The namespace needs Pod Security Admission level `privileged`. Set runner.acknowledgePrivileged=true to accept this trade-off, or use runner.isolation=sysbox on nodes that support sysbox." -}}
+{{- end -}}
+{{- if eq .Values.runner.privileged.runtime.runtimeClassName "sysbox-runc" -}}
+{{- fail "runner.privileged.runtime.runtimeClassName=sysbox-runc conflicts with runner.isolation=privileged: use runner.isolation=sysbox for sysbox nodes" -}}
+{{- end -}}
+{{- end -}}
+{{- if eq .Values.dataPlane.mode "in-cluster" -}}
+{{- if not (hasSuffix (printf ":%v" .Values.runner.service.httpPort) .Values.runner.config.listenAddr) -}}
+{{- fail "runner.config.listenAddr port must match runner.service.httpPort" -}}
+{{- end -}}
+{{- if not (hasSuffix (printf ":%v" .Values.runner.service.controlGrpcPort) .Values.runner.config.controlGrpcListenAddr) -}}
+{{- fail "runner.config.controlGrpcListenAddr port must match runner.service.controlGrpcPort" -}}
+{{- end -}}
+{{- end -}}
+{{- if eq .Values.dataPlane.mode "in-cluster" -}}
+{{- $dockerDataRoot := .Values.runner.dockerDataRoot -}}
+{{- if and $dockerDataRoot.persistence.enabled (ne .Values.runner.isolation "privileged") -}}
+{{- fail "runner.dockerDataRoot.persistence.enabled requires runner.isolation=privileged. Sysbox uses a bounded emptyDir for the inner Docker data root, even with disk quotas. See the chart README section 'Docker Data Root'" -}}
+{{- end -}}
+{{- end -}}
+{{- if and (eq .Values.dataPlane.mode "in-cluster") (gt (int .Values.runner.config.defaultDiskQuotaMb) 0) -}}
+{{- $dockerDataRoot := .Values.runner.dockerDataRoot -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString .Values.runner.config.diskQuotaPoolSizeGb)) -}}
+{{- fail (printf "runner.config.diskQuotaPoolSizeGb must be a positive whole number of GB when runner.config.defaultDiskQuotaMb is above 0 (got %q): the derived pool size scales with runner.config.capacityTotal and can outgrow the volume that holds the pool image. See the chart README section 'Disk Quotas'" (toString .Values.runner.config.diskQuotaPoolSizeGb)) -}}
+{{- end -}}
+{{- if not .Values.runner.config.diskQuotaPoolPath -}}
+{{- $volumeSize := ternary $dockerDataRoot.persistence.size (($dockerDataRoot.emptyDir | default dict).sizeLimit | default "") $dockerDataRoot.persistence.enabled | toString -}}
+{{- $volumeKey := ternary "runner.dockerDataRoot.persistence.size" "runner.dockerDataRoot.emptyDir.sizeLimit" $dockerDataRoot.persistence.enabled -}}
+{{- if not (regexMatch "^[0-9]+Gi?$" $volumeSize) -}}
+{{- fail (printf "%s must be a whole number of G or Gi (got %q): the disk-quota pool image lives on that volume, and the chart checks that runner.config.diskQuotaPoolSizeGb fits it" $volumeKey $volumeSize) -}}
+{{- end -}}
+{{- $volumeSizeGb := trimSuffix "G" (trimSuffix "Gi" $volumeSize) | int -}}
+{{- if gt (int .Values.runner.config.diskQuotaPoolSizeGb) $volumeSizeGb -}}
+{{- fail (printf "runner.config.diskQuotaPoolSizeGb (%v) must not exceed the docker data root size (%s): the quota pool image lives on that volume" .Values.runner.config.diskQuotaPoolSizeGb $volumeSize) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if eq .Values.dataPlane.mode "in-cluster" -}}
+{{- $maxBytes := include "n8n-sandbox-service.runnerVolumeCacheMaxBytes" . | default "21474836480" -}}
+{{- if not (regexMatch "^[1-9][0-9]{0,15}$" $maxBytes) -}}
+{{- fail (printf "runner.config.volumeCacheMaxBytes must be a positive whole number of bytes, at most 16 digits (got %q)" $maxBytes) -}}
+{{- end -}}
+{{- if .Values.runner.volumeCache.emptyDir.enabled -}}
+{{- $sizeLimit := .Values.runner.volumeCache.emptyDir.sizeLimit | toString -}}
+{{- if not (regexMatch "^[1-9][0-9]*Gi$" $sizeLimit) -}}
+{{- fail (printf "runner.volumeCache.emptyDir.sizeLimit must be a whole number of Gi when the emptyDir is enabled (got %q). See the chart README section 'Volume Cache'" $sizeLimit) -}}
+{{- end -}}
+{{- if gt (div (mul (int64 $maxBytes) 21) 20) (mul (int64 (trimSuffix "Gi" $sizeLimit)) 1073741824) -}}
+{{- fail (printf "runner.volumeCache.emptyDir.sizeLimit (%s) must hold runner.config.volumeCacheMaxBytes (%s, default 20 GiB) and 5%% more: the kubelet evicts a pod whose emptyDir outgrows its limit" $sizeLimit $maxBytes) -}}
+{{- end -}}
+{{- end -}}
+{{- $cacheDir := include "n8n-sandbox-service.runnerVolumeCacheDir" . -}}
+{{- /* The runner resolves a relative default against its working dir; an explicit dir and a mount path must be absolute. */ -}}
+{{- if and (or (default "" .Values.runner.config.volumeCacheDir | toString | trim) .Values.runner.volumeCache.emptyDir.enabled) (not (isAbs $cacheDir)) -}}
+{{- fail (printf "the runner's volume cache dir (%s) must be an absolute path" $cacheDir) -}}
+{{- end -}}
+{{- if isAbs $cacheDir -}}
+{{- if eq $cacheDir "/" -}}
+{{- fail "the runner's volume cache dir must not be /: the runner empties the cache dir at startup" -}}
+{{- end -}}
+{{- $dataDir := include "n8n-sandbox-service.runnerDataDir" . | clean -}}
+{{- if and (isAbs $dataDir) (or (eq $cacheDir $dataDir) (hasPrefix (printf "%s/" $cacheDir) $dataDir)) -}}
+{{- fail (printf "the runner's volume cache dir (%s) must not be the data dir (%s) or contain it: the runner empties the cache dir at startup" $cacheDir $dataDir) -}}
+{{- end -}}
+{{- range $dockerDir := list "/var/lib/docker" (include "n8n-sandbox-service.runnerDockerDataMountPath" $ | clean) -}}
+{{- if or (eq $cacheDir $dockerDir) (hasPrefix (printf "%s/" $dockerDir) $cacheDir) (hasPrefix (printf "%s/" $cacheDir) $dockerDir) -}}
+{{- fail (printf "the runner's volume cache dir (%s) must not be %s, inside it or contain it: the runner empties the cache dir at startup" $cacheDir $dockerDir) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $apiMetricsAddr := include "n8n-sandbox-service.apiMetricsListenAddr" . -}}
+{{- if $apiMetricsAddr -}}
+{{- $apiListenAddr := .Values.api.config.listenAddr | toString | trim -}}
+{{- $apiGrpcAddr := .Values.api.config.grpcListenAddr | toString | trim -}}
+{{/*
+Whole-address shape, not just the last segment: net.SplitHostPort rejects a
+bare host, and an unbracketed IPv6 address ("::1:9100") for too many colons.
+*/}}
+{{- if not (regexMatch `^(\[[^]]*\]|[^:]*):[0-9]{1,5}$` $apiMetricsAddr) -}}
+{{- fail (printf "api.config.metricsListenAddr must be host:port with a numeric port, e.g. \":9100\" or \"[::]:9100\" (got %q)" $apiMetricsAddr) -}}
+{{- end -}}
+{{- $apiMetricsPort := last (splitList ":" $apiMetricsAddr) -}}
+{{/* Match the range the API accepts, so a bad port fails the render rather than the container. */}}
+{{- if or (lt (atoi $apiMetricsPort) 1) (gt (atoi $apiMetricsPort) 65535) -}}
+{{- fail (printf "api.config.metricsListenAddr port must be between 1 and 65535 (got %q)" $apiMetricsAddr) -}}
+{{- end -}}
+{{/*
+The comparisons below are numeric, and Helm cannot resolve a service name the
+way net.Listen does, so a named port here would silently compare as 0.
+*/}}
+{{- range $key, $addr := dict "listenAddr" $apiListenAddr "grpcListenAddr" $apiGrpcAddr -}}
+{{- if not (regexMatch "^[0-9]{1,5}$" (last (splitList ":" $addr))) -}}
+{{- fail (printf "api.config.%s (%q) must use a numeric port when api.config.metricsListenAddr is set, so the chart can tell the ports apart" $key $addr) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq (atoi $apiMetricsPort) (atoi (last (splitList ":" $apiGrpcAddr))) -}}
+{{- fail (printf "api.config.metricsListenAddr (%q) must not use the port of api.config.grpcListenAddr (%q): one port cannot serve both" $apiMetricsAddr $apiGrpcAddr) -}}
+{{- end -}}
+{{- $apiListenPort := last (splitList ":" $apiListenAddr) -}}
+{{/*
+api.service.httpPort and grpcPort are Service-facing numbers, independent of
+the container ports the API binds (api-service.yaml reaches those by name). The
+metrics Service port is the container port itself, so it can land on one of
+them and leave the Service listing a port twice, which is invalid.
+*/}}
+{{- if ne (atoi $apiMetricsPort) (atoi $apiListenPort) -}}
+{{- $httpServicePort := atoi (toString .Values.api.service.httpPort) -}}
+{{- $grpcServicePort := atoi (toString .Values.api.service.grpcPort) -}}
+{{- if or (eq (atoi $apiMetricsPort) $httpServicePort) (eq (atoi $apiMetricsPort) $grpcServicePort) -}}
+{{- fail (printf "api.config.metricsListenAddr (%q) repeats an API Service port (api.service.httpPort=%v, api.service.grpcPort=%v): a Service cannot list one port twice" $apiMetricsAddr .Values.api.service.httpPort .Values.api.service.grpcPort) -}}
+{{- end -}}
+{{- end -}}
+{{- $metricsHost := trimSuffix "]" (trimPrefix "[" (trimSuffix (printf ":%s" $apiMetricsPort) $apiMetricsAddr)) -}}
+{{/* Brackets stripped and wildcards folded together, matching sameListenHost in internal/api/config. */}}
+{{- if eq (atoi $apiMetricsPort) (atoi $apiListenPort) -}}
+{{- $wildcards := list "" "0.0.0.0" "::" -}}
+{{- $listenHost := trimSuffix "]" (trimPrefix "[" (trimSuffix (printf ":%s" $apiListenPort) $apiListenAddr)) -}}
+{{- if and (ne $metricsHost $listenHost) (not (and (has $metricsHost $wildcards) (has $listenHost $wildcards))) -}}
+{{- fail (printf "api.config.metricsListenAddr (%q) uses the port of api.config.listenAddr (%q) but a different host: leave it empty to serve /metrics on the API listener" $apiMetricsAddr $apiListenAddr) -}}
+{{- end -}}
+{{- end -}}
+{{/*
+A ServiceMonitor scrapes the pod IP, which a loopback-only listener never
+accepts. Binding loopback is still valid for a sidecar that shares the pod
+network namespace, so this only fails when something outside would scrape it.
+Gated on a dedicated port: on the shared one the scrape follows listenAddr, and
+a loopback API fails its readiness probe long before metrics matter.
+*/}}
+{{- if and .Values.monitoring.serviceMonitor.enabled .Values.monitoring.serviceMonitor.api.enabled (include "n8n-sandbox-service.apiMetricsPort" .) -}}
+{{- if or (hasPrefix "127." $metricsHost) (eq $metricsHost "localhost") (eq $metricsHost "::1") -}}
+{{- fail (printf "api.config.metricsListenAddr (%q) binds loopback, which the API ServiceMonitor cannot scrape: bind all interfaces (\":%s\") or set monitoring.serviceMonitor.api.enabled=false" $apiMetricsAddr $apiMetricsPort) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $volumeStore := include "n8n-sandbox-service.apiVolumeStore" . -}}
+{{- if and $volumeStore (ne $volumeStore "local") -}}
+{{- fail (printf "api.config.volumeStore must be empty or local (got %q): set remote through api.extraEnv. See the chart README section 'API Sidecars'" $volumeStore) -}}
+{{- end -}}
+{{- range .Values.api.extraEnv -}}
+{{- if and (kindIs "map" .) (eq (toString .name) "SANDBOX_API_VOLUME_STORE") (eq (lower (trim (toString .value))) "local") -}}
+{{- fail "api.extraEnv sets SANDBOX_API_VOLUME_STORE=local: set api.config.volumeStore=local instead, so the chart opens the volume-objects port and checks the setup" -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $volumeStore "local" -}}
+{{/* Several API pods need a shared store directory and signing key, which the API does not support yet. */}}
+{{- if .Values.api.autoscaling.enabled -}}
+{{- fail "api.config.volumeStore=local requires api.autoscaling.enabled=false: the store keeps volume objects on one API pod's volume and signs read URLs with a key of that pod's own. See the chart README section 'Volume Store'" -}}
+{{- end -}}
+{{- if ne (int .Values.api.replicaCount) 1 -}}
+{{- fail (printf "api.config.volumeStore=local requires api.replicaCount=1 (got %v): the store keeps volume objects on one API pod's volume and signs read URLs with a key of that pod's own. See the chart README section 'Volume Store'" .Values.api.replicaCount) -}}
+{{- end -}}
+{{- if not .Values.api.persistence.enabled -}}
+{{- fail "api.config.volumeStore=local requires api.persistence.enabled: the store keeps volume objects in api.config.dataDir, which is otherwise lost with the pod. See the chart README section 'Volume Store'" -}}
+{{- end -}}
+{{- $volumeAddr := .Values.api.config.volumeLocalListenAddr | default "" | toString | trim -}}
+{{- if not (regexMatch `^(\[[^]]*\]|[^:]*):[0-9]{1,5}$` $volumeAddr) -}}
+{{- fail (printf "api.config.volumeLocalListenAddr must be host:port with a numeric port, e.g. \":8443\" (got %q)" $volumeAddr) -}}
+{{- end -}}
+{{- $volumePortString := last (splitList ":" $volumeAddr) -}}
+{{- $volumePort := atoi $volumePortString -}}
+{{- if or (lt $volumePort 1) (gt $volumePort 65535) -}}
+{{- fail (printf "api.config.volumeLocalListenAddr port must be between 1 and 65535 (got %q)" $volumeAddr) -}}
+{{- end -}}
+{{- $volumeHost := trimSuffix "]" (trimPrefix "[" (trimSuffix (printf ":%s" $volumePortString) $volumeAddr)) -}}
+{{- if or (hasPrefix "127." $volumeHost) (eq $volumeHost "localhost") (eq $volumeHost "::1") -}}
+{{- fail (printf "api.config.volumeLocalListenAddr (%q) binds loopback, which runners cannot reach: bind all interfaces (\":%d\")" $volumeAddr $volumePort) -}}
+{{- end -}}
+{{/* Numeric ports only, as for the metrics port: Helm cannot resolve a service name. */}}
+{{- range $key, $addr := dict "listenAddr" (.Values.api.config.listenAddr | toString | trim) "grpcListenAddr" (.Values.api.config.grpcListenAddr | toString | trim) -}}
+{{- if not (regexMatch "^[0-9]{1,5}$" (last (splitList ":" $addr))) -}}
+{{- fail (printf "api.config.%s (%q) must use a numeric port when api.config.volumeStore=local, so the chart can tell the ports apart" $key $addr) -}}
+{{- end -}}
+{{- if eq $volumePort (atoi (last (splitList ":" $addr))) -}}
+{{- fail (printf "api.config.volumeLocalListenAddr (%q) must not use the port of api.config.%s (%q): one port cannot serve both" $volumeAddr $key $addr) -}}
+{{- end -}}
+{{- end -}}
+{{/* api-deployment.yaml renders the http and grpc container ports as 8080 and 9090 whatever the addresses say. */}}
+{{- if has $volumePort (list 8080 9090) -}}
+{{- fail (printf "api.config.volumeLocalListenAddr (%q) must not use port 8080 or 9090: the API container's http and grpc ports" $volumeAddr) -}}
+{{- end -}}
+{{- with include "n8n-sandbox-service.apiMetricsPort" . -}}
+{{- if eq $volumePort (atoi .) -}}
+{{- fail (printf "api.config.volumeLocalListenAddr (%q) must not use the port of api.config.metricsListenAddr (%q): one port cannot serve both" $volumeAddr (include "n8n-sandbox-service.apiMetricsListenAddr" $)) -}}
+{{- end -}}
+{{- end -}}
+{{- $volumeServicePort := include "n8n-sandbox-service.scalarString" .Values.api.service.volumeObjectsPort -}}
+{{- if or (not (regexMatch "^[1-9][0-9]{0,4}$" $volumeServicePort)) (gt (atoi $volumeServicePort) 65535) -}}
+{{- fail (printf "api.service.volumeObjectsPort must be a port between 1 and 65535 (got %q)" $volumeServicePort) -}}
+{{- end -}}
+{{- $servicePorts := dict "api.service.httpPort" (atoi (toString .Values.api.service.httpPort)) "api.service.grpcPort" (atoi (toString .Values.api.service.grpcPort)) -}}
+{{- with include "n8n-sandbox-service.apiMetricsPort" . -}}
+{{- $_ := set $servicePorts "the metrics port of api.config.metricsListenAddr" (atoi .) -}}
+{{- end -}}
+{{- range $key, $port := $servicePorts -}}
+{{- if eq (atoi $volumeServicePort) $port -}}
+{{- fail (printf "api.service.volumeObjectsPort (%s) repeats %s: a Service cannot list one port twice" $volumeServicePort $key) -}}
+{{- end -}}
+{{- end -}}
+{{- $volumeUrl := .Values.api.config.volumeLocalUrl | default "" | toString | trim -}}
+{{- if and (not $volumeUrl) (eq .Values.dataPlane.mode "external") -}}
+{{- fail "api.config.volumeLocalUrl is required with api.config.volumeStore=local and dataPlane.mode=external: the default names the API Service, which runners outside the cluster cannot resolve. Its host must be a SAN of the API registration certificate. See the chart README section 'Volume Store'" -}}
+{{- end -}}
+{{/* A host name, an IPv4 address or a bracketed IPv6 address, and an optional port. */}}
+{{- $volumeUrlPort := regexFind `:[0-9]+/?$` $volumeUrl | trimPrefix ":" | trimSuffix "/" -}}
+{{- if and $volumeUrl (or (not (regexMatch `^https://(\[([0-9A-Fa-f]{0,4}:){2,7}([0-9A-Fa-f]{1,4}|[0-9]{1,3}(\.[0-9]{1,3}){3})?\]|[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?)(:[0-9]{1,5})?/?$` $volumeUrl)) (and $volumeUrlPort (or (lt (atoi $volumeUrlPort) 1) (gt (atoi $volumeUrlPort) 65535)))) -}}
+{{- fail "api.config.volumeLocalUrl must be an https URL with a host name or IP address and an optional port between 1 and 65535 only, e.g. https://sandbox-api.example.internal:8443: no credentials, path, query or fragment" -}}
+{{- end -}}
+{{/* An env entry overrides the chart's, so the API would no longer serve where the chart opened ports. */}}
+{{- range .Values.api.extraEnv -}}
+{{- if and (kindIs "map" .) (has (toString .name) (list "SANDBOX_API_VOLUME_STORE" "SANDBOX_API_VOLUME_LOCAL_LISTEN_ADDR" "SANDBOX_API_VOLUME_LOCAL_URL")) -}}
+{{- fail (printf "api.extraEnv sets %s, which the chart sets with api.config.volumeStore=local: set api.config.volumeLocalListenAddr or api.config.volumeLocalUrl instead" .name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $autoscaling := .Values.api.autoscaling -}}
+{{- if $autoscaling.enabled -}}
+{{- if ne .Values.api.config.store "postgres" -}}
+{{- fail "api.autoscaling.enabled requires api.config.store=postgres: with sqlite every API pod keeps its own store and runner registry. See the chart README section 'API Autoscaling'" -}}
+{{- end -}}
+{{- if .Values.api.persistence.enabled -}}
+{{- fail "api.autoscaling.enabled requires api.persistence.enabled=false: every API pod would mount the one volume claim, and the postgres store keeps its state in the database. See the chart README section 'API Autoscaling'" -}}
+{{- end -}}
+{{- range $key := list "minReplicas" "maxReplicas" -}}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString (index $autoscaling $key))) -}}
+{{- fail (printf "api.autoscaling.%s must be a whole number of at least 1 (got %q)" $key (toString (index $autoscaling $key))) -}}
+{{- end -}}
+{{- end -}}
+{{- if lt (int $autoscaling.maxReplicas) (int $autoscaling.minReplicas) -}}
+{{- fail (printf "api.autoscaling.maxReplicas (%v) must not be below api.autoscaling.minReplicas (%v)" $autoscaling.maxReplicas $autoscaling.minReplicas) -}}
+{{- end -}}
+{{- $cpuTarget := $autoscaling.targetCPUUtilizationPercentage -}}
+{{- $cpuSet := include "n8n-sandbox-service.autoscalingTargetSet" $cpuTarget -}}
+{{/* No upper bound: use can exceed the CPU request, and the API server allows targets above 100. */}}
+{{- if and $cpuSet (not (regexMatch "^[1-9][0-9]*$" (toString $cpuTarget))) -}}
+{{- fail (printf "api.autoscaling.targetCPUUtilizationPercentage must be a whole number of at least 1 (got %q): set it to null to drop the CPU metric" (toString $cpuTarget)) -}}
+{{- end -}}
+{{- $memoryTarget := $autoscaling.targetMemoryAverageValue -}}
+{{- $memorySet := include "n8n-sandbox-service.autoscalingTargetSet" $memoryTarget -}}
+{{- if and $memorySet (not (regexMatch "^[1-9][0-9]*(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$" (toString $memoryTarget))) -}}
+{{- fail (printf "api.autoscaling.targetMemoryAverageValue must be a whole number with an optional unit, e.g. 700Mi (got %q): leave it empty to drop the memory metric" (toString $memoryTarget)) -}}
+{{- end -}}
+{{- if not (or $cpuSet $memorySet) -}}
+{{- fail "api.autoscaling.enabled requires api.autoscaling.targetCPUUtilizationPercentage, api.autoscaling.targetMemoryAverageValue, or both" -}}
+{{- end -}}
+{{- $cpuRequest := ((.Values.api.resources | default dict).requests | default dict).cpu | default "" | toString | trim -}}
+{{/* The API server accepts a zero request such as "0m", but the HPA cannot divide by it. */}}
+{{- if and $cpuSet (not (regexMatch "^[0.]*[1-9]" $cpuRequest)) -}}
+{{- fail (printf "api.autoscaling.targetCPUUtilizationPercentage requires api.resources.requests.cpu above zero (got %q): the target is a percentage of the CPU request, and the HPA cannot scale on CPU without one" $cpuRequest) -}}
+{{- end -}}
+{{- end -}}
+{{- $gracePeriod := include "n8n-sandbox-service.apiTerminationGracePeriodSeconds" . -}}
+{{- if and $gracePeriod (not (regexMatch "^(0|[1-9][0-9]*)$" $gracePeriod)) -}}
+{{- fail (printf "api.terminationGracePeriodSeconds must be a whole number of seconds (got %q): leave it empty for the Kubernetes default of 30" $gracePeriod) -}}
+{{- end -}}
+{{- if not .Values.auth.existingSecret -}}
+{{- range $key := list "apiKeys" "runnerRegistrationToken" "runnerApiKey" "runnerApiKeys" -}}
+{{- $stringValue := default "" (index $.Values.auth.generated $key) | toString | trim -}}
+{{- if or (eq $stringValue "") (eq (lower $stringValue) "changeme") -}}
+{{- fail (printf "auth.generated.%s must be set to a non-placeholder value when auth.existingSecret is empty" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq (lower (trim (toString .Values.auth.generated.provisionerKeys))) "changeme" -}}
+{{- fail "auth.generated.provisionerKeys must not be a placeholder value; leave it empty to run without provisioner keys" -}}
+{{- end -}}
+{{- if eq (lower (trim (toString .Values.auth.generated.scalerKeys))) "changeme" -}}
+{{- fail "auth.generated.scalerKeys must not be a placeholder value; leave it empty to run without scaler keys" -}}
+{{- end -}}
+{{- end -}}

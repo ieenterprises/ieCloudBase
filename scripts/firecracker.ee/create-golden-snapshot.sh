@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# Builds the golden snapshot (snapshot_mem, snapshot_state, boot.json) on a Firecracker
+# host. Run by the runner at admission (SANDBOX_RUNNER_FIRECRACKER_CREATE_SNAPSHOT_SCRIPT)
+# or by hand as root.
+set -euo pipefail
+
+KERNEL=""
+ROOTFS=""
+DAEMON_BIN=""
+OUT_DIR=""
+MEM_MIB="${MEM_MIB:-512}"
+VCPUS="${VCPUS:-1}"
+FIRECRACKER_BIN="${FIRECRACKER_BIN:-/opt/firecracker/bin/firecracker}"
+JAILER_BIN="${JAILER_BIN:-/opt/firecracker/bin/jailer}"
+JAILER_BASE_DIR="${JAILER_BASE_DIR:-/srv/jailer}"
+GUEST_IP="${GUEST_IP:-172.16.0.10}"
+HOST_TAP_IP_CIDR="${HOST_TAP_IP_CIDR:-172.16.0.1/24}"
+HOST_TAP_IP="${HOST_TAP_IP_CIDR%%/*}"
+HOST_TAP_DEVICE_NAME="${HOST_TAP_DEVICE_NAME:-fc-tap-0}"
+DAEMON_PORT="${DAEMON_PORT:-8081}"
+GUEST_MAC="${GUEST_MAC:-AA:FC:00:00:00:01}"
+# Empty read-only drives for volumes. Firecracker can't add drives after a
+# restore. At most 15: 17 MMIO devices on x86_64, less the rootfs and the NIC.
+VOLUME_DRIVES="${VOLUME_DRIVES:-8}"
+# Paths as Firecracker sees them inside the jail. Recorded in boot.json so a
+# later cold boot can reproduce this VM without guessing.
+KERNEL_JAIL_PATH="/vmlinux"
+ROOTFS_JAIL_PATH="/rootfs.ext4"
+VM_ID="snapshot-$RANDOM-$$"
+NETNS="fc-snapshot-$$"
+JAIL_ROOT=""
+FC_PID=""
+ROOTFS_MOUNT=""
+
+# Prints the required CLI arguments for the snapshot helper.
+usage() {
+	cat >&2 <<EOF
+Usage: $0 --kernel PATH --ext4 PATH --daemon-bin PATH --out DIR
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--kernel)
+		KERNEL="$2"
+		shift 2
+		;;
+	--ext4)
+		ROOTFS="$2"
+		shift 2
+		;;
+	--daemon-bin)
+		DAEMON_BIN="$2"
+		shift 2
+		;;
+	--out)
+		OUT_DIR="$2"
+		shift 2
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		usage
+		echo "unknown argument: $1" >&2
+		exit 1
+		;;
+	esac
+done
+
+if [[ -z "$KERNEL" || -z "$ROOTFS" || -z "$DAEMON_BIN" || -z "$OUT_DIR" ]]; then
+	usage
+	exit 1
+fi
+if ! [[ "$VOLUME_DRIVES" =~ ^([0-9]|1[0-5])$ ]]; then
+	echo "ERROR: VOLUME_DRIVES must be a number from 0 to 15, got ${VOLUME_DRIVES}" >&2
+	exit 1
+fi
+
+KERNEL="$(realpath "$KERNEL")"
+ROOTFS="$(realpath "$ROOTFS")"
+DAEMON_BIN="$(realpath "$DAEMON_BIN")"
+OUT_DIR="$(realpath "$OUT_DIR")"
+SNAPSHOT_MEM="${OUT_DIR}/snapshot_mem"
+SNAPSHOT_STATE="${OUT_DIR}/snapshot_state"
+BOOT_PARAMS="${OUT_DIR}/boot.json"
+BOOT_PARAMS_TMP="${BOOT_PARAMS}.tmp"
+
+# Sends a PUT request to the Firecracker API socket in the jail. Firecracker uses
+# REST over a Unix socket for machine configuration and lifecycle actions.
+api_put() {
+	local path=$1 body=$2
+	curl --fail-with-body --silent --show-error \
+		--unix-socket "${JAIL_ROOT}/firecracker.socket" \
+		-X PUT "http://localhost${path}" \
+		-H "Content-Type: application/json" \
+		-d "$body" >/dev/null
+}
+
+# Sends a PATCH request to the Firecracker API socket. Snapshot creation pauses
+# the VM through PATCH /vm before writing the full snapshot.
+api_patch() {
+	local path=$1 body=$2
+	curl --fail-with-body --silent --show-error \
+		--unix-socket "${JAIL_ROOT}/firecracker.socket" \
+		-X PATCH "http://localhost${path}" \
+		-H "Content-Type: application/json" \
+		-d "$body" >/dev/null
+}
+
+# Best-effort cleanup for all host resources created by this helper. It must be
+# safe after partial setup because failures can happen while mounts/netns exist.
+cleanup() {
+	local exit_code=$?
+	set +e
+	if [[ -n "$FC_PID" ]]; then
+		kill "$FC_PID" >/dev/null 2>&1
+		wait "$FC_PID" >/dev/null 2>&1
+	fi
+	if [[ -n "$ROOTFS_MOUNT" ]]; then
+		umount -l "$ROOTFS_MOUNT" >/dev/null 2>&1
+		rmdir "$ROOTFS_MOUNT" >/dev/null 2>&1
+	fi
+	if [[ -n "$JAIL_ROOT" ]]; then
+		umount -l "${JAIL_ROOT}/vmlinux" >/dev/null 2>&1
+		umount -l "${JAIL_ROOT}/rootfs.ext4" >/dev/null 2>&1
+		umount -l "${JAIL_ROOT}/snapshot_mem" >/dev/null 2>&1
+		umount -l "${JAIL_ROOT}/snapshot_state" >/dev/null 2>&1
+	fi
+	ip netns delete "$NETNS" >/dev/null 2>&1
+	rm -rf "${JAILER_BASE_DIR}/firecracker/${VM_ID}" >/dev/null 2>&1
+	rm -f "$BOOT_PARAMS_TMP" >/dev/null 2>&1
+	exit "$exit_code"
+}
+trap cleanup EXIT
+
+echo "==> Installing sandbox daemon into Firecracker rootfs..."
+ROOTFS_MOUNT="$(mktemp -d)"
+mount -o loop "$ROOTFS" "$ROOTFS_MOUNT"
+install -m 0755 "$DAEMON_BIN" "${ROOTFS_MOUNT}/sandbox-daemon"
+sync
+umount "$ROOTFS_MOUNT"
+rmdir "$ROOTFS_MOUNT"
+ROOTFS_MOUNT=""
+
+echo "==> Preparing snapshot network namespace..."
+ip netns add "$NETNS"
+ip netns exec "$NETNS" ip link set lo up
+ip netns exec "$NETNS" ip tuntap add name "$HOST_TAP_DEVICE_NAME" mode tap
+ip netns exec "$NETNS" ip addr add "$HOST_TAP_IP_CIDR" dev "$HOST_TAP_DEVICE_NAME"
+ip netns exec "$NETNS" ip link set "$HOST_TAP_DEVICE_NAME" up
+
+echo "==> Preparing Firecracker jail..."
+# Mounted before jailer starts, as the runner does: jailer copies the mounts it
+# finds into its own mount namespace, and one made afterwards arrives there
+# without its read-only flag.
+JAIL_ROOT="${JAILER_BASE_DIR}/firecracker/${VM_ID}/root"
+mkdir -p "$OUT_DIR" "$JAIL_ROOT"
+rm -f "$SNAPSHOT_MEM" "$SNAPSHOT_STATE" "$BOOT_PARAMS" "$BOOT_PARAMS_TMP"
+touch "$SNAPSHOT_MEM" "$SNAPSHOT_STATE"
+# Jailer runs Firecracker as uid/gid 1000; virtio block needs RW on rootfs. The
+# kernel is only read, and the runner binds the same file into every jail, so it
+# keeps its owner and is bound read-only.
+chown 1000:1000 "$ROOTFS" "$SNAPSHOT_MEM" "$SNAPSHOT_STATE"
+touch "${JAIL_ROOT}/vmlinux" "${JAIL_ROOT}/rootfs.ext4" "${JAIL_ROOT}/snapshot_mem" "${JAIL_ROOT}/snapshot_state"
+mount --bind -o ro "$KERNEL" "${JAIL_ROOT}/vmlinux"
+mount --bind "$ROOTFS" "${JAIL_ROOT}/rootfs.ext4"
+mount --bind "$SNAPSHOT_MEM" "${JAIL_ROOT}/snapshot_mem"
+mount --bind "$SNAPSHOT_STATE" "${JAIL_ROOT}/snapshot_state"
+volume_drives_json=""
+for ((i = 0; i < VOLUME_DRIVES; i++)); do
+	touch "${JAIL_ROOT}/vol${i}.img"
+	chmod 0444 "${JAIL_ROOT}/vol${i}.img"
+	volume_drives_json+="${volume_drives_json:+, }{\"drive_id\": \"vol${i}\", \"path\": \"/vol${i}.img\"}"
+done
+
+echo "==> Starting Firecracker for snapshot creation..."
+"$JAILER_BIN" \
+	--id "$VM_ID" \
+	--exec-file "$FIRECRACKER_BIN" \
+	--uid 1000 \
+	--gid 1000 \
+	--chroot-base-dir "$JAILER_BASE_DIR" \
+	--netns "/run/netns/${NETNS}" \
+	-- \
+	--api-sock /firecracker.socket &
+FC_PID=$!
+
+for _ in $(seq 1 200); do
+	if [[ -S "${JAIL_ROOT}/firecracker.socket" ]]; then
+		break
+	fi
+	sleep 0.05
+done
+if [[ ! -S "${JAIL_ROOT}/firecracker.socket" ]]; then
+	echo "ERROR: timed out waiting for Firecracker API socket" >&2
+	exit 1
+fi
+
+# pci=off is deliberate (virtio on MMIO); see docs/security-model.md before enabling PCI.
+# sysctl.user.max_user_namespaces=0 refuses user namespaces, as Docker's default
+# seccomp profile does for Docker sandboxes; the kernel applies it before init.
+# clocksource=kvm-clock: the runner's clock_realtime restore only advances
+# kvm-clock. Where the guest sees an invariant TSC, the kernel would otherwise
+# switch to tsc, which resumes at snapshot time.
+boot_args="console=ttyS0 reboot=k panic=1 pci=off ipv6.disable=1 sysctl.user.max_user_namespaces=0 clocksource=kvm-clock init=/sandbox-daemon ip=${GUEST_IP}::${HOST_TAP_IP}:255.255.255.0::eth0:off"
+
+echo "==> Configuring and booting Firecracker snapshot VM..."
+api_put "/machine-config" "{\"vcpu_count\":${VCPUS},\"mem_size_mib\":${MEM_MIB},\"smt\":false}"
+api_put "/boot-source" "{\"kernel_image_path\":\"${KERNEL_JAIL_PATH}\",\"boot_args\":\"${boot_args}\"}"
+api_put "/drives/rootfs" "{\"drive_id\":\"rootfs\",\"path_on_host\":\"${ROOTFS_JAIL_PATH}\",\"is_root_device\":true,\"is_read_only\":false}"
+# In this order, so vol0 is /dev/vdb.
+for ((i = 0; i < VOLUME_DRIVES; i++)); do
+	api_put "/drives/vol${i}" "{\"drive_id\":\"vol${i}\",\"path_on_host\":\"/vol${i}.img\",\"is_root_device\":false,\"is_read_only\":true}"
+done
+api_put "/network-interfaces/eth0" "{\"iface_id\":\"eth0\",\"guest_mac\":\"${GUEST_MAC}\",\"host_dev_name\":\"${HOST_TAP_DEVICE_NAME}\"}"
+api_put "/actions" '{"action_type":"InstanceStart"}'
+
+echo "==> Waiting for sandbox daemon inside snapshot VM..."
+for _ in $(seq 1 120); do
+	if ip netns exec "$NETNS" curl -fsS --max-time 1 "http://${GUEST_IP}:${DAEMON_PORT}/healthz" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 0.5
+done
+if ! ip netns exec "$NETNS" curl -fsS --max-time 2 "http://${GUEST_IP}:${DAEMON_PORT}/healthz" >/dev/null; then
+	echo "ERROR: sandbox daemon did not become healthy before snapshot" >&2
+	exit 1
+fi
+
+echo "==> Pausing VM and writing Firecracker snapshot..."
+api_patch "/vm" '{"state":"Paused"}'
+api_put "/snapshot/create" '{"snapshot_type":"Full","snapshot_path":"/snapshot_state","mem_file_path":"/snapshot_mem"}'
+
+chmod 0644 "$SNAPSHOT_MEM" "$SNAPSHOT_STATE"
+
+# Written last, so a sidecar is never left claiming a snapshot that failed to
+# build. The runner replays these values verbatim when it has to cold boot a
+# sandbox whose VM died: memory, vCPUs and the kernel command line are chosen
+# here and exist nowhere in the runner's own configuration.
+#
+# Staged in a temporary file and renamed into place: the runner treats the
+# presence of boot.json as proof the snapshot set is complete and skips
+# rebuilding, so a half-written sidecar left behind by an interrupted run would
+# fail admission on every subsequent startup.
+echo "==> Recording boot parameters at ${BOOT_PARAMS}..."
+cat >"$BOOT_PARAMS_TMP" <<EOF
+{
+  "schema_version": 2,
+  "vcpu_count": ${VCPUS},
+  "mem_size_mib": ${MEM_MIB},
+  "kernel_image_path": "${KERNEL_JAIL_PATH}",
+  "boot_args": "${boot_args}",
+  "rootfs_drive_path": "${ROOTFS_JAIL_PATH}",
+  "volume_drives": [${volume_drives_json}],
+  "guest_mac": "${GUEST_MAC}",
+  "guest_ip": "${GUEST_IP}",
+  "host_tap_device_name": "${HOST_TAP_DEVICE_NAME}",
+  "daemon_port": ${DAEMON_PORT},
+  "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+}
+EOF
+chmod 0644 "$BOOT_PARAMS_TMP"
+# The snapshot files and the staged sidecar have to reach disk before the rename
+# publishes them, and the rename itself has to reach disk after it: a rename left
+# in the page cache is lost by an unclean host shutdown, which would leave mem
+# and state without the boot.json the runner needs to cold boot.
+sync
+mv "$BOOT_PARAMS_TMP" "$BOOT_PARAMS"
+sync
+echo "==> Firecracker snapshot created at ${OUT_DIR}"
