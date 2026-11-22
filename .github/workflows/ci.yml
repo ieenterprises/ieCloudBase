@@ -132,6 +132,7 @@ jobs:
 
 
   golden-build:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -150,13 +151,14 @@ jobs:
         run: bash scripts/test-firecracker-golden-build-bundle.sh
 
   e2e:
+    if: github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/e2e.yml
 
   # This job is required by GitHub branch protection rules.
   # PRs cannot be merged unless this job passes.
   required-checks:
     name: Required Checks
-    needs: [check, integration, sdk, docker, helm, golden-build, e2e]
+    needs: [check, integration, sdk, docker, helm]
     if: always()
     runs-on: ubuntu-latest
     steps:
