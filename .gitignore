@@ -15,6 +15,4 @@ reseller-api/.recall-vault.json
 reseller-api/.private-locks.json
 reseller-api/.git-config.json
 reseller-api/.registry-creds.json
-sandbox-venv/
-sandbox-workspace/
 *.pem

@@ -51,7 +51,7 @@ jobs:
 
   build:
     needs: tag
-    runs-on: ${{ vars.RUNNER_PROVIDER == 'github' && 'ubuntu-latest' || 'blacksmith-4vcpu-ubuntu-2204' }}
+    runs-on: ubuntu-latest
     # Keyed on the derived tag, not on the input: `feature/foo` and `feature-foo`
     # are different inputs that push the same tag, so only this serializes them.
     concurrency:
