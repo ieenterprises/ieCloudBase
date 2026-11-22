@@ -3373,7 +3373,9 @@ if (DATABASE_URL) {
   });
 }
 
-const DIST_DIR = path.resolve(__dirname, '../playground/dist');
+const DIST_DIR = fs.existsSync(path.resolve(__dirname, '../playground/src/dist'))
+  ? path.resolve(__dirname, '../playground/src/dist')
+  : path.resolve(__dirname, '../playground/dist');
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',

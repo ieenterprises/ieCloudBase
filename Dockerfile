@@ -24,7 +24,7 @@ ENV PORT=4000
 
 COPY --from=builder /app/reseller-api/node_modules ./reseller-api/node_modules
 COPY reseller-api/package.json reseller-api/server.mjs ./reseller-api/
-COPY --from=builder /app/playground/dist ./playground/dist
+COPY --from=builder /app/playground/src/dist ./playground/dist
 
 EXPOSE 4000
 CMD ["node", "reseller-api/server.mjs"]
