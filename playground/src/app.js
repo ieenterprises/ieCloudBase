@@ -7065,3 +7065,15 @@ $('#wm-cg-save-btn')?.addEventListener('click', async () => {
   await loadWmContactGroups();
   setStatus(`Saved contact group: ${name}`, 'connected');
 });
+
+// Standalone Webmail Mode (when accessed on mail.iecloudbase.com / webmail.iecloudbase.com or ?standalone=mail)
+(function initStandaloneMailMode() {
+  const host = (window.location.hostname || '').toLowerCase();
+  const isMailHost = host === 'mail.iecloudbase.com' || host === 'webmail.iecloudbase.com';
+  const isMailQuery = new URLSearchParams(window.location.search).get('standalone') === 'mail';
+  if (!isMailHost && !isMailQuery) return;
+  document.body.classList.add('standalone-mail-mode');
+  document.title = 'ieCloudbase Mail';
+  switchView('webmail');
+  if (topbarPageTitle) topbarPageTitle.textContent = 'Mail';
+})();
