@@ -1131,19 +1131,38 @@ const server = http.createServer(async (req, res) => {
     const mailDomDel = pathname.match(/^\/mail\/domains\/([^/]+)$/);
     if (mailDomDel && req.method === 'DELETE') {
       const target = decodeURIComponent(mailDomDel[1]).toLowerCase();
-      const [domResp, accResp] = await stalwartJmap([
+      const [domResp, accResp, dkimResp] = await stalwartJmap([
         ['x:Domain/get', {}, 'd0'],
         ['x:Account/get', {}, 'a0'],
+        ['x:DkimSignature/get', {}, 'k0'],
       ]);
       const allDoms = domResp?.[1]?.list || [];
       const domObj = allDoms.find((d) => String(d.id).toLowerCase() === target || String(d.name || '').toLowerCase() === target);
       if (!domObj) return sendJson(res, 200, { deleted: true });
       const domId = domObj.id;
+      const domName = String(domObj.name || '').toLowerCase();
+      if (domName === 'iecloudbase.com') {
+        return sendJson(res, 400, { error: 'Cannot delete primary domain iecloudbase.com' });
+      }
+      const dkimIds = (dkimResp?.[1]?.list || []).filter((k) => k.domainId === domId).map((k) => k.id);
+      if (dkimIds.length > 0) {
+        await stalwartJmap([['x:DkimSignature/set', { destroy: dkimIds }, 'k1']]);
+      }
       const accounts = (accResp?.[1]?.list || []).filter((a) => a.domainId === domId);
       if (accounts.length > 0) {
         await stalwartJmap([['x:Account/set', { destroy: accounts.map((a) => a.id) }, 'a1']]);
       }
-      await stalwartJmap([['x:Domain/set', { destroy: [domId] }, 'd1']]);
+      const delResp = await stalwartJmap([['x:Domain/set', { destroy: [domId] }, 'd1']]);
+      const notDestroyed = delResp?.[0]?.[1]?.notDestroyed?.[domId];
+      if (notDestroyed) {
+        return sendJson(res, 400, { error: notDestroyed.description || notDestroyed.type || 'Failed to delete domain in Stalwart' });
+      }
+      const grpStore = readGroupMailStore();
+      const filteredGroups = (grpStore.groups || []).filter((g) => String(g.domain || '').toLowerCase() !== domName);
+      if (filteredGroups.length !== (grpStore.groups || []).length) {
+        grpStore.groups = filteredGroups;
+        writeGroupMailStore(grpStore);
+      }
       return sendJson(res, 200, { deleted: true });
     }
 
