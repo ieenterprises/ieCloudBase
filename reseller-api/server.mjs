@@ -1605,10 +1605,10 @@ const server = http.createServer(async (req, res) => {
         ['x:Domain/get', {}, 'd0'],
         ['x:Account/get', { limit: 500 }, 'a0'],
       ]);
-      const domObj = (domResp[0]?.[1]?.list || []).find((d) => String(d.name || '').toLowerCase() === 'iecloudbase.com');
+      const domObj = (domResp?.[1]?.list || []).find((d) => String(d.name || '').toLowerCase() === 'iecloudbase.com');
       if (!domObj) return sendJson(res, 500, { error: 'Primary domain iecloudbase.com is not configured' });
 
-      const existing = (accResp[0]?.[1]?.list || []).some(
+      const existing = (accResp?.[1]?.list || []).some(
         (a) =>
           String(a.emailAddress || '').toLowerCase() === address ||
           (String(a.name || '').toLowerCase() === localName && a.domainId === domObj.id),
