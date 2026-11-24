@@ -4,6 +4,16 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ieCloudbase — Cloud Platform</title>
+  <script>
+    (function () {
+      var h = (window.location.hostname || '').toLowerCase();
+      var q = new URLSearchParams(window.location.search).get('standalone') === 'mail';
+      if (h === 'mail.iecloudbase.com' || h === 'webmail.iecloudbase.com' || q) {
+        document.documentElement.classList.add('standalone-mail-mode');
+        document.title = 'ieCloudbase Mail';
+      }
+    })();
+  </script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -62,11 +72,19 @@
       width: 62px;
     }
 
+    html.standalone-mail-mode #sidebar,
     body.standalone-mail-mode #sidebar {
       display: none !important;
     }
+    html.standalone-mail-mode #topbar #status,
     body.standalone-mail-mode #topbar #status {
       display: none !important;
+    }
+    html.standalone-mail-mode #view-sandboxes {
+      display: none !important;
+    }
+    html.standalone-mail-mode #view-webmail {
+      display: flex !important;
     }
 
     #sidebar.collapsed .brand-logo,
