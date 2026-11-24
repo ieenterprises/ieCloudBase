@@ -4671,6 +4671,34 @@ YOUR_HOSTNAME</pre>
           </div>
         </div>
 
+        <!-- Group Mail (Dedicated Group Addresses / Distribution Lists) -->
+        <div style="margin:20px 0 12px;">
+          <h2 class="paas-section-title" style="margin:0;">Group Mail (Distribution Lists)</h2>
+          <p style="margin:2px 0 0; font-size:12.5px; color:var(--text-secondary);">Create a Group Mail via <strong>+ Create Mailbox</strong> or click <strong>Group Mail</strong> on any existing mailbox above to distribute messages to all members.</p>
+        </div>
+        <div class="table-card" style="margin-bottom:18px;">
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>GROUP ADDRESS</th>
+                  <th>GROUP NAME</th>
+                  <th>MEMBERS</th>
+                  <th>RECEIVING</th>
+                  <th>REPLY MODE</th>
+                  <th>POSTING</th>
+                  <th style="text-align:right;">ACTIONS</th>
+                </tr>
+              </thead>
+              <tbody id="mail-groups-tbody"></tbody>
+            </table>
+          </div>
+          <div class="table-footer">
+            <span id="mail-groups-count-label">0 group(s)</span>
+            <span>Automatic distribution · Personal &amp; Business</span>
+          </div>
+        </div>
+
         <!-- IMAP / SMTP Client Connection Info -->
         <div class="dom-card">
           <h3>Mail Client Settings (Outlook / Apple Mail / Thunderbird / Mobile)</h3>
@@ -4755,6 +4783,67 @@ YOUR_HOSTNAME</pre>
       </div>
     </div>
 
+    <!-- MODAL: CREATE / EDIT GROUP ADDRESS -->
+    <div class="drawer-backdrop" id="mail-group-modal-backdrop" style="align-items:center; justify-content:center;">
+      <div style="background:#ffffff; border:1px solid var(--border); border-radius:12px; width:500px; max-width:94vw; box-shadow:0 20px 50px rgba(15,23,42,0.18); overflow:hidden;">
+        <div style="padding:20px 24px 14px; border-bottom:1px solid #f1f5f9; display:flex; align-items:center; justify-content:space-between;">
+          <h2 style="margin:0; font-size:18px; font-weight:700;" id="mail-group-modal-title">Create Group Address</h2>
+          <button type="button" class="icon-btn" id="mail-group-modal-close">✕</button>
+        </div>
+        <div style="padding:18px 24px; display:flex; flex-direction:column; gap:12px; max-height:72vh; overflow-y:auto;">
+          <div id="mail-group-addr-row">
+            <label style="display:block; font-size:12.5px; font-weight:600; margin-bottom:5px;">Group Email Address</label>
+            <div style="display:flex; gap:6px; align-items:center;">
+              <input type="text" class="input" id="mail-group-user-input" placeholder="e.g. team or sales" style="flex:1; margin-bottom:0;" />
+              <span style="font-weight:700; color:var(--text-secondary);">@</span>
+              <select class="select" id="mail-group-domain-select" style="min-width:165px;"></select>
+            </div>
+          </div>
+          <div>
+            <label style="display:block; font-size:12.5px; font-weight:600; margin-bottom:5px;">Group Name</label>
+            <input type="text" class="input" id="mail-group-name-input" placeholder="e.g. Engineering Team" style="margin-bottom:0;" />
+          </div>
+          <div>
+            <label style="display:block; font-size:12.5px; font-weight:600; margin-bottom:5px;">Receiving Behavior</label>
+            <select class="select" id="mail-group-delivery-select" style="width:100%;">
+              <option value="all_members" selected>Deliver to All Members (Everyone in Group Receives)</option>
+              <option value="all_and_inbox">All Members + Keep Copy in Group Inbox</option>
+            </select>
+            <div style="font-size:11.5px; color:var(--text-muted); margin-top:4px;">When an email is sent to this group address, everyone listed in Members below receives a copy.</div>
+          </div>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <div>
+              <label style="display:block; font-size:12.5px; font-weight:600; margin-bottom:5px;">Reply Behavior</label>
+              <select class="select" id="mail-group-reply-select" style="width:100%;">
+                <option value="group" selected>Reply to Group</option>
+                <option value="sender">Reply to Sender</option>
+              </select>
+            </div>
+            <div>
+              <label style="display:block; font-size:12.5px; font-weight:600; margin-bottom:5px;">Who Can Post</label>
+              <select class="select" id="mail-group-perm-select" style="width:100%;">
+                <option value="anyone" selected>Anyone</option>
+                <option value="members">Members Only</option>
+                <option value="admins">Admins Only</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label style="display:block; font-size:12.5px; font-weight:600; margin-bottom:5px;">Members</label>
+            <div style="display:flex; gap:8px; margin-bottom:8px;">
+              <input type="text" class="input" id="mail-group-member-input" placeholder="Add member email (e.g. john@gmail.com)" style="flex:1; margin-bottom:0;" />
+              <button type="button" class="btn btn-secondary" id="mail-group-add-member-btn">+ Add</button>
+            </div>
+            <div id="mail-group-members-list" style="display:flex; flex-wrap:wrap; gap:6px;"></div>
+          </div>
+        </div>
+        <div style="padding:14px 24px 20px; border-top:1px solid #f1f5f9; display:flex; justify-content:space-between;">
+          <button type="button" class="btn btn-secondary" id="mail-group-modal-cancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="mail-group-modal-submit">Save Group</button>
+        </div>
+      </div>
+    </div>
+
     <!-- VIEW 7: CUSTOM WEBMAIL INBOX -->
     <section id="view-webmail" class="view-container">
       <!-- Sign-in Card (shown when not signed into a mailbox) -->
@@ -4782,6 +4871,7 @@ YOUR_HOSTNAME</pre>
         <div class="wm-folders">
           <button class="btn btn-primary" id="wm-compose-btn" style="width:100%; margin-bottom:8px;">+ Compose</button>
           <div id="wm-folders-list" style="display:flex; flex-direction:column; gap:2px;"></div>
+          <button type="button" class="btn btn-secondary btn-sm" id="wm-contact-groups-btn" style="width:100%; margin-top:10px; justify-content:flex-start;">👥 Contact Groups</button>
           <div style="flex:1;"></div>
           <div style="padding:10px 8px; border-top:1px solid var(--border); font-size:11px; color:var(--text-muted);">
             <div id="wm-signed-email" style="font-weight:600; color:var(--text-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-bottom:6px;"></div>
@@ -4807,6 +4897,30 @@ YOUR_HOSTNAME</pre>
         </div>
       </div>
     </section>
+
+    <!-- MODAL: PERSONAL CONTACT GROUPS (WEBMAIL) -->
+    <div class="drawer-backdrop" id="wm-contact-groups-modal-backdrop" style="align-items:center; justify-content:center;">
+      <div style="background:#ffffff; border:1px solid var(--border); border-radius:12px; width:500px; max-width:94vw; box-shadow:0 20px 50px rgba(15,23,42,0.18); overflow:hidden;">
+        <div style="padding:20px 24px 14px; border-bottom:1px solid #f1f5f9; display:flex; align-items:center; justify-content:space-between;">
+          <h2 style="margin:0; font-size:18px; font-weight:700;">Contact Groups</h2>
+          <button type="button" class="icon-btn" id="wm-cg-modal-close">✕</button>
+        </div>
+        <div style="padding:18px 24px; display:flex; flex-direction:column; gap:14px; max-height:72vh; overflow-y:auto;">
+          <p style="margin:0; font-size:12.5px; color:var(--text-secondary);">Create personal contact lists (like Gmail labels) to quickly fill multiple recipients in <strong>+ Compose</strong>.</p>
+          <div style="background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:12px; display:flex; flex-direction:column; gap:8px;">
+            <input type="text" class="input" id="wm-cg-name-input" placeholder="Group name (e.g. Family, Project Team)" style="margin-bottom:0;" />
+            <input type="text" class="input" id="wm-cg-members-input" placeholder="Member emails, comma-separated (e.g. a@gmail.com, b@iecloudbase.com)" style="margin-bottom:0;" />
+            <div style="display:flex; justify-content:flex-end;">
+              <button type="button" class="btn btn-primary btn-sm" id="wm-cg-save-btn">+ Save Contact Group</button>
+            </div>
+          </div>
+          <div id="wm-cg-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+        </div>
+        <div style="padding:12px 24px 16px; border-top:1px solid #f1f5f9; display:flex; justify-content:flex-end;">
+          <button type="button" class="btn btn-secondary" id="wm-cg-modal-done">Done</button>
+        </div>
+      </div>
+    </div>
 
     <!-- VIEW 8: SNAPSHOTS (Upcoming) -->
     <section id="view-snapshots" class="view-container">
@@ -5053,8 +5167,13 @@ YOUR_HOSTNAME</pre>
       </div>
       <div class="drawer-body">
         <div class="form-group">
-          <label for="wm-compose-to">To</label>
-          <input class="input" type="text" id="wm-compose-to" placeholder="recipient@gmail.com" style="margin-bottom:0;" />
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px;">
+            <label for="wm-compose-to" style="margin:0;">To</label>
+            <select class="select" id="wm-compose-group-select" style="width:auto; max-width:220px; font-size:11.5px; padding:3px 8px;">
+              <option value="">+ Insert Group...</option>
+            </select>
+          </div>
+          <input class="input" type="text" id="wm-compose-to" placeholder="recipient@gmail.com, team@iecloudbase.com" style="margin-bottom:0;" />
         </div>
         <div class="form-group">
           <label for="wm-compose-subject">Subject</label>
@@ -5107,6 +5226,14 @@ YOUR_HOSTNAME</pre>
       </div>
       <div class="drawer-body">
         <div class="form-group">
+          <label>Mailbox Purpose</label>
+          <div class="segmented" id="email-purpose-toggle">
+            <button type="button" class="seg-btn active" data-epurpose="mailbox">Personal Mailbox</button>
+            <button type="button" class="seg-btn" data-epurpose="group">Group Mail</button>
+          </div>
+        </div>
+
+        <div class="form-group">
           <label>Email Type</label>
           <div class="segmented" id="email-mode-toggle">
             <button type="button" class="seg-btn active" data-emode="free">@iecloudbase.com</button>
@@ -5127,25 +5254,67 @@ YOUR_HOSTNAME</pre>
         </div>
 
         <div class="form-group">
-          <label for="email-displayname-input">Display Name</label>
+          <label for="email-displayname-input" id="email-displayname-label">Display Name</label>
           <input class="input" type="text" id="email-displayname-input" placeholder="e.g. John Doe" style="margin-bottom:0;" />
         </div>
 
-        <div class="form-group">
-          <label for="email-password-input">Mailbox Password</label>
-          <div style="display:flex; gap:6px;">
-            <input class="input" type="text" id="email-password-input" placeholder="Strong password" style="margin-bottom:0;" />
-            <button type="button" class="btn btn-secondary btn-sm" id="email-gen-pass-btn">Generate</button>
+        <div id="email-personal-fields">
+          <div class="form-group">
+            <label for="email-password-input">Mailbox Password</label>
+            <div style="display:flex; gap:6px;">
+              <input class="input" type="text" id="email-password-input" placeholder="Strong password" style="margin-bottom:0;" />
+              <button type="button" class="btn btn-secondary btn-sm" id="email-gen-pass-btn">Generate</button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="email-quota-select">Storage Quota</label>
+            <select class="select" id="email-quota-select" style="width:100%;">
+              <option value="5 GB">5 GB (Starter)</option>
+              <option value="10 GB" selected>10 GB (Standard)</option>
+              <option value="50 GB">50 GB (Pro)</option>
+            </select>
           </div>
         </div>
 
-        <div class="form-group">
-          <label for="email-quota-select">Storage Quota</label>
-          <select class="select" id="email-quota-select" style="width:100%;">
-            <option value="5 GB">5 GB (Starter)</option>
-            <option value="10 GB" selected>10 GB (Standard)</option>
-            <option value="50 GB">50 GB (Pro)</option>
-          </select>
+        <div id="email-group-fields" style="display:none;">
+          <div class="form-group">
+            <label for="email-drawer-group-delivery">Receiving Behavior</label>
+            <select class="select" id="email-drawer-group-delivery" style="width:100%;">
+              <option value="all_members" selected>Deliver to All Members (Everyone Receives)</option>
+              <option value="all_and_inbox">All Members + Keep Copy in Group Inbox</option>
+            </select>
+            <div class="form-help">Everyone added under Members below receives emails sent to this group address.</div>
+          </div>
+
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+            <div class="form-group">
+              <label for="email-drawer-group-reply">Reply Behavior</label>
+              <select class="select" id="email-drawer-group-reply" style="width:100%;">
+                <option value="group" selected>Reply to Group</option>
+                <option value="sender">Reply to Sender</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="email-drawer-group-perm">Who Can Post</label>
+              <select class="select" id="email-drawer-group-perm" style="width:100%;">
+                <option value="anyone" selected>Anyone</option>
+                <option value="members">Members Only</option>
+                <option value="admins">Admins Only</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="email-drawer-group-member-input">Group Members</label>
+            <div style="display:flex; gap:6px;">
+              <input class="input" type="email" id="email-drawer-group-member-input" placeholder="Add member email (e.g. john@gmail.com)" style="margin-bottom:0;" />
+              <button type="button" class="btn btn-secondary btn-sm" id="email-drawer-group-add-member-btn">+ Add</button>
+            </div>
+            <div id="email-drawer-group-members-list" style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;">
+              <span style="font-size:12px; color:var(--text-muted);">No members yet. Add member emails above.</span>
+            </div>
+          </div>
         </div>
 
         <div class="form-group" id="email-autodns-group" style="display:none;">

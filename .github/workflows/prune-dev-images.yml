@@ -3,9 +3,6 @@ name: Prune Dev Images
 # Deletes old alpha and staging images from the GHCR -dev packages. The packages
 # and the retention rules are in .github/scripts/prune-dev-images.sh.
 on:
-  schedule:
-    # Every day at 04:23 UTC.
-    - cron: '23 4 * * *'
   workflow_dispatch:
     inputs:
       dry_run:

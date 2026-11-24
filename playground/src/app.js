@@ -2522,6 +2522,7 @@ mailClearDomainFilterBtn?.addEventListener('click', () => {
   emailDomainFilter.value = 'all';
   renderMailDomainsGrid();
   renderEmailTable();
+  loadMailGroupsFromServer();
   if (mailDnsInspectorCard && mailDnsInspectorCard.style.display !== 'none') {
     renderMailDnsInspector();
   }
@@ -2602,6 +2603,7 @@ async function loadMailboxesFromServer() {
   }
   renderMailDomainsGrid();
   renderEmailTable();
+  loadMailGroupsFromServer();
   if (mailDnsInspectorCard && mailDnsInspectorCard.style.display !== 'none') {
     renderMailDnsInspector();
   }
@@ -3113,9 +3115,15 @@ function renderEmailTable() {
     const aliasesHtml = aliasList.length > 0
       ? `<span class="badge badge-neutral" title="${aliasList.join(', ')}">${aliasList.length} alias${aliasList.length > 1 ? 'es' : ''}</span>`
       : '<span style="color:var(--text-muted); font-size:12px;">None</span>';
+    const linkedGroup = (typeof mailGroupsList !== 'undefined' && Array.isArray(mailGroupsList))
+      ? mailGroupsList.find((g) => g.address.toLowerCase() === m.address.toLowerCase())
+      : null;
+    const groupBadgeHtml = linkedGroup
+      ? ` <span class="badge badge-running" style="margin-left:4px; font-size:10.5px;" title="${(linkedGroup.members || []).length} member(s)">Group (${(linkedGroup.members || []).length})</span>`
+      : '';
 
     tr.innerHTML = `
-      <td><span class="mono-id" style="font-weight:600;">${m.address}</span></td>
+      <td><span class="mono-id" style="font-weight:600;">${m.address}</span>${groupBadgeHtml}</td>
       <td>${m.displayName || '—'}</td>
       <td><span class="badge badge-neutral">${m.domain}</span></td>
       <td style="color:var(--text-secondary);">${m.quota}</td>
@@ -3136,6 +3144,12 @@ function renderEmailTable() {
       $('#wm-email-input').value = m.address;
       switchView('webmail');
     });
+
+    const groupBtn = document.createElement('button');
+    groupBtn.className = 'btn btn-secondary btn-sm';
+    groupBtn.style.cssText = 'padding:4px 8px; font-size:11.5px;';
+    groupBtn.textContent = linkedGroup ? 'Edit Group' : 'Group Mail';
+    groupBtn.addEventListener('click', () => openMailGroupModalForMailbox(m));
 
     const aliasBtn = document.createElement('button');
     aliasBtn.className = 'btn btn-secondary btn-sm';
@@ -3163,7 +3177,7 @@ function renderEmailTable() {
       setStatus(`Mailbox deleted: ${m.address}`, 'connected');
     });
 
-    actions.append(webmailBtn, aliasBtn, passBtn, delBtn);
+    actions.append(webmailBtn, groupBtn, aliasBtn, passBtn, delBtn);
     tr.lastElementChild.appendChild(actions);
     emailTbody.appendChild(tr);
   });
@@ -3179,7 +3193,63 @@ function updateEmailPreview() {
   emailPreviewAddr.textContent = `${user}@${domain}`;
 }
 
+let emailDrawerPurpose = 'mailbox';
+let drawerGroupMembers = [];
+
+function renderDrawerGroupMembers() {
+  const listEl = $('#email-drawer-group-members-list');
+  if (!listEl) return;
+  if (drawerGroupMembers.length === 0) {
+    listEl.innerHTML = '<span style="font-size:12px; color:var(--text-muted);">No members yet. Add member emails above.</span>';
+    return;
+  }
+  listEl.innerHTML = '';
+  drawerGroupMembers.forEach((m) => {
+    const pill = document.createElement('span');
+    pill.className = 'badge badge-neutral';
+    pill.style.cssText = 'display:inline-flex; align-items:center; gap:5px; padding:4px 8px; font-size:11.5px;';
+    pill.innerHTML = `<span>${m}</span><button type="button" style="border:none; background:none; cursor:pointer; font-weight:700; color:var(--text-muted); padding:0 2px;">×</button>`;
+    pill.querySelector('button').addEventListener('click', () => {
+      drawerGroupMembers = drawerGroupMembers.filter((x) => x !== m);
+      renderDrawerGroupMembers();
+    });
+    listEl.appendChild(pill);
+  });
+}
+
+function setEmailDrawerPurpose(purpose) {
+  emailDrawerPurpose = purpose === 'group' ? 'group' : 'mailbox';
+  $$('#email-purpose-toggle .seg-btn').forEach((b) => b.classList.toggle('active', b.dataset.epurpose === emailDrawerPurpose));
+  const isGrp = emailDrawerPurpose === 'group';
+  const personalFields = $('#email-personal-fields');
+  const groupFields = $('#email-group-fields');
+  const dispLabel = $('#email-displayname-label');
+  if (personalFields) personalFields.style.display = isGrp ? 'none' : 'block';
+  if (groupFields) groupFields.style.display = isGrp ? 'block' : 'none';
+  if (dispLabel) dispLabel.textContent = isGrp ? 'Group Name' : 'Display Name';
+  if (emailDisplaynameInput) emailDisplaynameInput.placeholder = isGrp ? 'e.g. Engineering Team' : 'e.g. John Doe';
+  emailDrawerSubmitBtn.textContent = isGrp ? 'Create Group Mail' : 'Create Mailbox';
+}
+
+$$('#email-purpose-toggle .seg-btn').forEach((btn) => {
+  btn.addEventListener('click', () => setEmailDrawerPurpose(btn.dataset.epurpose));
+});
+
+$('#email-drawer-group-add-member-btn')?.addEventListener('click', () => {
+  const inp = $('#email-drawer-group-member-input');
+  const val = (inp?.value || '').trim().toLowerCase();
+  if (!val || !val.includes('@')) return setStatus('Enter a valid member email address', 'error');
+  if (!drawerGroupMembers.includes(val)) {
+    drawerGroupMembers.push(val);
+    inp.value = '';
+    renderDrawerGroupMembers();
+  }
+});
+
 function openEmailDrawer() {
+  setEmailDrawerPurpose('mailbox');
+  drawerGroupMembers = [];
+  renderDrawerGroupMembers();
   if (selectedMailDomain && selectedMailDomain !== 'iecloudbase.com') {
     emailDrawerMode = 'business';
     emailModeButtons.forEach((b) => b.classList.toggle('active', b.dataset.emode === 'business'));
@@ -3233,6 +3303,56 @@ emailDrawerSubmitBtn.addEventListener('click', async () => {
     ? 'iecloudbase.com'
     : (emailCustomDomainInput.value.trim().toLowerCase() || typedDom);
   const password = emailPasswordInput.value.trim();
+
+  if (emailDrawerPurpose === 'group') {
+    if (!user || !domain) {
+      setStatus('Enter group username and domain', 'error');
+      return;
+    }
+    emailDrawerSubmitBtn.disabled = true;
+    emailDrawerSubmitBtn.textContent = 'Creating...';
+    const address = `${user}@${domain}`;
+    try {
+      await resellerFetch('/mail/groups', {
+        method: 'POST',
+        body: JSON.stringify({
+          username: user,
+          domain,
+          name: emailDisplaynameInput.value.trim() || user,
+          members: drawerGroupMembers,
+          deliveryMode: $('#email-drawer-group-delivery')?.value || 'all_members',
+          replyMode: $('#email-drawer-group-reply')?.value || 'group',
+          postPermission: $('#email-drawer-group-perm')?.value || 'anyone',
+        }),
+      });
+      if (emailDrawerMode === 'business' && emailAutodnsCheckbox.checked) {
+        try {
+          await resellerFetch(`/reseller/domains/${encodeURIComponent(domain)}/records`, {
+            method: 'POST',
+            body: JSON.stringify({ type: 'MX', host: '', answer: 'mail.iecloudbase.com', ttl: 3600, priority: 10 }),
+          });
+          await resellerFetch(`/reseller/domains/${encodeURIComponent(domain)}/records`, {
+            method: 'POST',
+            body: JSON.stringify({ type: 'TXT', host: '', answer: 'v=spf1 mx a ip4:13.51.192.94 ~all', ttl: 3600 }),
+          });
+        } catch {}
+      }
+      await loadMailGroupsFromServer();
+      emailUsernameInput.value = '';
+      emailDisplaynameInput.value = '';
+      drawerGroupMembers = [];
+      renderDrawerGroupMembers();
+      closeEmailDrawer();
+      setStatus(`Group Mail created: ${address}`, 'connected');
+    } catch (e) {
+      setStatus(`Create Group Mail failed: ${e.message}`, 'error');
+    } finally {
+      emailDrawerSubmitBtn.disabled = false;
+      emailDrawerSubmitBtn.textContent = 'Create Group Mail';
+    }
+    return;
+  }
+
   if (!user || !domain || !password) {
     setStatus('Enter username, domain, and password', 'error');
     return;
@@ -3410,6 +3530,7 @@ async function wmSignIn(email, password) {
       renderWmFolders();
       await loadWmMessages();
     }
+    loadWmContactGroups();
     setStatus(`Webmail: ${email}`, 'connected');
   } catch (e) {
     wmLoginErr.textContent = e.message;
@@ -3645,6 +3766,7 @@ function openWmCompose() {
     wmComposeRecallWindow.value = '0';
     wmComposeRecallWindow.disabled = false;
   }
+  loadWmContactGroups();
   wmComposeBackdrop.classList.add('open');
   wmComposeTo.focus();
 }
@@ -6618,4 +6740,328 @@ $('#kv-create-submit-btn')?.addEventListener('click', async () => {
     btn.disabled = false;
     btn.textContent = 'Create Key Value';
   }
+});
+
+// ============================================================================
+// --- GROUP MAIL (1. Dedicated Group Addresses + 2. Personal Contact Groups) ---
+// ============================================================================
+var mailGroupsList = [];
+let editingGroupId = null;
+let editingGroupMembers = [];
+let pendingConvertMailbox = null;
+
+async function loadMailGroupsFromServer() {
+  try {
+    const data = await resellerFetch('/mail/groups');
+    mailGroupsList = Array.isArray(data.groups) ? data.groups : [];
+  } catch {
+    mailGroupsList = [];
+  }
+  renderMailGroupsTable();
+  if (typeof renderEmailTable === 'function') renderEmailTable();
+}
+
+function renderMailGroupsTable() {
+  const tbody = $('#mail-groups-tbody');
+  const countLbl = $('#mail-groups-count-label');
+  if (!tbody) return;
+  const domFilter = selectedMailDomain || emailDomainFilter?.value || 'all';
+  const filtered = mailGroupsList.filter((g) => domFilter === 'all' || g.domain === domFilter);
+  if (countLbl) countLbl.textContent = `${filtered.length} group(s)`;
+
+  if (filtered.length === 0) {
+    tbody.innerHTML = `
+      <tr><td colspan="7"><div class="empty-box">
+        <h3>No group addresses yet</h3>
+        <p>Create a shared address like <code>team@iecloudbase.com</code> or <code>sales@yourdomain.com</code>.</p>
+      </div></td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = '';
+  filtered.forEach((g) => {
+    const tr = document.createElement('tr');
+    const permLabel = g.postPermission === 'members' ? 'Members Only' : g.postPermission === 'admins' ? 'Admins Only' : 'Anyone';
+    const deliveryLabel = g.deliveryMode === 'all_and_inbox' ? 'All Members + Inbox' : 'All Members';
+    const replyLabel = g.replyMode === 'sender' ? 'Reply to Sender' : 'Reply to Group';
+    tr.innerHTML = `
+      <td><span class="mono-id" style="font-weight:600;">${g.address}</span></td>
+      <td>${g.name || '—'}</td>
+      <td><span class="badge badge-neutral" title="${(g.members || []).join(', ')}">${(g.members || []).length} member(s)</span></td>
+      <td><span class="badge badge-running">${deliveryLabel}</span></td>
+      <td><span class="badge badge-neutral">${replyLabel}</span></td>
+      <td><span class="badge badge-neutral">${permLabel}</span></td>
+      <td style="text-align:right;"></td>
+    `;
+    const actions = document.createElement('div');
+    actions.className = 'row-actions';
+    actions.style.cssText = 'display:inline-flex; gap:4px; align-items:center;';
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'btn btn-secondary btn-sm';
+    editBtn.textContent = 'Edit Members';
+    editBtn.addEventListener('click', () => openMailGroupModal(g));
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn btn-danger-ghost btn-sm';
+    delBtn.textContent = 'Delete';
+    delBtn.addEventListener('click', async () => {
+      try {
+        await resellerFetch(`/mail/groups/${encodeURIComponent(g.id)}`, { method: 'DELETE' });
+        await loadMailGroupsFromServer();
+        setStatus(`Deleted group address: ${g.address}`, 'connected');
+      } catch (e) {
+        setStatus(`Delete group failed: ${e.message}`, 'error');
+      }
+    });
+
+    actions.append(editBtn, delBtn);
+    tr.lastElementChild.appendChild(actions);
+    tbody.appendChild(tr);
+  });
+}
+
+function renderEditingGroupMembers() {
+  const listEl = $('#mail-group-members-list');
+  if (!listEl) return;
+  if (editingGroupMembers.length === 0) {
+    listEl.innerHTML = '<div style="font-size:12px; color:var(--text-muted);">No members yet. Add member emails above.</div>';
+    return;
+  }
+  listEl.innerHTML = '';
+  editingGroupMembers.forEach((m) => {
+    const pill = document.createElement('div');
+    pill.style.cssText = 'display:inline-flex; align-items:center; gap:6px; background:#f1f5f9; border:1px solid var(--border); border-radius:999px; padding:4px 10px; font-size:12px; font-family:var(--mono);';
+    pill.innerHTML = `<span>${m}</span><button type="button" style="border:none;background:none;cursor:pointer;font-weight:700;color:var(--text-secondary);">✕</button>`;
+    pill.querySelector('button')?.addEventListener('click', () => {
+      editingGroupMembers = editingGroupMembers.filter((x) => x !== m);
+      renderEditingGroupMembers();
+    });
+    listEl.appendChild(pill);
+  });
+}
+
+function openMailGroupModal(grp = null, mailbox = null) {
+  editingGroupId = grp ? grp.id : null;
+  pendingConvertMailbox = (!grp && mailbox) ? mailbox : null;
+  editingGroupMembers = grp ? [...(grp.members || [])] : [];
+  const modal = $('#mail-group-modal-backdrop');
+  if (!modal) return;
+  if (grp) {
+    $('#mail-group-modal-title').textContent = `Edit Group Mail: ${grp.address}`;
+  } else if (mailbox) {
+    $('#mail-group-modal-title').textContent = `Make Group Mail: ${mailbox.address}`;
+  } else {
+    $('#mail-group-modal-title').textContent = 'Create Group Address';
+  }
+  $('#mail-group-addr-row').style.display = (grp || mailbox) ? 'none' : 'block';
+  const domSel = $('#mail-group-domain-select');
+  const domains = [...new Set(['iecloudbase.com', ...mailDomains.map((d) => d.domain || d.name)])];
+  if (domSel) {
+    domSel.innerHTML = domains.map((d) => `<option value="${d}" ${(selectedMailDomain || 'iecloudbase.com') === d ? 'selected' : ''}>${d}</option>`).join('');
+  }
+  $('#mail-group-user-input').value = '';
+  $('#mail-group-name-input').value = grp ? (grp.name || '') : (mailbox ? (mailbox.displayName || mailbox.address.split('@')[0]) : '');
+  const delivSel = $('#mail-group-delivery-select');
+  if (delivSel) delivSel.value = grp ? (grp.deliveryMode || 'all_members') : (mailbox ? 'all_and_inbox' : 'all_members');
+  $('#mail-group-reply-select').value = grp ? (grp.replyMode || 'group') : 'group';
+  $('#mail-group-perm-select').value = grp ? (grp.postPermission || 'anyone') : 'anyone';
+  $('#mail-group-member-input').value = '';
+  renderEditingGroupMembers();
+  modal.classList.add('open');
+}
+
+function openMailGroupModalForMailbox(mailbox) {
+  if (!mailbox?.address) return;
+  const existing = mailGroupsList.find((g) => g.address.toLowerCase() === mailbox.address.toLowerCase());
+  if (existing) {
+    openMailGroupModal(existing);
+  } else {
+    openMailGroupModal(null, mailbox);
+  }
+}
+
+function closeMailGroupModal() {
+  pendingConvertMailbox = null;
+  $('#mail-group-modal-backdrop')?.classList.remove('open');
+}
+
+$('#mail-group-modal-close')?.addEventListener('click', closeMailGroupModal);
+$('#mail-group-modal-cancel')?.addEventListener('click', closeMailGroupModal);
+$('#mail-group-add-member-btn')?.addEventListener('click', () => {
+  const inp = $('#mail-group-member-input');
+  const val = (inp?.value || '').trim().toLowerCase();
+  if (!val || !val.includes('@')) return setStatus('Enter a valid member email address', 'error');
+  if (!editingGroupMembers.includes(val)) {
+    editingGroupMembers.push(val);
+    inp.value = '';
+    renderEditingGroupMembers();
+  }
+});
+$('#mail-group-modal-submit')?.addEventListener('click', async () => {
+  const btn = $('#mail-group-modal-submit');
+  const name = ($('#mail-group-name-input')?.value || '').trim();
+  const deliveryMode = $('#mail-group-delivery-select')?.value || 'all_members';
+  const replyMode = $('#mail-group-reply-select')?.value || 'group';
+  const postPermission = $('#mail-group-perm-select')?.value || 'anyone';
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+  try {
+    if (editingGroupId) {
+      await resellerFetch(`/mail/groups/${encodeURIComponent(editingGroupId)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ name, members: editingGroupMembers, deliveryMode, replyMode, postPermission }),
+      });
+      setStatus('Group Mail updated', 'connected');
+    } else if (pendingConvertMailbox) {
+      const [u, d] = pendingConvertMailbox.address.split('@');
+      await resellerFetch('/mail/groups', {
+        method: 'POST',
+        body: JSON.stringify({
+          username: u,
+          domain: d || pendingConvertMailbox.domain || 'iecloudbase.com',
+          name: name || u,
+          members: editingGroupMembers,
+          deliveryMode,
+          replyMode,
+          postPermission,
+          convertExisting: true,
+        }),
+      });
+      setStatus(`Configured ${pendingConvertMailbox.address} as Group Mail`, 'connected');
+    } else {
+      const username = ($('#mail-group-user-input')?.value || '').trim().toLowerCase();
+      const domain = $('#mail-group-domain-select')?.value || 'iecloudbase.com';
+      if (!username) {
+        btn.disabled = false;
+        btn.textContent = 'Save Group';
+        return setStatus('Enter a group username (e.g. team)', 'error');
+      }
+      await resellerFetch('/mail/groups', {
+        method: 'POST',
+        body: JSON.stringify({ username, domain, name: name || username, members: editingGroupMembers, deliveryMode, replyMode, postPermission }),
+      });
+      setStatus(`Created group address: ${username}@${domain}`, 'connected');
+    }
+    closeMailGroupModal();
+    await loadMailGroupsFromServer();
+  } catch (e) {
+    setStatus(`Save group failed: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save Group';
+  }
+});
+
+// 2. Personal Contact Groups in Webmail Inbox
+let wmContactGroups = [];
+let wmSharedGroups = [];
+
+async function loadWmContactGroups() {
+  if (!wmSession?.email) return;
+  try {
+    const data = await resellerFetch(`/webmail/contact-groups?email=${encodeURIComponent(wmSession.email)}`);
+    wmContactGroups = Array.isArray(data.contactGroups) ? data.contactGroups : [];
+    wmSharedGroups = Array.isArray(data.sharedGroups) ? data.sharedGroups : [];
+  } catch {
+    wmContactGroups = [];
+    wmSharedGroups = [];
+  }
+  renderWmContactGroupsList();
+  renderWmComposeGroupDropdown();
+}
+
+function renderWmComposeGroupDropdown() {
+  const sel = $('#wm-compose-group-select');
+  if (!sel) return;
+  let html = '<option value="">+ Insert Group...</option>';
+  if (wmContactGroups.length > 0) {
+    html += '<optgroup label="My Contact Groups">';
+    wmContactGroups.forEach((cg) => {
+      html += `<option value="cg:${cg.id}">👥 ${cg.name} (${(cg.members || []).length})</option>`;
+    });
+    html += '</optgroup>';
+  }
+  if (wmSharedGroups.length > 0) {
+    html += '<optgroup label="Shared Group Addresses">';
+    wmSharedGroups.forEach((sg) => {
+      html += `<option value="sg:${sg.address}">📨 ${sg.name} (${sg.address})</option>`;
+    });
+    html += '</optgroup>';
+  }
+  sel.innerHTML = html;
+}
+
+$('#wm-compose-group-select')?.addEventListener('change', (e) => {
+  const val = e.target.value;
+  if (!val) return;
+  let toAdd = [];
+  if (val.startsWith('cg:')) {
+    const cg = wmContactGroups.find((c) => c.id === val.slice(3));
+    if (cg) toAdd = cg.members || [];
+  } else if (val.startsWith('sg:')) {
+    toAdd = [val.slice(3)];
+  }
+  if (toAdd.length > 0 && wmComposeTo) {
+    const existing = wmComposeTo.value.split(',').map((s) => s.trim()).filter(Boolean);
+    const merged = [...new Set([...existing, ...toAdd])];
+    wmComposeTo.value = merged.join(', ');
+  }
+  e.target.value = '';
+});
+
+function renderWmContactGroupsList() {
+  const el = $('#wm-cg-list');
+  if (!el) return;
+  if (wmContactGroups.length === 0) {
+    el.innerHTML = '<div style="font-size:12.5px; color:var(--text-muted); text-align:center; padding:12px 0;">No contact groups yet. Create one above!</div>';
+    return;
+  }
+  el.innerHTML = '';
+  wmContactGroups.forEach((cg) => {
+    const card = document.createElement('div');
+    card.style.cssText = 'border:1px solid var(--border); border-radius:8px; padding:10px 12px; display:flex; align-items:center; justify-content:space-between; gap:10px;';
+    card.innerHTML = `
+      <div style="min-width:0;">
+        <div style="font-weight:700; font-size:13px;">${cg.name} <span class="badge badge-neutral" style="font-size:10.5px; margin-left:4px;">${(cg.members || []).length} member(s)</span></div>
+        <div style="font-size:11.5px; color:var(--text-secondary); font-family:var(--mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${(cg.members || []).join(', ')}</div>
+      </div>
+      <div style="display:flex; gap:6px; flex-shrink:0;">
+        <button type="button" class="btn btn-secondary btn-sm wm-cg-compose-btn">Compose</button>
+        <button type="button" class="btn btn-danger-ghost btn-sm wm-cg-del-btn">Delete</button>
+      </div>
+    `;
+    card.querySelector('.wm-cg-compose-btn')?.addEventListener('click', () => {
+      $('#wm-contact-groups-modal-backdrop')?.classList.remove('open');
+      openWmCompose();
+      if (wmComposeTo) wmComposeTo.value = (cg.members || []).join(', ');
+    });
+    card.querySelector('.wm-cg-del-btn')?.addEventListener('click', async () => {
+      await resellerFetch(`/webmail/contact-groups/${encodeURIComponent(cg.id)}`, { method: 'DELETE' });
+      await loadWmContactGroups();
+      setStatus(`Deleted contact group: ${cg.name}`, 'connected');
+    });
+    el.appendChild(card);
+  });
+}
+
+$('#wm-contact-groups-btn')?.addEventListener('click', async () => {
+  await loadWmContactGroups();
+  $('#wm-contact-groups-modal-backdrop')?.classList.add('open');
+});
+$('#wm-cg-modal-close')?.addEventListener('click', () => $('#wm-contact-groups-modal-backdrop')?.classList.remove('open'));
+$('#wm-cg-modal-done')?.addEventListener('click', () => $('#wm-contact-groups-modal-backdrop')?.classList.remove('open'));
+$('#wm-cg-save-btn')?.addEventListener('click', async () => {
+  if (!wmSession?.email) return;
+  const name = ($('#wm-cg-name-input')?.value || '').trim();
+  const members = ($('#wm-cg-members-input')?.value || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (!name || members.length === 0) return setStatus('Enter group name and at least one member email', 'error');
+  await resellerFetch('/webmail/contact-groups', {
+    method: 'POST',
+    body: JSON.stringify({ ownerEmail: wmSession.email, name, members }),
+  });
+  $('#wm-cg-name-input').value = '';
+  $('#wm-cg-members-input').value = '';
+  await loadWmContactGroups();
+  setStatus(`Saved contact group: ${name}`, 'connected');
 });

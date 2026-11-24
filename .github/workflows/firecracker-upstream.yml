@@ -1,8 +1,6 @@
 name: Firecracker upstream
 
 on:
-  schedule:
-    - cron: "23 5 * * 1"
   workflow_dispatch:
 
 # The bump PR branch and commit are written with the release app's token; the

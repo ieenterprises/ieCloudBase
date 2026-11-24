@@ -1,8 +1,6 @@
 name: Sweep stale E2E VMs
 
 on:
-  schedule:
-    - cron: "25 */6 * * *"
   workflow_dispatch:
 
 permissions:

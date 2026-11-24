@@ -1,8 +1,6 @@
 name: Bump Firecracker kernel
 
 on:
-  schedule:
-    - cron: "17 5 * * 1"
   workflow_dispatch:
 
 # The PR branch and commit are written with the release app's token, so

@@ -442,6 +442,29 @@ function readRecallVault() {
 function writeRecallVault(vault) {
   fs.writeFileSync(RECALL_VAULT_PATH, JSON.stringify(vault, null, 2), 'utf-8');
 }
+
+const GROUP_MAIL_PATH = path.join(__dirname, '.group-mail.json');
+function readGroupMailStore() {
+  try {
+    if (fs.existsSync(GROUP_MAIL_PATH)) {
+      const parsed = JSON.parse(fs.readFileSync(GROUP_MAIL_PATH, 'utf-8'));
+      return {
+        groups: Array.isArray(parsed?.groups) ? parsed.groups : [],
+        contactGroups: Array.isArray(parsed?.contactGroups) ? parsed.contactGroups : [],
+      };
+    }
+  } catch {}
+  return { groups: [], contactGroups: [] };
+}
+function writeGroupMailStore(store) {
+  fs.writeFileSync(GROUP_MAIL_PATH, JSON.stringify(store, null, 2), 'utf-8');
+  if (dbPool) {
+    dbPool.query(
+      "INSERT INTO iecloudbase_kv (key, value, updated_at) VALUES ('group_mail_store', $1::jsonb, NOW()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+      [JSON.stringify(store)]
+    ).catch(() => {});
+  }
+}
 function escapeHtml(str) {
   return String(str || '')
     .replace(/&/g, '&amp;')
@@ -476,6 +499,96 @@ async function stalwartJmap(methodCalls, extraUsing = []) {
     throw err;
   }
   return data?.methodResponses || [];
+}
+
+async function stalwartUpload(accountId, buffer, contentType = 'application/octet-stream') {
+  const res = await stalwartHttpsFetch(`/jmap/upload/${encodeURIComponent(accountId)}/`, {
+    method: 'POST',
+    headers: {
+      Authorization: STALWART_AUTH,
+      'Content-Type': contentType,
+      'Content-Length': String(buffer.length),
+    },
+    body: buffer,
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  if (!res.ok) throw new Error(data?.detail || `Upload HTTP ${res.status}`);
+  return data;
+}
+
+async function resolveStalwartAccountId(group) {
+  if (group?.stalwartId) return group.stalwartId;
+  const addr = String(group?.address || '').toLowerCase();
+  const local = String(group?.username || '').toLowerCase();
+  if (!addr && !local) return null;
+  try {
+    const accResp = await stalwartJmap([['x:Account/get', { limit: 200 }, 'a0']]);
+    const list = accResp[0]?.[1]?.list || [];
+    const match = list.find(
+      (a) =>
+        String(a.emailAddress || '').toLowerCase() === addr ||
+        (Array.isArray(a.aliases) && a.aliases.some((al) => String(al).toLowerCase() === addr)) ||
+        (String(a.name || '').toLowerCase() === local && addr.endsWith('@iecloudbase.com')),
+    );
+    return match?.id || null;
+  } catch {
+    return null;
+  }
+}
+
+async function syncGroupSieveInStalwart(group, remove = false) {
+  try {
+    const accountId = await resolveStalwartAccountId(group);
+    if (!accountId) return;
+    const getResp = await stalwartJmap([['SieveScript/get', { accountId }, 's0']], ['urn:ietf:params:jmap:sieve']);
+    const existing = (getResp[0]?.[1]?.list || []).filter((s) => s.name === 'iecloudbase_group_mail');
+    const destroyIds = existing.map((s) => s.id).filter(Boolean);
+
+    if (remove || !Array.isArray(group.members) || group.members.length === 0) {
+      if (destroyIds.length > 0) {
+        await stalwartJmap(
+          [['SieveScript/set', { accountId, destroy: destroyIds, onSuccessActivateScript: null }, 's1']],
+          ['urn:ietf:params:jmap:sieve'],
+        );
+      }
+      return;
+    }
+
+    const lines = [];
+    if (group.postPermission === 'members' || group.postPermission === 'admins') {
+      const allowed = group.postPermission === 'admins'
+        ? (group.admins || [])
+        : [...new Set([...(group.members || []), ...(group.admins || [])])];
+      if (allowed.length > 0) {
+        const listStr = allowed.map((a) => JSON.stringify(String(a).toLowerCase())).join(', ');
+        lines.push(`if not address :is "from" [${listStr}] { discard; stop; }`);
+      }
+    }
+    const selfAddr = String(group.address || '').toLowerCase();
+    for (const m of group.members) {
+      const target = String(m || '').trim().toLowerCase();
+      if (target && target !== selfAddr) {
+        lines.push(`redirect ${JSON.stringify(target)};`);
+      }
+    }
+    if (group.deliveryMode === 'all_and_inbox') {
+      lines.push('keep;');
+    }
+    if (lines.length === 0) return;
+
+    const up = await stalwartUpload(accountId, Buffer.from(lines.join('\n') + '\n', 'utf-8'), 'application/sieve');
+    const setPayload = {
+      accountId,
+      create: { gs: { name: 'iecloudbase_group_mail', blobId: up.blobId } },
+      onSuccessActivateScript: '#gs',
+    };
+    if (destroyIds.length > 0) setPayload.destroy = destroyIds;
+    await stalwartJmap([['SieveScript/set', setPayload, 's1']], ['urn:ietf:params:jmap:sieve']);
+  } catch (e) {
+    console.warn(`[group-sieve] sync failed for ${group?.address}:`, e.message);
+  }
 }
 
 async function namecom(endpoint, options = {}) {
@@ -1236,6 +1349,148 @@ const server = http.createServer(async (req, res) => {
     }
 
     // =========================================================================
+    // GROUP MAIL (Dedicated Group Addresses + Personal Contact Groups)
+    // =========================================================================
+    if (req.method === 'GET' && pathname === '/mail/groups') {
+      const store = readGroupMailStore();
+      return sendJson(res, 200, { groups: store.groups });
+    }
+
+    if (req.method === 'POST' && pathname === '/mail/groups') {
+      const body = await readBody(req);
+      const localName = String(body.username || '').trim().toLowerCase().replace(/[^a-z0-9._-]/g, '');
+      const domain = String(body.domain || 'iecloudbase.com').trim().toLowerCase();
+      const name = String(body.name || localName).trim();
+      const members = Array.isArray(body.members) ? [...new Set(body.members.map((m) => String(m).trim().toLowerCase()).filter(Boolean))] : [];
+      const replyMode = body.replyMode === 'sender' ? 'sender' : 'group';
+      const deliveryMode = body.deliveryMode === 'all_and_inbox' ? 'all_and_inbox' : 'all_members';
+      const postPermission = ['anyone', 'members', 'admins'].includes(body.postPermission) ? body.postPermission : 'anyone';
+      const admins = Array.isArray(body.admins) ? body.admins.map((a) => String(a).trim().toLowerCase()).filter(Boolean) : [];
+      if (!localName || !domain) return sendJson(res, 400, { error: 'Group username and domain are required' });
+
+      const address = `${localName}@${domain}`;
+      const store = readGroupMailStore();
+      if (store.groups.some((g) => g.address.toLowerCase() === address)) {
+        return sendJson(res, 409, { error: `Group ${address} already exists` });
+      }
+
+      let stalwartGroupId = null;
+      if (!body.convertExisting) {
+        try {
+          const domResp = await stalwartJmap([['x:Domain/get', {}, 'd0']]);
+          const domObj = (domResp[0]?.[1]?.list || []).find((d) => String(d.name || '').toLowerCase() === domain);
+          if (domObj) {
+            const grpResp = await stalwartJmap([
+              ['x:Account/set', { create: { g1: { '@type': 'Group', name: localName, domainId: domObj.id, description: name } } }, 'g0'],
+            ]);
+            stalwartGroupId = grpResp[0]?.[1]?.created?.g1?.id || null;
+          }
+        } catch {}
+      }
+
+      const newGroup = {
+        id: 'grp_' + crypto.randomBytes(6).toString('hex'),
+        stalwartId: stalwartGroupId,
+        address,
+        username: localName,
+        domain,
+        name,
+        members,
+        deliveryMode,
+        replyMode,
+        postPermission,
+        admins,
+        createdAt: Date.now(),
+      };
+      store.groups.unshift(newGroup);
+      writeGroupMailStore(store);
+      syncGroupSieveInStalwart(newGroup);
+      return sendJson(res, 201, { group: newGroup });
+    }
+
+    const mailGrpUpdate = pathname.match(/^\/mail\/groups\/([^/]+)$/);
+    if (mailGrpUpdate && req.method === 'PUT') {
+      const id = decodeURIComponent(mailGrpUpdate[1]);
+      const body = await readBody(req);
+      const store = readGroupMailStore();
+      const idx = store.groups.findIndex((g) => g.id === id);
+      if (idx === -1) return sendJson(res, 404, { error: 'Group not found' });
+      const grp = store.groups[idx];
+      if (typeof body.name === 'string' && body.name.trim()) grp.name = body.name.trim();
+      if (Array.isArray(body.members)) grp.members = [...new Set(body.members.map((m) => String(m).trim().toLowerCase()).filter(Boolean))];
+      if (body.replyMode === 'sender' || body.replyMode === 'group') grp.replyMode = body.replyMode;
+      if (body.deliveryMode === 'all_and_inbox' || body.deliveryMode === 'all_members') grp.deliveryMode = body.deliveryMode;
+      if (['anyone', 'members', 'admins'].includes(body.postPermission)) grp.postPermission = body.postPermission;
+      if (Array.isArray(body.admins)) grp.admins = body.admins.map((a) => String(a).trim().toLowerCase()).filter(Boolean);
+      writeGroupMailStore(store);
+      syncGroupSieveInStalwart(grp);
+      return sendJson(res, 200, { group: grp });
+    }
+
+    if (mailGrpUpdate && req.method === 'DELETE') {
+      const id = decodeURIComponent(mailGrpUpdate[1]);
+      const store = readGroupMailStore();
+      const grp = store.groups.find((g) => g.id === id);
+      if (grp) {
+        await syncGroupSieveInStalwart(grp, true);
+      }
+      if (grp?.stalwartId) {
+        try {
+          await stalwartJmap([['x:Account/set', { destroy: [grp.stalwartId] }, 'd0']]);
+        } catch {}
+      }
+      store.groups = store.groups.filter((g) => g.id !== id);
+      writeGroupMailStore(store);
+      return sendJson(res, 200, { deleted: true });
+    }
+
+    if (req.method === 'GET' && pathname === '/webmail/contact-groups') {
+      const owner = (url.searchParams.get('email') || '').trim().toLowerCase();
+      const store = readGroupMailStore();
+      const list = owner
+        ? store.contactGroups.filter((c) => c.ownerEmail === owner)
+        : store.contactGroups;
+      return sendJson(res, 200, { contactGroups: list, sharedGroups: store.groups });
+    }
+
+    if (req.method === 'POST' && pathname === '/webmail/contact-groups') {
+      const body = await readBody(req);
+      const ownerEmail = String(body.ownerEmail || '').trim().toLowerCase();
+      const name = String(body.name || '').trim();
+      const members = Array.isArray(body.members) ? [...new Set(body.members.map((m) => String(m).trim().toLowerCase()).filter(Boolean))] : [];
+      if (!ownerEmail || !name) return sendJson(res, 400, { error: 'ownerEmail and group name are required' });
+      const store = readGroupMailStore();
+      if (body.id) {
+        const existing = store.contactGroups.find((c) => c.id === body.id && c.ownerEmail === ownerEmail);
+        if (existing) {
+          existing.name = name;
+          existing.members = members;
+          writeGroupMailStore(store);
+          return sendJson(res, 200, { contactGroup: existing });
+        }
+      }
+      const cg = {
+        id: 'cg_' + crypto.randomBytes(6).toString('hex'),
+        ownerEmail,
+        name,
+        members,
+        createdAt: Date.now(),
+      };
+      store.contactGroups.unshift(cg);
+      writeGroupMailStore(store);
+      return sendJson(res, 201, { contactGroup: cg });
+    }
+
+    const cgDelMatch = pathname.match(/^\/webmail\/contact-groups\/([^/]+)$/);
+    if (cgDelMatch && req.method === 'DELETE') {
+      const id = decodeURIComponent(cgDelMatch[1]);
+      const store = readGroupMailStore();
+      store.contactGroups = store.contactGroups.filter((c) => c.id !== id);
+      writeGroupMailStore(store);
+      return sendJson(res, 200, { deleted: true });
+    }
+
+    // =========================================================================
     // CUSTOM WEBMAIL (RFC 8621 JMAP via Stalwart for any mailbox)
     // =========================================================================
     async function userJmapSession(email, password) {
@@ -1398,7 +1653,38 @@ const server = http.createServer(async (req, res) => {
       const identities = setupResp[1]?.[1]?.list || [];
       const identityId = identities[0]?.id;
 
-      const toList = to.split(',').map((addr) => ({ email: addr.trim() })).filter((x) => x.email);
+      const rawToList = to.split(',').map((addr) => addr.trim()).filter(Boolean);
+      const groupStore = readGroupMailStore();
+      const senderLower = email.toLowerCase();
+      const expandedEmails = [];
+      let groupReplyTo = null;
+      for (const addr of rawToList) {
+        const lower = addr.toLowerCase();
+        const grp = groupStore.groups.find((g) => g.address.toLowerCase() === lower);
+        if (grp) {
+          const isMember = (grp.members || []).some((m) => m.toLowerCase() === senderLower);
+          const isAdmin = (grp.admins || []).some((a) => a.toLowerCase() === senderLower);
+          if (grp.postPermission === 'members' && !isMember && !isAdmin) {
+            return sendJson(res, 403, { error: `Only members of ${grp.address} can send to this group.` });
+          }
+          if (grp.postPermission === 'admins' && !isAdmin) {
+            return sendJson(res, 403, { error: `Only admins of ${grp.address} can send to this group.` });
+          }
+          for (const m of (grp.members || [])) {
+            if (m && !expandedEmails.includes(m.toLowerCase())) expandedEmails.push(m.toLowerCase());
+          }
+          if (grp.deliveryMode === 'all_and_inbox' && !expandedEmails.includes(lower)) {
+            expandedEmails.push(lower);
+          }
+          if (grp.replyMode === 'group') groupReplyTo = grp.address;
+        } else if (!expandedEmails.includes(lower)) {
+          expandedEmails.push(lower);
+        }
+      }
+      if (expandedEmails.length === 0) {
+        return sendJson(res, 400, { error: 'Group has no members to deliver to.' });
+      }
+      const toList = expandedEmails.map((addr) => ({ email: addr }));
       let hostedDomains = ['iecloudbase.com'];
       try {
         const domResp = await stalwartJmap([['x:Domain/get', {}, 'd0']]);
@@ -1508,6 +1794,7 @@ const server = http.createServer(async (req, res) => {
         keywords: { $seen: true },
         messageId: [messageIdHeader],
         from: [{ email }],
+        ...(groupReplyTo ? { replyTo: [{ email: groupReplyTo }] } : {}),
         to: toList,
         subject: subject || '(No Subject)',
         ...(jmapAttachments.length > 0 ? { attachments: jmapAttachments } : {}),
@@ -3405,4 +3692,8 @@ function tryServeStatic(req, res, pathname) {
 
 server.listen(PORT, () => {
   console.log(`ieCloudBase Reseller API (${API_BASE}) listening on http://localhost:${PORT}`);
+  const store = readGroupMailStore();
+  for (const grp of store.groups || []) {
+    syncGroupSieveInStalwart(grp);
+  }
 });
