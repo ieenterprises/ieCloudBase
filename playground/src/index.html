@@ -4884,14 +4884,38 @@ YOUR_HOSTNAME</pre>
             <div class="brand-logo" style="width:36px; height:36px;"><img src="https://raw.githubusercontent.com/ieenterprises/logo/main/Company%20Logo%203.png" alt="ieCloudbase Mail Logo" /></div>
             <div>
               <div style="font-size:16px; font-weight:700;">ieCloudbase Mail</div>
-              <div style="font-size:12px; color:var(--text-muted);">Sign in with any @iecloudbase.com or custom domain mailbox</div>
+              <div style="font-size:12px; color:var(--text-muted);" id="wm-auth-subtitle">Sign in or create a free @iecloudbase.com account</div>
             </div>
           </div>
-          <label class="field-label" for="wm-email-input">Email Address</label>
-          <input class="input" type="text" id="wm-email-input" placeholder="admin@iecloudbase.com" />
-          <label class="field-label" for="wm-pass-input">Password</label>
-          <input class="input" type="password" id="wm-pass-input" placeholder="Mailbox password" />
-          <button class="btn btn-primary" id="wm-login-btn" style="width:100%; margin-top:4px;">Sign In to Inbox</button>
+
+          <div class="segmented" id="wm-auth-tabs" style="margin-bottom:14px; width:100%;">
+            <button type="button" class="seg-btn active" id="wm-auth-tab-signin" style="flex:1;">Sign In</button>
+            <button type="button" class="seg-btn" id="wm-auth-tab-signup" style="flex:1;">Create Account</button>
+          </div>
+
+          <div id="wm-signin-form">
+            <label class="field-label" for="wm-email-input">Email Address</label>
+            <input class="input" type="text" id="wm-email-input" placeholder="admin@iecloudbase.com" />
+            <label class="field-label" for="wm-pass-input">Password</label>
+            <input class="input" type="password" id="wm-pass-input" placeholder="Mailbox password" />
+            <button class="btn btn-primary" id="wm-login-btn" style="width:100%; margin-top:4px;">Sign In to Inbox</button>
+          </div>
+
+          <div id="wm-signup-form" style="display:none;">
+            <label class="field-label" for="wm-signup-name">Full Name</label>
+            <input class="input" type="text" id="wm-signup-name" placeholder="e.g. John Doe" />
+            <label class="field-label" for="wm-signup-user">Choose Your Email Address</label>
+            <div style="display:flex; align-items:center; gap:6px; margin-bottom:10px;">
+              <input class="input" type="text" id="wm-signup-user" placeholder="e.g. john.doe" style="flex:1; margin-bottom:0;" />
+              <span style="font-size:12.5px; font-weight:600; color:var(--text-secondary); background:#f1f5f9; border:1px solid var(--border); border-radius:8px; padding:8px 10px; white-space:nowrap;">@iecloudbase.com</span>
+            </div>
+            <label class="field-label" for="wm-signup-pass">Password</label>
+            <input class="input" type="password" id="wm-signup-pass" placeholder="At least 6 characters" />
+            <label class="field-label" for="wm-signup-pass2">Confirm Password</label>
+            <input class="input" type="password" id="wm-signup-pass2" placeholder="Re-enter password" />
+            <button class="btn btn-primary" id="wm-signup-btn" style="width:100%; margin-top:4px;">Create @iecloudbase.com Account</button>
+          </div>
+
           <div id="wm-login-err" style="display:none; margin-top:10px; font-size:12px; color:var(--danger);"></div>
         </div>
       </div>

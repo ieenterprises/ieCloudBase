@@ -1581,6 +1581,68 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (req.method === 'POST' && pathname === '/webmail/signup') {
+      const body = await readBody(req);
+      const rawUser = String(body.username || '').trim().toLowerCase();
+      const userPart = rawUser.includes('@') ? rawUser.split('@')[0] : rawUser;
+      const localName = userPart.replace(/[^a-z0-9._-]/g, '');
+      const displayName = String(body.displayName || localName).trim();
+      const password = String(body.password || '');
+
+      if (!localName || localName.length < 2) {
+        return sendJson(res, 400, { error: 'Username must be at least 2 characters (letters, numbers, ., _, -)' });
+      }
+      const reserved = ['admin', 'administrator', 'postmaster', 'root', 'abuse', 'security', 'noreply', 'no-reply'];
+      if (reserved.includes(localName)) {
+        return sendJson(res, 409, { error: `The username "${localName}" is reserved` });
+      }
+      if (password.length < 6) {
+        return sendJson(res, 400, { error: 'Password must be at least 6 characters' });
+      }
+
+      const address = `${localName}@iecloudbase.com`;
+      const [domResp, accResp] = await stalwartJmap([
+        ['x:Domain/get', {}, 'd0'],
+        ['x:Account/get', { limit: 500 }, 'a0'],
+      ]);
+      const domObj = (domResp[0]?.[1]?.list || []).find((d) => String(d.name || '').toLowerCase() === 'iecloudbase.com');
+      if (!domObj) return sendJson(res, 500, { error: 'Primary domain iecloudbase.com is not configured' });
+
+      const existing = (accResp[0]?.[1]?.list || []).some(
+        (a) =>
+          String(a.emailAddress || '').toLowerCase() === address ||
+          (String(a.name || '').toLowerCase() === localName && a.domainId === domObj.id),
+      );
+      if (existing) {
+        return sendJson(res, 409, { error: `${address} is already taken. Try another username.` });
+      }
+
+      const accCreate = await stalwartJmap([
+        [
+          'x:Account/set',
+          {
+            create: {
+              u1: {
+                '@type': 'User',
+                name: localName,
+                domainId: domObj.id,
+                description: displayName || localName,
+                credentials: { '0': { '@type': 'Password', secret: password } },
+                quotas: { maxDiskQuota: 10 * 1024 * 1024 * 1024 },
+              },
+            },
+          },
+          'a1',
+        ],
+      ]);
+      const created = accCreate[0]?.[1]?.created?.u1;
+      if (!created) {
+        const notCreated = accCreate[0]?.[1]?.notCreated?.u1;
+        return sendJson(res, 400, { error: notCreated?.description || notCreated?.type || 'Failed to create account' });
+      }
+      return sendJson(res, 201, { created: true, id: created.id, address });
+    }
+
     if (req.method === 'POST' && pathname === '/webmail/login') {
       const { email, password } = await readBody(req);
       if (!email || !password) return sendJson(res, 400, { error: 'email and password required' });

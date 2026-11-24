@@ -3541,6 +3541,78 @@ async function wmSignIn(email, password) {
   }
 }
 
+// Webmail Sign In / Create Account tabs & signup handler
+(function initWmAuthTabs() {
+  const tabIn = $('#wm-auth-tab-signin');
+  const tabUp = $('#wm-auth-tab-signup');
+  const formIn = $('#wm-signin-form');
+  const formUp = $('#wm-signup-form');
+  const sub = $('#wm-auth-subtitle');
+  const signupBtn = $('#wm-signup-btn');
+  if (!tabIn || !tabUp || !formIn || !formUp) return;
+
+  function setAuthMode(mode) {
+    const isUp = mode === 'signup';
+    tabIn.classList.toggle('active', !isUp);
+    tabUp.classList.toggle('active', isUp);
+    formIn.style.display = isUp ? 'none' : 'block';
+    formUp.style.display = isUp ? 'block' : 'none';
+    if (sub) {
+      sub.textContent = isUp
+        ? 'Create your free @iecloudbase.com email address'
+        : 'Sign in with any @iecloudbase.com or custom domain mailbox';
+    }
+    if (wmLoginErr) wmLoginErr.style.display = 'none';
+  }
+
+  tabIn.addEventListener('click', () => setAuthMode('signin'));
+  tabUp.addEventListener('click', () => setAuthMode('signup'));
+
+  signupBtn?.addEventListener('click', async () => {
+    const displayName = ($('#wm-signup-name')?.value || '').trim();
+    const username = ($('#wm-signup-user')?.value || '').trim().toLowerCase();
+    const password = $('#wm-signup-pass')?.value || '';
+    const password2 = $('#wm-signup-pass2')?.value || '';
+    wmLoginErr.style.display = 'none';
+
+    if (!username || username.length < 2) {
+      wmLoginErr.textContent = 'Choose a username (at least 2 characters).';
+      wmLoginErr.style.display = 'block';
+      return;
+    }
+    if (password.length < 6) {
+      wmLoginErr.textContent = 'Password must be at least 6 characters.';
+      wmLoginErr.style.display = 'block';
+      return;
+    }
+    if (password !== password2) {
+      wmLoginErr.textContent = 'Passwords do not match.';
+      wmLoginErr.style.display = 'block';
+      return;
+    }
+
+    signupBtn.disabled = true;
+    signupBtn.textContent = 'Creating account...';
+    try {
+      const data = await resellerFetch('/webmail/signup', {
+        method: 'POST',
+        body: JSON.stringify({ username, displayName, password }),
+      });
+      if ($('#wm-email-input')) $('#wm-email-input').value = data.address;
+      if ($('#wm-pass-input')) $('#wm-pass-input').value = password;
+      setAuthMode('signin');
+      await wmSignIn(data.address, password);
+      setStatus(`Welcome! Created ${data.address}`, 'connected');
+    } catch (e) {
+      wmLoginErr.textContent = e.message || 'Sign up failed';
+      wmLoginErr.style.display = 'block';
+    } finally {
+      signupBtn.disabled = false;
+      signupBtn.textContent = 'Create @iecloudbase.com Account';
+    }
+  });
+})();
+
 wmLoginBtn.addEventListener('click', () => {
   const email = wmEmailInput.value.trim();
   const pass = wmPassInput.value;
