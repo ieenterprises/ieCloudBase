@@ -231,7 +231,8 @@ func TestSandboxProxyStillAsksASilentCordonedRunnerToDelete(t *testing.T) {
 func TestSandboxProxyGivesUpOnASilentCordonedRunnerThatDoesNotAnswer(t *testing.T) {
 	env := newCordonTestEnv(t, "stopped", true)
 	env.cfg.HeartbeatGrace = time.Nanosecond
-	shrinkSilentRunnerDeleteBudget(t, 50*time.Millisecond)
+	time.Sleep(2 * time.Millisecond)
+	shrinkSilentRunnerDeleteBudget(t, 20*time.Millisecond)
 	env.control.deleteHook = func(ctx context.Context) { <-ctx.Done() }
 
 	if rr := env.serve(http.MethodPost, "/executions"); rr.Code != http.StatusNotFound {
