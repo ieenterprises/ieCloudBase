@@ -3,6 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" type="image/png" href="https://raw.githubusercontent.com/ieenterprises/logo/main/Company%20Logo%203.png" />
+  <link rel="apple-touch-icon" href="https://raw.githubusercontent.com/ieenterprises/logo/main/Company%20Logo%203.png" />
   <title>ieCloudbase — Cloud Platform</title>
   <script>
     (function () {
@@ -149,18 +151,21 @@
     }
 
     .brand-logo {
-      width: 28px;
-      height: 28px;
-      border-radius: 7px;
-      background: var(--accent);
-      color: #fff;
-      display: flex;
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      overflow: hidden;
+      display: inline-flex;
       align-items: center;
       justify-content: center;
-      font-weight: 700;
-      font-size: 13px;
-      letter-spacing: -0.5px;
       flex-shrink: 0;
+    }
+
+    .brand-logo img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
     }
 
     .brand-name {
@@ -1927,7 +1932,7 @@
   <!-- Left Navigation Sidebar -->
   <aside id="sidebar">
     <div class="brand-bar">
-      <div class="brand-logo">ie</div>
+      <div class="brand-logo"><img src="https://raw.githubusercontent.com/ieenterprises/logo/main/Company%20Logo%203.png" alt="ieCloudbase Logo" /></div>
       <span class="brand-name">ieCloudbase</span>
       <span class="brand-badge">Cloud</span>
       <button type="button" class="sidebar-toggle-btn" id="sidebar-toggle-btn" title="Collapse / Expand Sidebar" aria-label="Toggle Sidebar">
@@ -4876,7 +4881,7 @@ YOUR_HOSTNAME</pre>
       <div id="wm-login-screen" class="page-body" style="display:flex; align-items:center; justify-content:center;">
         <div class="dom-card" style="width:100%; max-width:400px; padding:24px;">
           <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px;">
-            <div class="brand-logo">ie</div>
+            <div class="brand-logo" style="width:36px; height:36px;"><img src="https://raw.githubusercontent.com/ieenterprises/logo/main/Company%20Logo%203.png" alt="ieCloudbase Mail Logo" /></div>
             <div>
               <div style="font-size:16px; font-weight:700;">ieCloudbase Mail</div>
               <div style="font-size:12px; color:var(--text-muted);">Sign in with any @iecloudbase.com or custom domain mailbox</div>
