@@ -7178,8 +7178,14 @@ function switchRecordsSubTab(tab) {
   $$('.rec-panel').forEach((p) => { p.style.display = 'none'; });
   const target = $(`#rec-panel-${tab}`);
   if (target) target.style.display = 'block';
+  if (tab === 'overview') renderRecOverview();
+  if (tab === 'schemas') renderRecSchemas();
   if (tab === 'auth') loadAuthTableRows();
-  if (tab === 'storage') renderRecMounts();
+  if (tab === 'storage') {
+    loadRecBuckets();
+    renderRecMounts();
+  }
+  if (tab === 'settings') renderRecSettings();
 }
 
 $$('#rec-subtabs .paas-status-tab').forEach((btn) => {
@@ -7193,6 +7199,7 @@ async function openRecordsStudio() {
   if (currentServiceDetail.kind === 'postgres' && !pgList.some((s) => s.id === currentServiceDetail.id)) {
     pgList.unshift({ id: currentServiceDetail.id, name: currentServiceDetail.name, kind: 'postgres' });
   }
+  if ($('#rec-studio-project-title')) $('#rec-studio-project-title').textContent = `${currentServiceDetail.name} · Records Studio`;
   if (dbSel) {
     if (pgList.length === 0) {
       dbSel.innerHTML = '<option value="">No PostgreSQL databases</option>';
@@ -7208,9 +7215,10 @@ async function openRecordsStudio() {
     recActiveDbId = match ? match.id : '';
   }
   if (dbSel && recActiveDbId) dbSel.value = recActiveDbId;
-  switchRecordsSubTab('database');
+  switchRecordsSubTab('overview');
   renderRecMounts();
-  await loadRecTables();
+  await Promise.all([loadRecTables(), loadRecBuckets()]);
+  renderRecOverview();
 }
 
 $('#rec-db-select')?.addEventListener('change', async (e) => {
@@ -7584,3 +7592,317 @@ $('#rec-mount-add-btn')?.addEventListener('click', async () => {
     setStatus(`Attach disk failed: ${e.message}`, 'error');
   }
 });
+
+// --- Supabase-Style Studio Extensions (Overview, Schemas, SQL, New Table, Storage Buckets, Settings) ---
+let recBuckets = [];
+let recActiveBucket = '';
+
+function renderRecOverview() {
+  if (!currentServiceDetail) return;
+  if ($('#rec-ov-name')) $('#rec-ov-name').textContent = currentServiceDetail.name || 'Database Project';
+  if ($('#rec-ov-host')) {
+    $('#rec-ov-host').textContent = currentServiceDetail.connectionString
+      ? `${currentServiceDetail.host}:${currentServiceDetail.port}/${currentServiceDetail.databaseName || ''}`
+      : (currentServiceDetail.url || currentServiceDetail.appName || '');
+  }
+  if ($('#rec-ov-tables-count')) $('#rec-ov-tables-count').textContent = String(recTables.length);
+  const totalApprox = recTables.reduce((sum, t) => sum + Number(t.approxRows || 0), 0);
+  if ($('#rec-ov-rows-count')) $('#rec-ov-rows-count').textContent = String(totalApprox);
+  if ($('#rec-ov-buckets-count')) $('#rec-ov-buckets-count').textContent = String(recBuckets.length);
+}
+
+$('#rec-table-filter')?.addEventListener('input', () => {
+  const q = ($('#rec-table-filter')?.value || '').trim().toLowerCase();
+  $$('#rec-tables-list button').forEach((b) => {
+    const name = (b.firstElementChild?.textContent || '').toLowerCase();
+    b.style.display = !q || name.includes(q) ? 'flex' : 'none';
+  });
+});
+
+$('#rec-auth-search')?.addEventListener('input', () => {
+  const q = ($('#rec-auth-search')?.value || '').trim().toLowerCase();
+  $$('#rec-auth-tbody tr').forEach((tr) => {
+    tr.style.display = !q || tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+  });
+});
+
+function renderRecSchemas() {
+  const grid = $('#rec-schema-cards');
+  if (!grid) return;
+  if (recTables.length === 0) {
+    grid.innerHTML = '<div style="font-size:13px; color:var(--text-muted);">No tables in public schema yet. Click <strong>+ New table</strong> to create one.</div>';
+    return;
+  }
+  grid.innerHTML = recTables.map((t) => `
+    <div style="border:1px solid var(--border); border-radius:8px; overflow:hidden; background:#fff;">
+      <div style="padding:8px 12px; background:#f8fafc; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center;">
+        <strong style="font-size:12.5px; font-family:var(--mono);">${t.name}</strong>
+        <span style="font-size:11px; color:var(--text-muted);">${t.approxRows} rows</span>
+      </div>
+      <div style="padding:6px 10px;">
+        ${(t.columns || []).map((c) => `
+          <div style="display:flex; justify-content:space-between; padding:3px 2px; font-size:11.5px; border-bottom:1px solid #f8fafc;">
+            <span style="font-family:var(--mono);">${c.name}</span>
+            <span style="color:var(--text-muted); font-family:var(--mono);">${c.type}</span>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `).join('');
+}
+
+// SQL Editor
+$('#rec-sql-template-select')?.addEventListener('change', (e) => {
+  if (e.target.value && $('#rec-sql-input')) $('#rec-sql-input').value = e.target.value;
+});
+
+async function runRecSql() {
+  if (!recActiveDbId) return setStatus('Select a PostgreSQL database first', 'error');
+  const sql = ($('#rec-sql-input')?.value || '').trim();
+  if (!sql) return setStatus('Enter a SQL query', 'error');
+  const btn = $('#rec-sql-run-btn');
+  const meta = $('#rec-sql-meta');
+  const thead = $('#rec-sql-thead');
+  const tbody = $('#rec-sql-tbody');
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  try {
+    const res = await resellerFetch(`/paas/records/postgres/${encodeURIComponent(recActiveDbId)}/sql`, {
+      method: 'POST',
+      body: JSON.stringify({ sql }),
+    });
+    if (meta) meta.textContent = `${res.command || 'OK'} · ${res.rowCount} row(s) · ${res.durationMs || 0}ms`;
+    const fields = res.fields || [];
+    const rows = res.rows || [];
+    if (fields.length === 0) {
+      thead.innerHTML = '';
+      tbody.innerHTML = `<tr><td style="padding:14px; color:var(--text-secondary);">Query executed successfully (${res.command || 'OK'}, ${res.rowCount} row(s) affected).</td></tr>`;
+    } else {
+      thead.innerHTML = `<tr style="background:#f8fafc; border-bottom:1px solid var(--border);">${fields.map((f) => `<th style="padding:7px 10px; text-align:left; font-weight:600; white-space:nowrap;">${f}</th>`).join('')}</tr>`;
+      tbody.innerHTML = rows.length === 0
+        ? `<tr><td colspan="${fields.length}" style="padding:14px; text-align:center; color:var(--text-muted);">0 rows returned.</td></tr>`
+        : rows.map((r) => `<tr style="border-bottom:1px solid #f1f5f9;">${fields.map((f) => `<td style="padding:6px 10px; font-family:var(--mono); max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${formatCellValue(r[f])}</td>`).join('')}</tr>`).join('');
+    }
+    await loadRecTables();
+  } catch (e) {
+    if (meta) meta.textContent = 'Error';
+    thead.innerHTML = '';
+    tbody.innerHTML = `<tr><td style="padding:14px; color:#dc2626; font-family:var(--mono);">${e.message}</td></tr>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Run SQL';
+  }
+}
+
+$('#rec-sql-run-btn')?.addEventListener('click', runRecSql);
+$('#rec-sql-input')?.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    runRecSql();
+  }
+});
+
+// New Table Modal
+function addNewTableColRow(name = '', type = 'text', isPrimary = false) {
+  const wrap = $('#rec-nt-cols');
+  if (!wrap) return;
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex; gap:6px; align-items:center;';
+  row.innerHTML = `
+    <input type="text" class="input rec-nt-cname" placeholder="column_name" value="${name}" style="flex:1; margin-bottom:0; font-family:var(--mono); font-size:12px;" />
+    <select class="select rec-nt-ctype" style="width:130px; font-size:12px;">
+      <option value="uuid" ${type === 'uuid' ? 'selected' : ''}>uuid</option>
+      <option value="serial" ${type === 'serial' ? 'selected' : ''}>serial</option>
+      <option value="text" ${type === 'text' ? 'selected' : ''}>text</option>
+      <option value="integer" ${type === 'integer' ? 'selected' : ''}>integer</option>
+      <option value="boolean" ${type === 'boolean' ? 'selected' : ''}>boolean</option>
+      <option value="numeric" ${type === 'numeric' ? 'selected' : ''}>numeric</option>
+      <option value="jsonb" ${type === 'jsonb' ? 'selected' : ''}>jsonb</option>
+      <option value="timestamptz" ${type === 'timestamptz' ? 'selected' : ''}>timestamptz</option>
+    </select>
+    <label style="display:inline-flex; align-items:center; gap:3px; font-size:11px; white-space:nowrap;"><input type="checkbox" class="rec-nt-cpk" ${isPrimary ? 'checked' : ''} /> PK</label>
+    <button type="button" class="icon-btn" title="Remove">✕</button>
+  `;
+  row.querySelector('button')?.addEventListener('click', () => row.remove());
+  wrap.appendChild(row);
+}
+
+function openNewTableModal() {
+  if (!recActiveDbId) return setStatus('Select a PostgreSQL database first', 'error');
+  if ($('#rec-nt-name')) $('#rec-nt-name').value = '';
+  const wrap = $('#rec-nt-cols');
+  if (wrap) {
+    wrap.innerHTML = '';
+    addNewTableColRow('id', 'uuid', true);
+    addNewTableColRow('name', 'text', false);
+    addNewTableColRow('created_at', 'timestamptz', false);
+  }
+  $('#rec-new-table-modal-backdrop')?.classList.add('open');
+}
+
+$('#rec-new-table-btn')?.addEventListener('click', openNewTableModal);
+$('#rec-schemas-new-tbl-btn')?.addEventListener('click', openNewTableModal);
+$('#rec-nt-add-col-btn')?.addEventListener('click', () => addNewTableColRow('', 'text', false));
+$('#rec-nt-close')?.addEventListener('click', () => $('#rec-new-table-modal-backdrop')?.classList.remove('open'));
+$('#rec-nt-cancel')?.addEventListener('click', () => $('#rec-new-table-modal-backdrop')?.classList.remove('open'));
+$('#rec-nt-save')?.addEventListener('click', async () => {
+  const name = ($('#rec-nt-name')?.value || '').trim();
+  const columns = $$('#rec-nt-cols > div').map((r) => ({
+    name: (r.querySelector('.rec-nt-cname')?.value || '').trim(),
+    type: r.querySelector('.rec-nt-ctype')?.value || 'text',
+    isPrimary: Boolean(r.querySelector('.rec-nt-cpk')?.checked),
+  })).filter((c) => c.name);
+  if (!name || columns.length === 0) return setStatus('Enter table name and at least one column', 'error');
+  try {
+    await resellerFetch(`/paas/records/postgres/${encodeURIComponent(recActiveDbId)}/tables`, {
+      method: 'POST',
+      body: JSON.stringify({ name, columns }),
+    });
+    $('#rec-new-table-modal-backdrop')?.classList.remove('open');
+    recActiveTable = name;
+    await loadRecTables();
+    renderRecSchemas();
+    setStatus(`Created table ${name}`, 'connected');
+  } catch (e) {
+    setStatus(`Create table failed: ${e.message}`, 'error');
+  }
+});
+
+// Storage Buckets & Objects
+async function loadRecBuckets() {
+  const listEl = $('#rec-buckets-list');
+  const targetId = recActiveDbId || currentServiceDetail?.id;
+  if (!listEl || !targetId) return;
+  try {
+    const data = await resellerFetch(`/paas/records/postgres/${encodeURIComponent(targetId)}/storage/buckets`);
+    recBuckets = Array.isArray(data.buckets) ? data.buckets : [];
+    renderRecOverview();
+    if (recBuckets.length === 0) {
+      listEl.innerHTML = '<div style="font-size:12px; color:var(--text-muted); padding:8px;">No buckets yet. Click <strong>+ New bucket</strong>.</div>';
+      $('#rec-active-bucket-name').textContent = 'Select a bucket';
+      if ($('#rec-file-upload-btn')) $('#rec-file-upload-btn').style.display = 'none';
+      $('#rec-objects-list').textContent = 'Create a bucket to upload and manage files.';
+      return;
+    }
+    if (!recActiveBucket || !recBuckets.some((b) => b.name === recActiveBucket)) {
+      recActiveBucket = recBuckets[0].name;
+    }
+    listEl.innerHTML = '';
+    recBuckets.forEach((b) => {
+      const item = document.createElement('div');
+      const active = b.name === recActiveBucket;
+      item.style.cssText = `display:flex; align-items:center; justify-content:space-between; padding:7px 9px; border-radius:6px; cursor:pointer; font-size:12.5px; background:${active ? '#0f172a' : 'transparent'}; color:${active ? '#fff' : 'var(--text-primary)'}; margin-bottom:2px;`;
+      item.innerHTML = `<span style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${b.name}</span><span style="font-size:10.5px; opacity:0.8;">${b.isPublic ? 'PUBLIC' : 'PRIVATE'} · ${b.fileCount || 0}</span>`;
+      item.addEventListener('click', () => {
+        recActiveBucket = b.name;
+        loadRecBuckets();
+      });
+      listEl.appendChild(item);
+    });
+    await loadRecBucketObjects();
+  } catch {
+    listEl.innerHTML = '<div style="font-size:12px; color:var(--text-muted); padding:8px;">Could not load buckets.</div>';
+  }
+}
+
+async function loadRecBucketObjects() {
+  const targetId = recActiveDbId || currentServiceDetail?.id;
+  const listEl = $('#rec-objects-list');
+  const uploadBtn = $('#rec-file-upload-btn');
+  if (!targetId || !recActiveBucket || !listEl) return;
+  $('#rec-active-bucket-name').textContent = `${recActiveBucket} (bucket)`;
+  if (uploadBtn) uploadBtn.style.display = 'inline-flex';
+  const data = await resellerFetch(`/paas/records/postgres/${encodeURIComponent(targetId)}/storage/objects?bucket=${encodeURIComponent(recActiveBucket)}`);
+  const objs = Array.isArray(data.objects) ? data.objects : [];
+  if (objs.length === 0) {
+    listEl.innerHTML = '<div style="padding:14px; text-align:center; color:var(--text-muted);">No files in this bucket yet. Click <strong>+ Upload File</strong>.</div>';
+    return;
+  }
+  listEl.innerHTML = '';
+  objs.forEach((o) => {
+    const row = document.createElement('div');
+    row.className = 'bp-service-preview';
+    const url = `${RESELLER_BASE}/paas/records/postgres/${encodeURIComponent(targetId)}/storage/objects/${encodeURIComponent(o.id)}`;
+    row.innerHTML = `
+      <div>
+        <a href="${url}" target="_blank" style="font-weight:600; font-size:12.5px; color:var(--text-primary); text-decoration:underline;">${o.name} ↗</a>
+        <div style="font-size:11px; color:var(--text-muted);">${o.mimeType} · ${Math.max(1, Math.round((o.size || 0) / 1024))} KB</div>
+      </div>
+      <button type="button" class="btn btn-danger-ghost btn-sm">Delete</button>
+    `;
+    row.querySelector('button')?.addEventListener('click', async () => {
+      await resellerFetch(`/paas/records/postgres/${encodeURIComponent(targetId)}/storage/objects`, {
+        method: 'DELETE',
+        body: JSON.stringify({ id: o.id }),
+      });
+      await loadRecBuckets();
+      setStatus(`Deleted ${o.name}`, 'connected');
+    });
+    listEl.appendChild(row);
+  });
+}
+
+$('#rec-new-bucket-btn')?.addEventListener('click', () => {
+  if ($('#rec-nb-name')) $('#rec-nb-name').value = '';
+  $('#rec-new-bucket-modal-backdrop')?.classList.add('open');
+});
+$('#rec-nb-close')?.addEventListener('click', () => $('#rec-new-bucket-modal-backdrop')?.classList.remove('open'));
+$('#rec-nb-cancel')?.addEventListener('click', () => $('#rec-new-bucket-modal-backdrop')?.classList.remove('open'));
+$('#rec-nb-save')?.addEventListener('click', async () => {
+  const targetId = recActiveDbId || currentServiceDetail?.id;
+  const name = ($('#rec-nb-name')?.value || '').trim();
+  const isPublic = Boolean($('#rec-nb-public')?.checked);
+  if (!name || !targetId) return setStatus('Enter a bucket name', 'error');
+  try {
+    await resellerFetch(`/paas/records/postgres/${encodeURIComponent(targetId)}/storage/buckets`, {
+      method: 'POST',
+      body: JSON.stringify({ name, isPublic }),
+    });
+    $('#rec-new-bucket-modal-backdrop')?.classList.remove('open');
+    recActiveBucket = name.toLowerCase().replace(/[^a-z0-9-_]/g, '-');
+    await loadRecBuckets();
+    setStatus(`Created bucket ${recActiveBucket}`, 'connected');
+  } catch (e) {
+    setStatus(`Create bucket failed: ${e.message}`, 'error');
+  }
+});
+
+$('#rec-file-upload-btn')?.addEventListener('click', () => $('#rec-file-upload-input')?.click());
+$('#rec-file-upload-input')?.addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  const targetId = recActiveDbId || currentServiceDetail?.id;
+  if (!file || !targetId || !recActiveBucket) return;
+  const buf = await file.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  await resellerFetch(`/paas/records/postgres/${encodeURIComponent(targetId)}/storage/objects`, {
+    method: 'POST',
+    body: JSON.stringify({
+      bucket: recActiveBucket,
+      name: file.name,
+      mimeType: file.type || 'application/octet-stream',
+      size: file.size,
+      dataBase64: btoa(binary),
+    }),
+  });
+  e.target.value = '';
+  await loadRecBuckets();
+  setStatus(`Uploaded ${file.name}`, 'connected');
+});
+
+function renderRecSettings() {
+  const card = $('#rec-settings-card');
+  if (!card || !currentServiceDetail) return;
+  card.innerHTML = `
+    <h3 style="margin:0 0 12px; font-size:15px;">Project Settings</h3>
+    <div style="display:grid; grid-template-columns:150px 1fr; gap:10px; font-size:13px; align-items:center;">
+      <strong>Service Name</strong><code style="background:#f3f4f6; padding:6px 10px; border-radius:6px;">${currentServiceDetail.name}</code>
+      <strong>Service ID</strong><code style="background:#f3f4f6; padding:6px 10px; border-radius:6px;">${currentServiceDetail.id}</code>
+      <strong>Engine / Runtime</strong><code style="background:#f3f4f6; padding:6px 10px; border-radius:6px;">${currentServiceDetail.runtime || currentServiceDetail.kind}</code>
+      ${currentServiceDetail.connectionString ? `<strong>Connection URL</strong><code style="background:#f3f4f6; padding:6px 10px; border-radius:6px; word-break:break-all;">${currentServiceDetail.connectionString}</code>` : ''}
+    </div>
+  `;
+}

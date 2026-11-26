@@ -3244,6 +3244,169 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { deleted: true });
     }
 
+    const pgSqlMatch = pathname.match(/^\/paas\/records\/postgres\/([^/]+)\/sql$/);
+    if (pgSqlMatch && req.method === 'POST') {
+      const pgId = decodeURIComponent(pgSqlMatch[1]);
+      const body = await readBody(req);
+      const sql = String(body.sql || '').trim();
+      if (!sql) return sendJson(res, 400, { error: 'sql query is required' });
+      const t0 = Date.now();
+      const out = await withUserPostgres(pgId, async (pool) => {
+        const resSql = await pool.query(sql);
+        const last = Array.isArray(resSql) ? resSql[resSql.length - 1] : resSql;
+        return {
+          command: last?.command || 'QUERY',
+          rowCount: Number(last?.rowCount ?? (last?.rows?.length || 0)),
+          fields: (last?.fields || []).map((f) => f.name),
+          rows: (last?.rows || []).slice(0, 500),
+          durationMs: Date.now() - t0,
+        };
+      });
+      return sendJson(res, 200, out);
+    }
+
+    if (pgTablesMatch && req.method === 'POST') {
+      const pgId = decodeURIComponent(pgTablesMatch[1]);
+      const body = await readBody(req);
+      const rawName = String(body.name || '').trim().replace(/[^a-zA-Z0-9_]/g, '_');
+      const cols = Array.isArray(body.columns) ? body.columns : [];
+      if (!rawName || cols.length === 0) {
+        return sendJson(res, 400, { error: 'Table name and at least one column are required' });
+      }
+      const allowedTypes = new Set(['uuid', 'serial', 'bigserial', 'text', 'varchar(255)', 'integer', 'bigint', 'boolean', 'numeric', 'jsonb', 'timestamptz', 'date']);
+      const colDefs = cols.map((c) => {
+        const cName = String(c.name || '').trim().replace(/[^a-zA-Z0-9_]/g, '_');
+        const cType = allowedTypes.has(String(c.type || '').toLowerCase()) ? String(c.type).toLowerCase() : 'text';
+        if (!cName) throw new Error('Invalid column name');
+        const parts = [`"${cName}"`, cType];
+        if (c.isPrimary) parts.push('PRIMARY KEY');
+        else if (c.nullable === false) parts.push('NOT NULL');
+        if (cType === 'uuid' && c.isPrimary) parts.push('DEFAULT gen_random_uuid()');
+        if (cType === 'timestamptz' && /created_at|updated_at/i.test(cName)) parts.push('DEFAULT now()');
+        return parts.join(' ');
+      });
+      await withUserPostgres(pgId, async (pool) => {
+        await pool.query(`CREATE TABLE IF NOT EXISTS "public"."${rawName}" (${colDefs.join(', ')})`);
+      });
+      return sendJson(res, 201, { created: true, name: rawName });
+    }
+
+    const STORAGE_META_PATH = path.join(__dirname, '.iecloudbase-storage.json');
+    function readStorageStore() {
+      try {
+        if (fs.existsSync(STORAGE_META_PATH)) return JSON.parse(fs.readFileSync(STORAGE_META_PATH, 'utf-8'));
+      } catch {}
+      return { buckets: [], objects: [] };
+    }
+    function writeStorageStore(store) {
+      fs.writeFileSync(STORAGE_META_PATH, JSON.stringify(store, null, 2), 'utf-8');
+    }
+
+    const pgBucketsMatch = pathname.match(/^\/paas\/records\/postgres\/([^/]+)\/storage\/buckets$/);
+    if (pgBucketsMatch && req.method === 'GET') {
+      const pgId = decodeURIComponent(pgBucketsMatch[1]);
+      const store = readStorageStore();
+      const buckets = (store.buckets || [])
+        .filter((b) => b.serviceId === pgId)
+        .map((b) => ({
+          ...b,
+          fileCount: (store.objects || []).filter((o) => o.serviceId === pgId && o.bucket === b.name).length,
+        }));
+      return sendJson(res, 200, { buckets });
+    }
+    if (pgBucketsMatch && req.method === 'POST') {
+      const pgId = decodeURIComponent(pgBucketsMatch[1]);
+      const body = await readBody(req);
+      const name = String(body.name || '').trim().toLowerCase().replace(/[^a-z0-9-_]/g, '-');
+      if (!name) return sendJson(res, 400, { error: 'Bucket name is required' });
+      const store = readStorageStore();
+      if (store.buckets.some((b) => b.serviceId === pgId && b.name === name)) {
+        return sendJson(res, 409, { error: `Bucket "${name}" already exists` });
+      }
+      const bucket = {
+        id: 'bkt_' + crypto.randomBytes(6).toString('hex'),
+        serviceId: pgId,
+        name,
+        isPublic: Boolean(body.isPublic),
+        maxSizeLabel: String(body.maxSizeLabel || '50 MB'),
+        allowedMime: String(body.allowedMime || 'Any'),
+        createdAt: new Date().toISOString(),
+      };
+      store.buckets.unshift(bucket);
+      writeStorageStore(store);
+      return sendJson(res, 201, { bucket });
+    }
+    if (pgBucketsMatch && req.method === 'DELETE') {
+      const pgId = decodeURIComponent(pgBucketsMatch[1]);
+      const body = await readBody(req);
+      const name = String(body.name || '').trim();
+      const store = readStorageStore();
+      store.buckets = store.buckets.filter((b) => !(b.serviceId === pgId && b.name === name));
+      store.objects = store.objects.filter((o) => !(o.serviceId === pgId && o.bucket === name));
+      writeStorageStore(store);
+      return sendJson(res, 200, { deleted: true });
+    }
+
+    const pgObjectsMatch = pathname.match(/^\/paas\/records\/postgres\/([^/]+)\/storage\/objects$/);
+    if (pgObjectsMatch && req.method === 'GET') {
+      const pgId = decodeURIComponent(pgObjectsMatch[1]);
+      const bucket = String(url.searchParams.get('bucket') || '').trim();
+      const store = readStorageStore();
+      const objects = (store.objects || [])
+        .filter((o) => o.serviceId === pgId && (!bucket || o.bucket === bucket))
+        .map(({ dataBase64, ...rest }) => rest);
+      return sendJson(res, 200, { objects });
+    }
+    if (pgObjectsMatch && req.method === 'POST') {
+      const pgId = decodeURIComponent(pgObjectsMatch[1]);
+      const body = await readBody(req);
+      const bucket = String(body.bucket || '').trim();
+      const name = String(body.name || '').trim();
+      const mimeType = String(body.mimeType || 'application/octet-stream');
+      const dataBase64 = String(body.dataBase64 || '');
+      if (!bucket || !name) return sendJson(res, 400, { error: 'bucket and file name are required' });
+      const store = readStorageStore();
+      const obj = {
+        id: 'obj_' + crypto.randomBytes(6).toString('hex'),
+        serviceId: pgId,
+        bucket,
+        name,
+        mimeType,
+        size: Number(body.size || Buffer.from(dataBase64, 'base64').length),
+        dataBase64,
+        createdAt: new Date().toISOString(),
+      };
+      store.objects.unshift(obj);
+      writeStorageStore(store);
+      const { dataBase64: _drop, ...meta } = obj;
+      return sendJson(res, 201, { object: meta });
+    }
+    if (pgObjectsMatch && req.method === 'DELETE') {
+      const pgId = decodeURIComponent(pgObjectsMatch[1]);
+      const body = await readBody(req);
+      const id = String(body.id || '').trim();
+      const store = readStorageStore();
+      store.objects = store.objects.filter((o) => !(o.serviceId === pgId && o.id === id));
+      writeStorageStore(store);
+      return sendJson(res, 200, { deleted: true });
+    }
+
+    const pgObjDownloadMatch = pathname.match(/^\/paas\/records\/postgres\/([^/]+)\/storage\/objects\/([^/]+)$/);
+    if (pgObjDownloadMatch && req.method === 'GET') {
+      const pgId = decodeURIComponent(pgObjDownloadMatch[1]);
+      const objId = decodeURIComponent(pgObjDownloadMatch[2]);
+      const store = readStorageStore();
+      const obj = (store.objects || []).find((o) => o.serviceId === pgId && o.id === objId);
+      if (!obj) return sendJson(res, 404, { error: 'Object not found' });
+      const buf = Buffer.from(obj.dataBase64 || '', 'base64');
+      res.writeHead(200, {
+        'Content-Type': obj.mimeType || 'application/octet-stream',
+        'Content-Disposition': `inline; filename="${obj.name.replace(/"/g, '')}"`,
+        'Content-Length': buf.length,
+      });
+      return res.end(buf);
+    }
+
     if (req.method === 'POST' && pathname === '/paas/static-sites') {
       const body = await readBody(req);
       const rawName = (body.name || '').trim();

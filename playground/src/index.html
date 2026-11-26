@@ -2605,91 +2605,213 @@
             <div class="dom-card" id="sd-connect-card"></div>
           </div>
 
-          <!-- Tab 5: Records Studio (Auth + Database + Storage/Disks) -->
+          <!-- Tab 5: Records Studio (Supabase-Style: Overview, Table Editor, SQL Editor, Schemas, Auth, Storage, Settings) -->
           <div id="sd-panel-records" class="sd-panel" style="display:none;">
-            <div class="dom-card" style="padding:16px 20px; margin-bottom:14px;">
-              <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;">
-                <div class="paas-status-tabs" id="rec-subtabs" style="margin:0;">
-                  <button type="button" class="paas-status-tab active" data-rectab="database">Database</button>
-                  <button type="button" class="paas-status-tab" data-rectab="auth">Auth</button>
-                  <button type="button" class="paas-status-tab" data-rectab="storage">Storage &amp; Disks</button>
-                </div>
-                <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                  <span style="font-size:12px; color:var(--text-secondary);">Database:</span>
-                  <select class="select" id="rec-db-select" style="height:32px; font-size:12.5px; min-width:190px;"></select>
-                  <button type="button" class="btn btn-secondary btn-sm" id="rec-refresh-btn">Refresh</button>
-                </div>
+            <div class="dom-card" style="padding:10px 16px; margin-bottom:12px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;">
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span style="font-size:13px; font-weight:700;" id="rec-studio-project-title">Records Studio</span>
+                <span class="badge badge-running" id="rec-studio-health-badge" style="font-size:11px;">Healthy</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                <span style="font-size:12px; color:var(--text-secondary);">Database:</span>
+                <select class="select" id="rec-db-select" style="height:30px; font-size:12.5px; min-width:185px;"></select>
+                <button type="button" class="btn btn-secondary btn-sm" id="rec-refresh-btn">Refresh</button>
               </div>
             </div>
 
-            <!-- Studio 1: Database (Tables & Records) -->
-            <div id="rec-panel-database" class="rec-panel">
-              <div style="display:grid; grid-template-columns:220px 1fr; gap:14px; align-items:start;">
-                <div class="dom-card" style="padding:12px;">
-                  <div style="font-size:11.5px; font-weight:700; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-muted); margin-bottom:8px;">Tables (public)</div>
-                  <div id="rec-tables-list" style="display:flex; flex-direction:column; gap:3px;"></div>
-                </div>
-                <div class="dom-card" style="padding:14px 16px; min-width:0;">
-                  <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:12px;">
-                    <div>
-                      <strong id="rec-active-table-name" style="font-size:14.5px;">Select a table</strong>
-                      <span id="rec-active-table-count" style="font-size:12px; color:var(--text-muted); margin-left:8px;"></span>
-                    </div>
-                    <div style="display:flex; gap:8px; align-items:center;">
-                      <input type="text" class="input" id="rec-row-search" placeholder="Search rows..." style="width:180px; height:32px; font-size:12.5px; margin-bottom:0;" />
-                      <button type="button" class="btn btn-primary btn-sm" id="rec-insert-row-btn">+ Insert Row</button>
-                    </div>
-                  </div>
-                  <div style="overflow-x:auto; border:1px solid var(--border); border-radius:8px;">
-                    <table id="rec-rows-table" style="width:100%; border-collapse:collapse; font-size:12.5px;">
-                      <thead id="rec-rows-thead"></thead>
-                      <tbody id="rec-rows-tbody"></tbody>
-                    </table>
-                  </div>
-                  <div style="display:flex; align-items:center; justify-content:space-between; margin-top:10px; font-size:12px; color:var(--text-secondary);">
-                    <span id="rec-page-info">0 row(s)</span>
-                    <div style="display:flex; gap:6px;">
-                      <button type="button" class="btn btn-secondary btn-sm" id="rec-prev-btn">Prev</button>
-                      <button type="button" class="btn btn-secondary btn-sm" id="rec-next-btn">Next</button>
-                    </div>
-                  </div>
-                </div>
+            <div style="display:grid; grid-template-columns:195px 1fr; gap:14px; align-items:start;">
+              <!-- Supabase-style Left Studio Nav -->
+              <div class="dom-card" style="padding:10px; display:flex; flex-direction:column; gap:2px;" id="rec-subtabs">
+                <button type="button" class="paas-status-tab active" data-rectab="overview" style="justify-content:flex-start; text-align:left; width:100%; border-radius:7px;">Project Overview</button>
+                <button type="button" class="paas-status-tab" data-rectab="database" style="justify-content:flex-start; text-align:left; width:100%; border-radius:7px;">Table Editor</button>
+                <button type="button" class="paas-status-tab" data-rectab="sql" style="justify-content:flex-start; text-align:left; width:100%; border-radius:7px;">SQL Editor</button>
+                <div style="height:1px; background:var(--border); margin:6px 4px;"></div>
+                <button type="button" class="paas-status-tab" data-rectab="schemas" style="justify-content:flex-start; text-align:left; width:100%; border-radius:7px;">Database</button>
+                <button type="button" class="paas-status-tab" data-rectab="auth" style="justify-content:flex-start; text-align:left; width:100%; border-radius:7px;">Authentication</button>
+                <button type="button" class="paas-status-tab" data-rectab="storage" style="justify-content:flex-start; text-align:left; width:100%; border-radius:7px;">Storage</button>
+                <div style="height:1px; background:var(--border); margin:6px 4px;"></div>
+                <button type="button" class="paas-status-tab" data-rectab="settings" style="justify-content:flex-start; text-align:left; width:100%; border-radius:7px;">Project Settings</button>
               </div>
-            </div>
 
-            <!-- Studio 2: Auth (Users Management) -->
-            <div id="rec-panel-auth" class="rec-panel" style="display:none;">
-              <div class="dom-card" style="padding:16px 20px;">
-                <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
-                  <div>
-                    <h3 style="margin:0; font-size:15px;">Authentication &amp; Users</h3>
-                    <p style="margin:2px 0 0; font-size:12.5px; color:var(--text-secondary);">Manage user accounts stored in this service's database.</p>
-                  </div>
-                  <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                    <span style="font-size:12px; color:var(--text-secondary);">Users Table:</span>
-                    <select class="select" id="rec-auth-table-select" style="height:32px; font-size:12.5px; min-width:150px;"></select>
-                    <button type="button" class="btn btn-primary btn-sm" id="rec-auth-add-btn">+ Add User</button>
+              <div style="min-width:0;">
+                <!-- 1. Project Overview -->
+                <div id="rec-panel-overview" class="rec-panel">
+                  <div class="dom-card" style="padding:18px 20px; margin-bottom:14px;">
+                    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin-bottom:16px;">
+                      <div>
+                        <h3 style="margin:0; font-size:18px; font-weight:700;" id="rec-ov-name">Database Project</h3>
+                        <div style="font-size:12px; color:var(--text-muted); font-family:var(--mono); margin-top:2px;" id="rec-ov-host">—</div>
+                      </div>
+                      <span class="badge badge-running" id="rec-ov-status">Healthy</span>
+                    </div>
+                    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px;">
+                      <div style="border:1px solid var(--border); border-radius:8px; padding:12px;">
+                        <div style="font-size:11px; color:var(--text-muted); font-weight:600;">POSTGRES TABLES</div>
+                        <div style="font-size:20px; font-weight:700; margin-top:4px;" id="rec-ov-tables-count">0</div>
+                      </div>
+                      <div style="border:1px solid var(--border); border-radius:8px; padding:12px;">
+                        <div style="font-size:11px; color:var(--text-muted); font-weight:600;">TOTAL RECORDS</div>
+                        <div style="font-size:20px; font-weight:700; margin-top:4px;" id="rec-ov-rows-count">0</div>
+                      </div>
+                      <div style="border:1px solid var(--border); border-radius:8px; padding:12px;">
+                        <div style="font-size:11px; color:var(--text-muted); font-weight:600;">STORAGE BUCKETS</div>
+                        <div style="font-size:20px; font-weight:700; margin-top:4px;" id="rec-ov-buckets-count">0</div>
+                      </div>
+                      <div style="border:1px solid var(--border); border-radius:8px; padding:12px;">
+                        <div style="font-size:11px; color:var(--text-muted); font-weight:600;">COMPUTE / ENGINE</div>
+                        <div style="font-size:14px; font-weight:700; margin-top:6px;">PostgreSQL 16</div>
+                      </div>
+                    </div>
                   </div>
                 </div>
-                <div style="overflow-x:auto; border:1px solid var(--border); border-radius:8px;">
-                  <table style="width:100%; border-collapse:collapse; font-size:12.5px;">
-                    <thead id="rec-auth-thead"></thead>
-                    <tbody id="rec-auth-tbody"></tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
 
-            <!-- Studio 3: Storage & Persistent Disks -->
-            <div id="rec-panel-storage" class="rec-panel" style="display:none;">
-              <div class="dom-card" style="padding:16px 20px; margin-bottom:14px;">
-                <h3 style="margin:0 0 6px; font-size:15px;">Persistent Storage &amp; Mounted Disks</h3>
-                <p style="margin:0 0 14px; font-size:12.5px; color:var(--text-secondary);">View, attach, or remove Docker persistent volumes mounted into this service.</p>
-                <div id="rec-mounts-list" style="margin-bottom:14px;"></div>
-                <div id="rec-mount-add-form" style="display:flex; gap:8px; flex-wrap:wrap; padding-top:12px; border-top:1px solid var(--border);">
-                  <input type="text" class="input" id="rec-mount-vol-input" placeholder="Volume name (e.g. nod-uploads)" style="flex:1; min-width:180px; margin-bottom:0;" />
-                  <input type="text" class="input" id="rec-mount-path-input" placeholder="Mount path (e.g. /app/data)" style="flex:1; min-width:180px; margin-bottom:0;" />
-                  <button type="button" class="btn btn-primary btn-sm" id="rec-mount-add-btn">+ Attach Disk</button>
+                <!-- 2. Table Editor -->
+                <div id="rec-panel-database" class="rec-panel" style="display:none;">
+                  <div style="display:grid; grid-template-columns:210px 1fr; gap:12px; align-items:start;">
+                    <div class="dom-card" style="padding:12px;">
+                      <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+                        <span style="font-size:11px; font-weight:700; text-transform:uppercase; color:var(--text-muted);">schema: public</span>
+                        <button type="button" class="btn btn-secondary btn-sm" id="rec-new-table-btn" style="padding:2px 8px; font-size:11px;">+ New table</button>
+                      </div>
+                      <input type="text" class="input" id="rec-table-filter" placeholder="Search tables..." style="height:28px; font-size:12px; margin-bottom:8px;" />
+                      <div id="rec-tables-list" style="display:flex; flex-direction:column; gap:3px; max-height:420px; overflow-y:auto;"></div>
+                    </div>
+                    <div class="dom-card" style="padding:14px 16px; min-width:0;">
+                      <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:12px;">
+                        <div>
+                          <strong id="rec-active-table-name" style="font-size:14.5px; font-family:var(--mono);">Select a table</strong>
+                          <span id="rec-active-table-count" style="font-size:12px; color:var(--text-muted); margin-left:8px;"></span>
+                        </div>
+                        <div style="display:flex; gap:8px; align-items:center;">
+                          <input type="text" class="input" id="rec-row-search" placeholder="Filter rows..." style="width:170px; height:30px; font-size:12px; margin-bottom:0;" />
+                          <button type="button" class="btn btn-primary btn-sm" id="rec-insert-row-btn">+ Insert</button>
+                        </div>
+                      </div>
+                      <div style="overflow-x:auto; border:1px solid var(--border); border-radius:8px;">
+                        <table id="rec-rows-table" style="width:100%; border-collapse:collapse; font-size:12.5px;">
+                          <thead id="rec-rows-thead"></thead>
+                          <tbody id="rec-rows-tbody"></tbody>
+                        </table>
+                      </div>
+                      <div style="display:flex; align-items:center; justify-content:space-between; margin-top:10px; font-size:12px; color:var(--text-secondary);">
+                        <span id="rec-page-info">0 row(s)</span>
+                        <div style="display:flex; gap:6px;">
+                          <button type="button" class="btn btn-secondary btn-sm" id="rec-prev-btn">Prev</button>
+                          <button type="button" class="btn btn-secondary btn-sm" id="rec-next-btn">Next</button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 3. SQL Editor -->
+                <div id="rec-panel-sql" class="rec-panel" style="display:none;">
+                  <div class="dom-card" style="padding:16px 20px;">
+                    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:10px;">
+                      <div>
+                        <h3 style="margin:0; font-size:15px;">SQL Editor</h3>
+                        <p style="margin:2px 0 0; font-size:12px; color:var(--text-muted);">Press Ctrl+Enter or click Run to execute SQL against this PostgreSQL database.</p>
+                      </div>
+                      <div style="display:flex; gap:6px; align-items:center;">
+                        <select class="select" id="rec-sql-template-select" style="height:30px; font-size:12px;">
+                          <option value="">Templates...</option>
+                          <option value="SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';">List Public Tables</option>
+                          <option value="SELECT now() AS server_time, current_database() AS db;">Check Database Time</option>
+                        </select>
+                        <button type="button" class="btn btn-primary btn-sm" id="rec-sql-run-btn">Run SQL</button>
+                      </div>
+                    </div>
+                    <textarea id="rec-sql-input" rows="7" placeholder="SELECT * FROM users LIMIT 50;" style="width:100%; font-family:var(--mono); font-size:12.5px; padding:12px; border:1px solid var(--border); border-radius:8px; background:#0f172a; color:#f8fafc; resize:vertical; margin-bottom:12px;"></textarea>
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+                      <strong style="font-size:13px;">Results</strong>
+                      <span id="rec-sql-meta" style="font-size:12px; color:var(--text-muted);">Ready</span>
+                    </div>
+                    <div style="overflow-x:auto; border:1px solid var(--border); border-radius:8px; max-height:340px;">
+                      <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                        <thead id="rec-sql-thead"></thead>
+                        <tbody id="rec-sql-tbody"><tr><td style="padding:16px; color:var(--text-muted); text-align:center;">Click Run SQL to execute your query.</td></tr></tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 4. Database (Schema Visualizer) -->
+                <div id="rec-panel-schemas" class="rec-panel" style="display:none;">
+                  <div class="dom-card" style="padding:16px 20px;">
+                    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
+                      <div>
+                        <h3 style="margin:0; font-size:15px;">Schema Visualizer (public)</h3>
+                        <p style="margin:2px 0 0; font-size:12px; color:var(--text-muted);">Visual overview of all tables, columns, and data types in this database.</p>
+                      </div>
+                      <button type="button" class="btn btn-secondary btn-sm" id="rec-schemas-new-tbl-btn">+ New table</button>
+                    </div>
+                    <div id="rec-schema-cards" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(240px, 1fr)); gap:12px;"></div>
+                  </div>
+                </div>
+
+                <!-- 5. Authentication (Users) -->
+                <div id="rec-panel-auth" class="rec-panel" style="display:none;">
+                  <div class="dom-card" style="padding:16px 20px;">
+                    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+                      <div>
+                        <h3 style="margin:0; font-size:15px;">Authentication &amp; Users</h3>
+                        <p style="margin:2px 0 0; font-size:12px; color:var(--text-muted);">Manage users registered in this service's database.</p>
+                      </div>
+                      <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                        <input type="text" class="input" id="rec-auth-search" placeholder="Search by email..." style="width:165px; height:30px; font-size:12px; margin-bottom:0;" />
+                        <select class="select" id="rec-auth-table-select" style="height:30px; font-size:12px; min-width:140px;"></select>
+                        <button type="button" class="btn btn-primary btn-sm" id="rec-auth-add-btn">+ Add user</button>
+                      </div>
+                    </div>
+                    <div style="overflow-x:auto; border:1px solid var(--border); border-radius:8px;">
+                      <table style="width:100%; border-collapse:collapse; font-size:12.5px;">
+                        <thead id="rec-auth-thead"></thead>
+                        <tbody id="rec-auth-tbody"></tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 6. Storage (Buckets & Files + Persistent Disks) -->
+                <div id="rec-panel-storage" class="rec-panel" style="display:none;">
+                  <div class="dom-card" style="padding:16px 20px; margin-bottom:14px;">
+                    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+                      <div>
+                        <h3 style="margin:0; font-size:15px;">Files &amp; Buckets</h3>
+                        <p style="margin:2px 0 0; font-size:12px; color:var(--text-muted);">Create storage buckets and upload, preview, or delete files.</p>
+                      </div>
+                      <button type="button" class="btn btn-primary btn-sm" id="rec-new-bucket-btn">+ New bucket</button>
+                    </div>
+                    <div style="display:grid; grid-template-columns:240px 1fr; gap:12px; align-items:start;">
+                      <div style="border:1px solid var(--border); border-radius:8px; padding:8px;" id="rec-buckets-list"></div>
+                      <div style="border:1px solid var(--border); border-radius:8px; padding:12px; min-width:0;">
+                        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:10px;">
+                          <strong id="rec-active-bucket-name" style="font-size:13.5px;">Select a bucket</strong>
+                          <div style="display:flex; gap:6px;">
+                            <input type="file" id="rec-file-upload-input" style="display:none;" />
+                            <button type="button" class="btn btn-secondary btn-sm" id="rec-file-upload-btn" style="display:none;">+ Upload File</button>
+                          </div>
+                        </div>
+                        <div id="rec-objects-list" style="font-size:12.5px; color:var(--text-muted);">Select or create a bucket on the left.</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="dom-card" style="padding:16px 20px;">
+                    <h3 style="margin:0 0 6px; font-size:15px;">Mounted Persistent Disks (Docker Volumes)</h3>
+                    <p style="margin:0 0 12px; font-size:12px; color:var(--text-muted);">Attach or remove Docker persistent volumes mounted into this service.</p>
+                    <div id="rec-mounts-list" style="margin-bottom:12px;"></div>
+                    <div id="rec-mount-add-form" style="display:flex; gap:8px; flex-wrap:wrap; padding-top:12px; border-top:1px solid var(--border);">
+                      <input type="text" class="input" id="rec-mount-vol-input" placeholder="Volume name (e.g. nod-uploads)" style="flex:1; min-width:180px; margin-bottom:0;" />
+                      <input type="text" class="input" id="rec-mount-path-input" placeholder="Mount path (e.g. /app/data)" style="flex:1; min-width:180px; margin-bottom:0;" />
+                      <button type="button" class="btn btn-primary btn-sm" id="rec-mount-add-btn">+ Attach Disk</button>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 7. Project Settings -->
+                <div id="rec-panel-settings" class="rec-panel" style="display:none;">
+                  <div class="dom-card" style="padding:16px 20px;" id="rec-settings-card"></div>
                 </div>
               </div>
             </div>
@@ -2706,6 +2828,57 @@
               <div style="padding:12px 22px 18px; border-top:1px solid #f1f5f9; display:flex; justify-content:space-between;">
                 <button type="button" class="btn btn-secondary" id="rec-row-modal-cancel">Cancel</button>
                 <button type="button" class="btn btn-primary" id="rec-row-modal-save">Save Record</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- MODAL: NEW TABLE -->
+          <div class="drawer-backdrop" id="rec-new-table-modal-backdrop" style="align-items:center; justify-content:center;">
+            <div style="background:#ffffff; border:1px solid var(--border); border-radius:12px; width:520px; max-width:94vw; box-shadow:0 20px 50px rgba(15,23,42,0.18); overflow:hidden;">
+              <div style="padding:18px 22px 12px; border-bottom:1px solid #f1f5f9; display:flex; align-items:center; justify-content:space-between;">
+                <h2 style="margin:0; font-size:17px; font-weight:700;">Create New Table</h2>
+                <button type="button" class="icon-btn" id="rec-nt-close">✕</button>
+              </div>
+              <div style="padding:16px 22px; display:flex; flex-direction:column; gap:10px; max-height:66vh; overflow-y:auto;">
+                <div>
+                  <label style="display:block; font-size:12px; font-weight:600; margin-bottom:4px;">Table Name</label>
+                  <input type="text" class="input" id="rec-nt-name" placeholder="e.g. products" style="margin-bottom:0;" />
+                </div>
+                <div>
+                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                    <label style="font-size:12px; font-weight:600;">Columns</label>
+                    <button type="button" class="btn btn-secondary btn-sm" id="rec-nt-add-col-btn">+ Add Column</button>
+                  </div>
+                  <div id="rec-nt-cols" style="display:flex; flex-direction:column; gap:6px;"></div>
+                </div>
+              </div>
+              <div style="padding:12px 22px 18px; border-top:1px solid #f1f5f9; display:flex; justify-content:space-between;">
+                <button type="button" class="btn btn-secondary" id="rec-nt-cancel">Cancel</button>
+                <button type="button" class="btn btn-primary" id="rec-nt-save">Create Table</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- MODAL: NEW STORAGE BUCKET -->
+          <div class="drawer-backdrop" id="rec-new-bucket-modal-backdrop" style="align-items:center; justify-content:center;">
+            <div style="background:#ffffff; border:1px solid var(--border); border-radius:12px; width:440px; max-width:94vw; box-shadow:0 20px 50px rgba(15,23,42,0.18); overflow:hidden;">
+              <div style="padding:18px 22px 12px; border-bottom:1px solid #f1f5f9; display:flex; align-items:center; justify-content:space-between;">
+                <h2 style="margin:0; font-size:17px; font-weight:700;">Create Storage Bucket</h2>
+                <button type="button" class="icon-btn" id="rec-nb-close">✕</button>
+              </div>
+              <div style="padding:16px 22px; display:flex; flex-direction:column; gap:10px;">
+                <div>
+                  <label style="display:block; font-size:12px; font-weight:600; margin-bottom:4px;">Bucket Name</label>
+                  <input type="text" class="input" id="rec-nb-name" placeholder="e.g. menu-images" style="margin-bottom:0;" />
+                </div>
+                <label style="display:flex; align-items:center; gap:8px; font-size:12.5px; cursor:pointer;">
+                  <input type="checkbox" id="rec-nb-public" checked />
+                  <span>Public bucket (files can be viewed via public URL)</span>
+                </label>
+              </div>
+              <div style="padding:12px 22px 18px; border-top:1px solid #f1f5f9; display:flex; justify-content:space-between;">
+                <button type="button" class="btn btn-secondary" id="rec-nb-cancel">Cancel</button>
+                <button type="button" class="btn btn-primary" id="rec-nb-save">Create Bucket</button>
               </div>
             </div>
           </div>
