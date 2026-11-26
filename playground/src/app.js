@@ -4773,6 +4773,7 @@ function switchServiceDetailTab(tabName) {
   if (target) target.style.display = 'block';
   if (tabName === 'logs') loadServiceDetailLogs();
   else stopSdLogAutoRefresh();
+  if (tabName === 'records' && typeof openRecordsStudio === 'function') openRecordsStudio();
 }
 
 function renderFilteredSdLogs() {
@@ -4883,9 +4884,12 @@ function renderServiceDetail(svc) {
 
   const isWeb = svc.kind === 'web';
   const isDb = svc.kind === 'postgres' || svc.kind === 'redis';
+  const showRecords = svc.kind === 'postgres' || svc.kind === 'web' || svc.kind === 'blueprint';
   $('#sd-tab-btn-env').style.display = isWeb ? 'inline-block' : 'none';
   $('#sd-tab-btn-domains').style.display = isWeb ? 'inline-block' : 'none';
   $('#sd-tab-btn-connect').style.display = isDb ? 'inline-block' : 'none';
+  if ($('#sd-tab-btn-records')) $('#sd-tab-btn-records').style.display = showRecords ? 'inline-block' : 'none';
+  if ($('#sd-records-btn')) $('#sd-records-btn').style.display = showRecords ? 'inline-flex' : 'none';
   switchServiceDetailTab(isDb ? 'connect' : 'events');
 
   // 1. Live Containers
@@ -7149,3 +7153,434 @@ $('#wm-cg-save-btn')?.addEventListener('click', async () => {
   switchView('webmail');
   if (topbarPageTitle) topbarPageTitle.textContent = 'Mail';
 })();
+
+// ============================================================================
+// --- RECORDS STUDIO (Auth + Database + Storage/Disks for App Hosting) ---
+// ============================================================================
+let recActiveDbId = null;
+let recTables = [];
+let recActiveTable = '';
+let recTableColumns = [];
+let recPrimaryKeys = [];
+let recRows = [];
+let recTotalRows = 0;
+let recOffset = 0;
+const REC_LIMIT = 50;
+let recEditingRowWhere = null; // null = insert, object = update
+let recModalMode = 'database'; // 'database' | 'auth'
+
+$('#sd-records-btn')?.addEventListener('click', () => {
+  switchServiceDetailTab('records');
+});
+
+function switchRecordsSubTab(tab) {
+  $$('#rec-subtabs .paas-status-tab').forEach((b) => b.classList.toggle('active', b.dataset.rectab === tab));
+  $$('.rec-panel').forEach((p) => { p.style.display = 'none'; });
+  const target = $(`#rec-panel-${tab}`);
+  if (target) target.style.display = 'block';
+  if (tab === 'auth') loadAuthTableRows();
+  if (tab === 'storage') renderRecMounts();
+}
+
+$$('#rec-subtabs .paas-status-tab').forEach((btn) => {
+  btn.addEventListener('click', () => switchRecordsSubTab(btn.dataset.rectab));
+});
+
+async function openRecordsStudio() {
+  if (!currentServiceDetail) return;
+  const dbSel = $('#rec-db-select');
+  const pgList = (paasAllServices || []).filter((s) => s.kind === 'postgres');
+  if (currentServiceDetail.kind === 'postgres' && !pgList.some((s) => s.id === currentServiceDetail.id)) {
+    pgList.unshift({ id: currentServiceDetail.id, name: currentServiceDetail.name, kind: 'postgres' });
+  }
+  if (dbSel) {
+    if (pgList.length === 0) {
+      dbSel.innerHTML = '<option value="">No PostgreSQL databases</option>';
+    } else {
+      dbSel.innerHTML = pgList.map((d) => `<option value="${d.id}">${d.name}</option>`).join('');
+    }
+  }
+  if (currentServiceDetail.kind === 'postgres') {
+    recActiveDbId = currentServiceDetail.id;
+  } else {
+    const svcSlug = (currentServiceDetail.name || '').toLowerCase().replace(/-web$|-app$/, '');
+    const match = pgList.find((d) => d.name.toLowerCase().includes(svcSlug)) || pgList[0];
+    recActiveDbId = match ? match.id : '';
+  }
+  if (dbSel && recActiveDbId) dbSel.value = recActiveDbId;
+  switchRecordsSubTab('database');
+  renderRecMounts();
+  await loadRecTables();
+}
+
+$('#rec-db-select')?.addEventListener('change', async (e) => {
+  recActiveDbId = e.target.value;
+  recActiveTable = '';
+  recOffset = 0;
+  await loadRecTables();
+  if ($('#rec-panel-auth')?.style.display !== 'none') await loadAuthTableRows();
+});
+
+$('#rec-refresh-btn')?.addEventListener('click', async () => {
+  await loadRecTables();
+  if ($('#rec-panel-auth')?.style.display !== 'none') await loadAuthTableRows();
+  if ($('#rec-panel-storage')?.style.display !== 'none') {
+    await openServiceDetail(currentServiceDetail.kind, currentServiceDetail.id);
+    switchServiceDetailTab('records');
+    switchRecordsSubTab('storage');
+  }
+});
+
+async function loadRecTables() {
+  const listEl = $('#rec-tables-list');
+  const authSel = $('#rec-auth-table-select');
+  if (!recActiveDbId) {
+    if (listEl) listEl.innerHTML = '<div style="font-size:12px; color:var(--text-muted); padding:6px;">No PostgreSQL database selected.</div>';
+    if (authSel) authSel.innerHTML = '';
+    renderRecRowsEmpty('Select or deploy a PostgreSQL database to manage records.');
+    return;
+  }
+  if (listEl) listEl.innerHTML = '<div style="font-size:12px; color:var(--text-muted); padding:6px;">Connecting...</div>';
+  try {
+    const data = await resellerFetch(`/paas/records/postgres/${encodeURIComponent(recActiveDbId)}/tables`);
+    recTables = Array.isArray(data.tables) ? data.tables : [];
+    if (authSel) {
+      authSel.innerHTML = recTables.map((t) => `<option value="${t.name}">${t.name}</option>`).join('');
+      const authGuess = recTables.find((t) => /^(users?|accounts?|auth_users|profiles)$/i.test(t.name))
+        || recTables.find((t) => (t.columns || []).some((c) => /email/i.test(c.name)));
+      if (authGuess) authSel.value = authGuess.name;
+    }
+    renderRecTablesList();
+    if (recTables.length > 0) {
+      if (!recActiveTable || !recTables.some((t) => t.name === recActiveTable)) {
+        recActiveTable = recTables[0].name;
+      }
+      await loadRecRows();
+    } else {
+      renderRecRowsEmpty('No tables found in public schema yet.');
+    }
+  } catch (e) {
+    if (listEl) listEl.innerHTML = `<div style="font-size:12px; color:#dc2626; padding:6px;">${e.message}</div>`;
+    renderRecRowsEmpty(`Could not connect to database: ${e.message}`);
+  }
+}
+
+function renderRecTablesList() {
+  const listEl = $('#rec-tables-list');
+  if (!listEl) return;
+  if (recTables.length === 0) {
+    listEl.innerHTML = '<div style="font-size:12px; color:var(--text-muted); padding:6px;">No tables yet.</div>';
+    return;
+  }
+  listEl.innerHTML = '';
+  recTables.forEach((t) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    const active = t.name === recActiveTable;
+    btn.style.cssText = `display:flex; align-items:center; justify-content:space-between; width:100%; text-align:left; padding:7px 10px; border-radius:7px; border:none; cursor:pointer; font-size:12.5px; font-family:var(--mono); background:${active ? '#0f172a' : 'transparent'}; color:${active ? '#ffffff' : 'var(--text-primary)'};`;
+    btn.innerHTML = `<span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${t.name}</span><span style="font-size:11px; opacity:0.75; margin-left:6px;">${t.approxRows}</span>`;
+    btn.addEventListener('click', async () => {
+      recActiveTable = t.name;
+      recOffset = 0;
+      renderRecTablesList();
+      await loadRecRows();
+    });
+    listEl.appendChild(btn);
+  });
+}
+
+function renderRecRowsEmpty(msg) {
+  $('#rec-active-table-name').textContent = recActiveTable || 'Database';
+  $('#rec-active-table-count').textContent = '';
+  $('#rec-rows-thead').innerHTML = '';
+  $('#rec-rows-tbody').innerHTML = `<tr><td style="padding:24px; text-align:center; color:var(--text-muted);">${msg}</td></tr>`;
+  $('#rec-page-info').textContent = '0 row(s)';
+}
+
+async function loadRecRows() {
+  if (!recActiveDbId || !recActiveTable) return;
+  const search = ($('#rec-row-search')?.value || '').trim();
+  try {
+    const q = new URLSearchParams({ table: recActiveTable, limit: String(REC_LIMIT), offset: String(recOffset), search });
+    const data = await resellerFetch(`/paas/records/postgres/${encodeURIComponent(recActiveDbId)}/rows?${q.toString()}`);
+    recTableColumns = data.columns || [];
+    recPrimaryKeys = data.primaryKeys || [];
+    recRows = data.rows || [];
+    recTotalRows = Number(data.total || 0);
+    renderRecRowsTable();
+  } catch (e) {
+    renderRecRowsEmpty(`Error loading rows: ${e.message}`);
+  }
+}
+
+function formatCellValue(v) {
+  if (v === null || v === undefined) return '<span style="color:#94a3b8; font-style:italic;">null</span>';
+  const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+  const esc = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return esc.length > 80 ? esc.slice(0, 77) + '...' : esc;
+}
+
+function buildRowWhere(row) {
+  if (recPrimaryKeys.length > 0 && recPrimaryKeys.every((pk) => row[pk] !== undefined)) {
+    const w = {};
+    recPrimaryKeys.forEach((pk) => { w[pk] = row[pk]; });
+    return w;
+  }
+  return { _ctid: row._ctid };
+}
+
+function renderRecRowsTable() {
+  $('#rec-active-table-name').textContent = recActiveTable;
+  $('#rec-active-table-count').textContent = `${recTotalRows} row(s)`;
+  const thead = $('#rec-rows-thead');
+  const tbody = $('#rec-rows-tbody');
+  if (!thead || !tbody) return;
+
+  thead.innerHTML = `<tr style="background:#f8fafc; border-bottom:1px solid var(--border);">${recTableColumns.map((c) => `<th style="padding:8px 10px; text-align:left; font-weight:600; white-space:nowrap;">${c.name}<div style="font-size:10px; font-weight:400; color:var(--text-muted);">${c.type}</div></th>`).join('')}<th style="padding:8px 10px; text-align:right; font-weight:600; white-space:nowrap;">ACTIONS</th></tr>`;
+
+  if (recRows.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="${recTableColumns.length + 1}" style="padding:20px; text-align:center; color:var(--text-muted);">No records found in ${recActiveTable}.</td></tr>`;
+  } else {
+    tbody.innerHTML = '';
+    recRows.forEach((row) => {
+      const tr = document.createElement('tr');
+      tr.style.borderBottom = '1px solid #f1f5f9';
+      tr.innerHTML = `${recTableColumns.map((c) => `<td style="padding:7px 10px; font-family:var(--mono); font-size:12px; max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${formatCellValue(row[c.name])}</td>`).join('')}<td style="padding:6px 10px; text-align:right; white-space:nowrap;"></td>`;
+      const editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'btn btn-secondary btn-sm';
+      editBtn.style.cssText = 'padding:3px 8px; font-size:11px; margin-right:4px;';
+      editBtn.textContent = 'Edit';
+      editBtn.addEventListener('click', () => openRecRowModal(row, 'database'));
+
+      const delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.className = 'btn btn-danger-ghost btn-sm';
+      delBtn.style.cssText = 'padding:3px 8px; font-size:11px;';
+      delBtn.textContent = 'Delete';
+      delBtn.addEventListener('click', async () => {
+        try {
+          await resellerFetch(`/paas/records/postgres/${encodeURIComponent(recActiveDbId)}/rows`, {
+            method: 'DELETE',
+            body: JSON.stringify({ table: recActiveTable, where: buildRowWhere(row) }),
+          });
+          setStatus('Record deleted', 'connected');
+          await loadRecRows();
+        } catch (e) {
+          setStatus(`Delete failed: ${e.message}`, 'error');
+        }
+      });
+      tr.lastElementChild.append(editBtn, delBtn);
+      tbody.appendChild(tr);
+    });
+  }
+
+  const start = recTotalRows === 0 ? 0 : recOffset + 1;
+  const end = Math.min(recTotalRows, recOffset + recRows.length);
+  $('#rec-page-info').textContent = `Showing ${start}–${end} of ${recTotalRows}`;
+  if ($('#rec-prev-btn')) $('#rec-prev-btn').disabled = recOffset <= 0;
+  if ($('#rec-next-btn')) $('#rec-next-btn').disabled = recOffset + REC_LIMIT >= recTotalRows;
+}
+
+$('#rec-row-search')?.addEventListener('input', () => { recOffset = 0; loadRecRows(); });
+$('#rec-prev-btn')?.addEventListener('click', () => { recOffset = Math.max(0, recOffset - REC_LIMIT); loadRecRows(); });
+$('#rec-next-btn')?.addEventListener('click', () => { recOffset += REC_LIMIT; loadRecRows(); });
+$('#rec-insert-row-btn')?.addEventListener('click', () => openRecRowModal(null, 'database'));
+
+// --- Auth Sub-Tab ---
+async function loadAuthTableRows() {
+  const authTbl = $('#rec-auth-table-select')?.value;
+  const thead = $('#rec-auth-thead');
+  const tbody = $('#rec-auth-tbody');
+  if (!recActiveDbId || !authTbl || !thead || !tbody) {
+    if (tbody) tbody.innerHTML = '<tr><td style="padding:20px; text-align:center; color:var(--text-muted);">No users table detected in this database.</td></tr>';
+    return;
+  }
+  try {
+    const data = await resellerFetch(`/paas/records/postgres/${encodeURIComponent(recActiveDbId)}/rows?table=${encodeURIComponent(authTbl)}&limit=100`);
+    const cols = data.columns || [];
+    const pks = data.primaryKeys || [];
+    const rows = data.rows || [];
+    const displayCols = cols.filter((c) => !/password|hash|salt|secret|token/i.test(c.name)).slice(0, 6);
+    thead.innerHTML = `<tr style="background:#f8fafc; border-bottom:1px solid var(--border);">${displayCols.map((c) => `<th style="padding:8px 10px; text-align:left; font-weight:600;">${c.name}</th>`).join('')}<th style="padding:8px 10px; text-align:right; font-weight:600;">ACTIONS</th></tr>`;
+    if (rows.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="${displayCols.length + 1}" style="padding:20px; text-align:center; color:var(--text-muted);">No user records in ${authTbl}.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = '';
+    rows.forEach((row) => {
+      const tr = document.createElement('tr');
+      tr.style.borderBottom = '1px solid #f1f5f9';
+      tr.innerHTML = `${displayCols.map((c) => `<td style="padding:7px 10px; font-size:12.5px;">${formatCellValue(row[c.name])}</td>`).join('')}<td style="padding:6px 10px; text-align:right; white-space:nowrap;"></td>`;
+      const editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'btn btn-secondary btn-sm';
+      editBtn.style.cssText = 'padding:3px 8px; font-size:11px; margin-right:4px;';
+      editBtn.textContent = 'Edit';
+      editBtn.addEventListener('click', () => {
+        recActiveTable = authTbl;
+        recTableColumns = cols;
+        recPrimaryKeys = pks;
+        openRecRowModal(row, 'auth');
+      });
+
+      const delBtn = document.createElement('button');
+      delBtn.type = 'button';
+      delBtn.className = 'btn btn-danger-ghost btn-sm';
+      delBtn.style.cssText = 'padding:3px 8px; font-size:11px;';
+      delBtn.textContent = 'Delete';
+      delBtn.addEventListener('click', async () => {
+        const w = pks.length > 0 && pks.every((pk) => row[pk] !== undefined)
+          ? Object.fromEntries(pks.map((pk) => [pk, row[pk]]))
+          : { _ctid: row._ctid };
+        await resellerFetch(`/paas/records/postgres/${encodeURIComponent(recActiveDbId)}/rows`, {
+          method: 'DELETE',
+          body: JSON.stringify({ table: authTbl, where: w }),
+        });
+        setStatus('User deleted', 'connected');
+        await loadAuthTableRows();
+      });
+      tr.lastElementChild.append(editBtn, delBtn);
+      tbody.appendChild(tr);
+    });
+  } catch (e) {
+    tbody.innerHTML = `<tr><td style="padding:20px; color:#dc2626;">${e.message}</td></tr>`;
+  }
+}
+
+$('#rec-auth-table-select')?.addEventListener('change', loadAuthTableRows);
+$('#rec-auth-add-btn')?.addEventListener('click', async () => {
+  const authTbl = $('#rec-auth-table-select')?.value;
+  if (!authTbl || !recActiveDbId) return setStatus('Select a users table first', 'error');
+  const data = await resellerFetch(`/paas/records/postgres/${encodeURIComponent(recActiveDbId)}/rows?table=${encodeURIComponent(authTbl)}&limit=1`);
+  recActiveTable = authTbl;
+  recTableColumns = data.columns || [];
+  recPrimaryKeys = data.primaryKeys || [];
+  openRecRowModal(null, 'auth');
+});
+
+// --- Insert / Edit Record Modal ---
+function openRecRowModal(row = null, mode = 'database') {
+  if (!recActiveTable || recTableColumns.length === 0) return setStatus('Select a table first', 'error');
+  recModalMode = mode;
+  recEditingRowWhere = row ? buildRowWhere(row) : null;
+  $('#rec-row-modal-title').textContent = row
+    ? `Edit ${mode === 'auth' ? 'User' : 'Record'} (${recActiveTable})`
+    : `Add ${mode === 'auth' ? 'User' : 'Record'} (${recActiveTable})`;
+  const fieldsEl = $('#rec-row-modal-fields');
+  fieldsEl.innerHTML = '';
+  recTableColumns.forEach((c) => {
+    const wrap = document.createElement('div');
+    const val = row && row[c.name] !== null && row[c.name] !== undefined
+      ? (typeof row[c.name] === 'object' ? JSON.stringify(row[c.name]) : String(row[c.name]))
+      : '';
+    const hint = !row && c.hasDefault ? ' (auto/default if blank)' : '';
+    wrap.innerHTML = `
+      <label style="display:block; font-size:12px; font-weight:600; margin-bottom:4px;">${c.name} <span style="font-weight:400; color:var(--text-muted);">${c.type}${hint}</span></label>
+      <input type="text" class="input rec-field-input" data-col="${c.name}" value="${val.replace(/"/g, '&quot;')}" placeholder="${c.nullable ? 'NULL' : ''}" style="margin-bottom:0; font-family:var(--mono); font-size:12.5px;" />
+    `;
+    fieldsEl.appendChild(wrap);
+  });
+  $('#rec-row-modal-backdrop')?.classList.add('open');
+}
+
+function closeRecRowModal() {
+  $('#rec-row-modal-backdrop')?.classList.remove('open');
+}
+
+$('#rec-row-modal-close')?.addEventListener('click', closeRecRowModal);
+$('#rec-row-modal-cancel')?.addEventListener('click', closeRecRowModal);
+$('#rec-row-modal-save')?.addEventListener('click', async () => {
+  const btn = $('#rec-row-modal-save');
+  const payload = {};
+  $$('#rec-row-modal-fields .rec-field-input').forEach((inp) => {
+    const col = inp.dataset.col;
+    const raw = inp.value;
+    if (!recEditingRowWhere && raw === '') return; // let DB defaults apply on insert
+    payload[col] = raw;
+  });
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+  try {
+    if (recEditingRowWhere) {
+      await resellerFetch(`/paas/records/postgres/${encodeURIComponent(recActiveDbId)}/rows`, {
+        method: 'PUT',
+        body: JSON.stringify({ table: recActiveTable, where: recEditingRowWhere, data: payload }),
+      });
+      setStatus('Record updated', 'connected');
+    } else {
+      await resellerFetch(`/paas/records/postgres/${encodeURIComponent(recActiveDbId)}/rows`, {
+        method: 'POST',
+        body: JSON.stringify({ table: recActiveTable, data: payload }),
+      });
+      setStatus('Record inserted', 'connected');
+    }
+    closeRecRowModal();
+    if (recModalMode === 'auth') await loadAuthTableRows();
+    else await loadRecRows();
+  } catch (e) {
+    setStatus(`Save failed: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save Record';
+  }
+});
+
+// --- Storage & Persistent Disks Sub-Tab ---
+function renderRecMounts() {
+  const listEl = $('#rec-mounts-list');
+  const addForm = $('#rec-mount-add-form');
+  if (!listEl || !currentServiceDetail) return;
+  const canMount = currentServiceDetail.kind === 'web' || currentServiceDetail.kind === 'postgres';
+  if (addForm) addForm.style.display = canMount ? 'flex' : 'none';
+  const mounts = Array.isArray(currentServiceDetail.mounts) ? currentServiceDetail.mounts : [];
+  if (mounts.length === 0) {
+    listEl.innerHTML = '<p style="font-size:13px; color:var(--text-secondary);">No persistent disks or volume mounts attached to this service yet.</p>';
+    return;
+  }
+  listEl.innerHTML = '';
+  mounts.forEach((m) => {
+    const row = document.createElement('div');
+    row.className = 'bp-service-preview';
+    row.innerHTML = `
+      <div>
+        <div style="font-size:13px; font-weight:600; font-family:var(--mono);">${m.mountPath || '/data'}</div>
+        <div style="font-size:12px; color:var(--text-secondary);">Type: ${m.type || 'volume'} · ${m.volumeName || m.filePath || m.hostPath || ''}</div>
+      </div>
+      <button type="button" class="btn btn-danger-ghost btn-sm">Remove</button>
+    `;
+    row.querySelector('button')?.addEventListener('click', async () => {
+      try {
+        await resellerFetch(`/paas/mounts/${encodeURIComponent(m.mountId)}`, { method: 'DELETE' });
+        setStatus('Removed mount (redeploy service to apply)', 'connected');
+        await openServiceDetail(currentServiceDetail.kind, currentServiceDetail.id);
+        switchServiceDetailTab('records');
+        switchRecordsSubTab('storage');
+      } catch (e) {
+        setStatus(`Remove mount failed: ${e.message}`, 'error');
+      }
+    });
+    listEl.appendChild(row);
+  });
+}
+
+$('#rec-mount-add-btn')?.addEventListener('click', async () => {
+  if (!currentServiceDetail) return;
+  const volumeName = ($('#rec-mount-vol-input')?.value || '').trim();
+  const mountPath = ($('#rec-mount-path-input')?.value || '').trim();
+  if (!volumeName || !mountPath) return setStatus('Enter volume name and mount path', 'error');
+  try {
+    await resellerFetch(`/paas/services/${encodeURIComponent(currentServiceDetail.kind)}/${encodeURIComponent(currentServiceDetail.id)}/mounts`, {
+      method: 'POST',
+      body: JSON.stringify({ volumeName, mountPath }),
+    });
+    $('#rec-mount-vol-input').value = '';
+    $('#rec-mount-path-input').value = '';
+    setStatus('Persistent disk attached (redeploy service to mount)', 'connected');
+    await openServiceDetail(currentServiceDetail.kind, currentServiceDetail.id);
+    switchServiceDetailTab('records');
+    switchRecordsSubTab('storage');
+  } catch (e) {
+    setStatus(`Attach disk failed: ${e.message}`, 'error');
+  }
+});

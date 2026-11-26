@@ -2844,6 +2844,8 @@ const server = http.createServer(async (req, res) => {
             dockerfile: one.dockerfile || '',
             url: primaryUrl,
             domains,
+            mounts: one.mounts || [],
+            environmentId: one.environmentId || null,
             env: envList,
             envRaw: one.env || '',
             deployments,
@@ -2870,6 +2872,8 @@ const server = http.createServer(async (req, res) => {
             databaseUser: one.databaseUser,
             databasePassword: one.databasePassword,
             connectionString: connStr,
+            mounts: one.mounts || [],
+            environmentId: one.environmentId || null,
             containers: matchedContainers,
           },
         });
@@ -2999,6 +3003,244 @@ const server = http.createServer(async (req, res) => {
       else if (kind === 'blueprint') await dokploy('/api/compose.delete', { method: 'POST', body: JSON.stringify({ composeId: id, deleteVolumes: false }) });
       else if (kind === 'postgres') await dokploy('/api/postgres.remove', { method: 'POST', body: JSON.stringify({ postgresId: id }) });
       else if (kind === 'redis') await dokploy('/api/redis.remove', { method: 'POST', body: JSON.stringify({ redisId: id }) });
+      return sendJson(res, 200, { deleted: true });
+    }
+
+    // --- RECORDS STUDIO (Auth + Database + Storage/Disks for App Hosting Services) ---
+    async function withUserPostgres(postgresId, fn) {
+      const one = await dokploy(`/api/postgres.one?postgresId=${encodeURIComponent(postgresId)}`);
+      if (!one?.postgresId) throw new Error('PostgreSQL service not found');
+      const connStr = `postgres://${encodeURIComponent(one.databaseUser)}:${encodeURIComponent(one.databasePassword)}@${one.appName}:5432/${encodeURIComponent(one.databaseName)}`;
+      const pool = new pg.Pool({ connectionString: connStr, max: 2, connectionTimeoutMillis: 6000 });
+      try {
+        return await fn(pool, one);
+      } finally {
+        await pool.end().catch(() => {});
+      }
+    }
+
+    async function getPublicTableMeta(pool, tableName) {
+      const tblCheck = await pool.query(
+        `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name = $1`,
+        [tableName],
+      );
+      if (tblCheck.rows.length === 0) throw new Error(`Table "${tableName}" not found`);
+      const colRes = await pool.query(
+        `SELECT column_name, data_type, is_nullable, column_default
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1
+         ORDER BY ordinal_position`,
+        [tableName],
+      );
+      const pkRes = await pool.query(
+        `SELECT a.attname AS column_name
+         FROM pg_index i
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+         WHERE i.indrelid = $1::regclass AND i.indisprimary`,
+        [`public."${tableName.replace(/"/g, '""')}"`],
+      );
+      return {
+        columns: colRes.rows.map((r) => ({
+          name: r.column_name,
+          type: r.data_type,
+          nullable: r.is_nullable === 'YES',
+          hasDefault: r.column_default !== null,
+        })),
+        primaryKeys: pkRes.rows.map((r) => r.column_name),
+      };
+    }
+
+    const pgTablesMatch = pathname.match(/^\/paas\/records\/postgres\/([^/]+)\/tables$/);
+    if (pgTablesMatch && req.method === 'GET') {
+      const pgId = decodeURIComponent(pgTablesMatch[1]);
+      const tables = await withUserPostgres(pgId, async (pool) => {
+        const resTbl = await pool.query(
+          `SELECT t.table_name,
+                  COALESCE(s.n_live_tup, 0)::bigint AS approx_rows
+           FROM information_schema.tables t
+           LEFT JOIN pg_stat_user_tables s ON s.relname = t.table_name AND s.schemaname = 'public'
+           WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+           ORDER BY t.table_name`,
+        );
+        const colRes = await pool.query(
+          `SELECT table_name, column_name, data_type
+           FROM information_schema.columns
+           WHERE table_schema = 'public'
+           ORDER BY table_name, ordinal_position`,
+        );
+        const colsByTbl = {};
+        for (const c of colRes.rows) {
+          if (!colsByTbl[c.table_name]) colsByTbl[c.table_name] = [];
+          colsByTbl[c.table_name].push({ name: c.column_name, type: c.data_type });
+        }
+        return resTbl.rows.map((r) => ({
+          name: r.table_name,
+          approxRows: Number(r.approx_rows || 0),
+          columns: colsByTbl[r.table_name] || [],
+        }));
+      });
+      return sendJson(res, 200, { tables });
+    }
+
+    const pgRowsMatch = pathname.match(/^\/paas\/records\/postgres\/([^/]+)\/rows$/);
+    if (pgRowsMatch && req.method === 'GET') {
+      const pgId = decodeURIComponent(pgRowsMatch[1]);
+      const table = (url.searchParams.get('table') || '').trim();
+      const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit') || 50)));
+      const offset = Math.max(0, Number(url.searchParams.get('offset') || 0));
+      const search = (url.searchParams.get('search') || '').trim();
+      if (!table) return sendJson(res, 400, { error: 'table query param is required' });
+
+      const result = await withUserPostgres(pgId, async (pool) => {
+        const meta = await getPublicTableMeta(pool, table);
+        const qTable = `"${table.replace(/"/g, '""')}"`;
+        let whereSql = '';
+        const params = [];
+        if (search && meta.columns.length > 0) {
+          const likes = meta.columns.map((c) => `CAST("${c.name.replace(/"/g, '""')}" AS TEXT) ILIKE $1`);
+          whereSql = `WHERE ${likes.join(' OR ')}`;
+          params.push(`%${search}%`);
+        }
+        const countRes = await pool.query(`SELECT COUNT(*)::bigint AS cnt FROM ${qTable} ${whereSql}`, params);
+        const orderCol = meta.primaryKeys[0] ? `"${meta.primaryKeys[0].replace(/"/g, '""')}" DESC` : 'ctid DESC';
+        const dataRes = await pool.query(
+          `SELECT ctid::text AS _ctid, * FROM ${qTable} ${whereSql} ORDER BY ${orderCol} LIMIT ${limit} OFFSET ${offset}`,
+          params,
+        );
+        return {
+          columns: meta.columns,
+          primaryKeys: meta.primaryKeys,
+          rows: dataRes.rows,
+          total: Number(countRes.rows[0]?.cnt || 0),
+        };
+      });
+      return sendJson(res, 200, result);
+    }
+
+    if (pgRowsMatch && req.method === 'POST') {
+      const pgId = decodeURIComponent(pgRowsMatch[1]);
+      const body = await readBody(req);
+      const table = String(body.table || '').trim();
+      const data = body.data && typeof body.data === 'object' ? body.data : {};
+      if (!table) return sendJson(res, 400, { error: 'table is required' });
+
+      const inserted = await withUserPostgres(pgId, async (pool) => {
+        const meta = await getPublicTableMeta(pool, table);
+        const validCols = new Set(meta.columns.map((c) => c.name));
+        const keys = Object.keys(data).filter((k) => validCols.has(k) && data[k] !== undefined);
+        const qTable = `"${table.replace(/"/g, '""')}"`;
+        if (keys.length === 0) {
+          const r = await pool.query(`INSERT INTO ${qTable} DEFAULT VALUES RETURNING ctid::text AS _ctid, *`);
+          return r.rows[0];
+        }
+        const colSql = keys.map((k) => `"${k.replace(/"/g, '""')}"`).join(', ');
+        const valSql = keys.map((_, i) => `$${i + 1}`).join(', ');
+        const vals = keys.map((k) => (data[k] === '' ? null : data[k]));
+        const r = await pool.query(`INSERT INTO ${qTable} (${colSql}) VALUES (${valSql}) RETURNING ctid::text AS _ctid, *`, vals);
+        return r.rows[0];
+      });
+      return sendJson(res, 201, { row: inserted });
+    }
+
+    if (pgRowsMatch && req.method === 'PUT') {
+      const pgId = decodeURIComponent(pgRowsMatch[1]);
+      const body = await readBody(req);
+      const table = String(body.table || '').trim();
+      const where = body.where && typeof body.where === 'object' ? body.where : {};
+      const data = body.data && typeof body.data === 'object' ? body.data : {};
+      if (!table) return sendJson(res, 400, { error: 'table is required' });
+
+      const updated = await withUserPostgres(pgId, async (pool) => {
+        const meta = await getPublicTableMeta(pool, table);
+        const validCols = new Set(meta.columns.map((c) => c.name));
+        const setKeys = Object.keys(data).filter((k) => validCols.has(k));
+        if (setKeys.length === 0) throw new Error('No valid columns to update');
+
+        const params = [];
+        const setParts = setKeys.map((k) => {
+          params.push(data[k] === '' ? null : data[k]);
+          return `"${k.replace(/"/g, '""')}" = $${params.length}`;
+        });
+
+        const whereParts = [];
+        if (meta.primaryKeys.length > 0 && meta.primaryKeys.every((pk) => where[pk] !== undefined)) {
+          for (const pk of meta.primaryKeys) {
+            params.push(where[pk]);
+            whereParts.push(`"${pk.replace(/"/g, '""')}" = $${params.length}`);
+          }
+        } else if (where._ctid) {
+          params.push(String(where._ctid));
+          whereParts.push(`ctid = $${params.length}::tid`);
+        } else {
+          throw new Error('Primary key or _ctid is required to update row');
+        }
+
+        const qTable = `"${table.replace(/"/g, '""')}"`;
+        const r = await pool.query(
+          `UPDATE ${qTable} SET ${setParts.join(', ')} WHERE ${whereParts.join(' AND ')} RETURNING ctid::text AS _ctid, *`,
+          params,
+        );
+        return r.rows[0] || null;
+      });
+      return sendJson(res, 200, { row: updated });
+    }
+
+    if (pgRowsMatch && req.method === 'DELETE') {
+      const pgId = decodeURIComponent(pgRowsMatch[1]);
+      const body = await readBody(req);
+      const table = String(body.table || '').trim();
+      const where = body.where && typeof body.where === 'object' ? body.where : {};
+      if (!table) return sendJson(res, 400, { error: 'table is required' });
+
+      const deleted = await withUserPostgres(pgId, async (pool) => {
+        const meta = await getPublicTableMeta(pool, table);
+        const params = [];
+        const whereParts = [];
+        if (meta.primaryKeys.length > 0 && meta.primaryKeys.every((pk) => where[pk] !== undefined)) {
+          for (const pk of meta.primaryKeys) {
+            params.push(where[pk]);
+            whereParts.push(`"${pk.replace(/"/g, '""')}" = $${params.length}`);
+          }
+        } else if (where._ctid) {
+          params.push(String(where._ctid));
+          whereParts.push(`ctid = $${params.length}::tid`);
+        } else {
+          throw new Error('Primary key or _ctid is required to delete row');
+        }
+        const qTable = `"${table.replace(/"/g, '""')}"`;
+        const r = await pool.query(`DELETE FROM ${qTable} WHERE ${whereParts.join(' AND ')}`, params);
+        return r.rowCount;
+      });
+      return sendJson(res, 200, { deletedCount: deleted });
+    }
+
+    const paasMountCreate = pathname.match(/^\/paas\/services\/(web|postgres)\/([^/]+)\/mounts$/);
+    if (paasMountCreate && req.method === 'POST') {
+      const kind = paasMountCreate[1];
+      const id = decodeURIComponent(paasMountCreate[2]);
+      const body = await readBody(req);
+      const mountPath = String(body.mountPath || '').trim();
+      const volumeName = String(body.volumeName || '').trim().toLowerCase().replace(/[^a-z0-9-_]/g, '');
+      if (!mountPath || mountPath === '/' || !volumeName) {
+        return sendJson(res, 400, { error: 'Valid volumeName and mountPath (not "/") are required' });
+      }
+      const created = await dokploy('/api/mounts.create', {
+        method: 'POST',
+        body: JSON.stringify({
+          type: 'volume',
+          volumeName,
+          mountPath,
+          serviceType: kind === 'postgres' ? 'postgres' : 'application',
+          serviceId: id,
+        }),
+      });
+      return sendJson(res, 201, { mount: created });
+    }
+
+    const paasMountDel = pathname.match(/^\/paas\/mounts\/([^/]+)$/);
+    if (paasMountDel && req.method === 'DELETE') {
+      const mountId = decodeURIComponent(paasMountDel[1]);
+      await dokploy('/api/mounts.remove', { method: 'POST', body: JSON.stringify({ mountId }) });
       return sendJson(res, 200, { deleted: true });
     }
 
