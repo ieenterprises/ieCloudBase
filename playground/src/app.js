@@ -7189,7 +7189,7 @@ $$('#rec-subtabs .paas-status-tab').forEach((btn) => {
 async function openRecordsStudio() {
   if (!currentServiceDetail) return;
   const dbSel = $('#rec-db-select');
-  const pgList = (paasAllServices || []).filter((s) => s.kind === 'postgres');
+  const pgList = (hostedApps || []).filter((s) => s.kind === 'postgres');
   if (currentServiceDetail.kind === 'postgres' && !pgList.some((s) => s.id === currentServiceDetail.id)) {
     pgList.unshift({ id: currentServiceDetail.id, name: currentServiceDetail.name, kind: 'postgres' });
   }
