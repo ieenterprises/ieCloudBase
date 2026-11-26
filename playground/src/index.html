@@ -2798,12 +2798,25 @@
                   </div>
 
                   <div class="dom-card" style="padding:16px 20px;">
-                    <h3 style="margin:0 0 6px; font-size:15px;">Mounted Persistent Disks (Docker Volumes)</h3>
-                    <p style="margin:0 0 12px; font-size:12px; color:var(--text-muted);">Attach or remove Docker persistent volumes mounted into this service.</p>
+                    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+                      <div>
+                        <h3 style="margin:0 0 4px; font-size:15px;">Disk Space &amp; Mounted Persistent Disks</h3>
+                        <p style="margin:0; font-size:12px; color:var(--text-muted);">View, resize allocated disk space (GB), or attach/remove Docker persistent volumes.</p>
+                      </div>
+                      <div style="display:flex; align-items:center; gap:6px; background:#f8fafc; border:1px solid var(--border); border-radius:8px; padding:6px 10px;">
+                        <span style="font-size:12px; font-weight:600;">Disk Space:</span>
+                        <button type="button" class="btn btn-secondary btn-sm" id="rec-disk-dec-btn" style="padding:2px 8px;">−</button>
+                        <input type="number" class="input" id="rec-disk-size-input" min="1" max="1000" value="10" style="width:68px; height:28px; text-align:center; margin-bottom:0; font-weight:700;" />
+                        <span style="font-size:12px; color:var(--text-secondary);">GB</span>
+                        <button type="button" class="btn btn-secondary btn-sm" id="rec-disk-inc-btn" style="padding:2px 8px;">+</button>
+                        <button type="button" class="btn btn-primary btn-sm" id="rec-disk-save-btn">Save</button>
+                      </div>
+                    </div>
                     <div id="rec-mounts-list" style="margin-bottom:12px;"></div>
                     <div id="rec-mount-add-form" style="display:flex; gap:8px; flex-wrap:wrap; padding-top:12px; border-top:1px solid var(--border);">
-                      <input type="text" class="input" id="rec-mount-vol-input" placeholder="Volume name (e.g. nod-uploads)" style="flex:1; min-width:180px; margin-bottom:0;" />
-                      <input type="text" class="input" id="rec-mount-path-input" placeholder="Mount path (e.g. /app/data)" style="flex:1; min-width:180px; margin-bottom:0;" />
+                      <input type="text" class="input" id="rec-mount-vol-input" placeholder="Volume name (e.g. nod-uploads)" style="flex:1; min-width:160px; margin-bottom:0;" />
+                      <input type="text" class="input" id="rec-mount-path-input" placeholder="Mount path (e.g. /app/data)" style="flex:1; min-width:160px; margin-bottom:0;" />
+                      <input type="number" class="input" id="rec-mount-size-input" min="1" max="1000" value="10" placeholder="GB" style="width:80px; margin-bottom:0;" />
                       <button type="button" class="btn btn-primary btn-sm" id="rec-mount-add-btn">+ Attach Disk</button>
                     </div>
                   </div>

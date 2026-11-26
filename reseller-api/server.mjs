@@ -2844,7 +2844,8 @@ const server = http.createServer(async (req, res) => {
             dockerfile: one.dockerfile || '',
             url: primaryUrl,
             domains,
-            mounts: one.mounts || [],
+            mounts: (one.mounts || []).map((m) => ({ ...m, sizeGB: readDiskSizes()[`mount:${m.mountId}`] || readDiskSizes()[one.applicationId] || 10 })),
+            diskSizeGB: readDiskSizes()[one.applicationId] || 10,
             environmentId: one.environmentId || null,
             env: envList,
             envRaw: one.env || '',
@@ -2872,7 +2873,8 @@ const server = http.createServer(async (req, res) => {
             databaseUser: one.databaseUser,
             databasePassword: one.databasePassword,
             connectionString: connStr,
-            mounts: one.mounts || [],
+            mounts: (one.mounts || []).map((m) => ({ ...m, sizeGB: readDiskSizes()[`mount:${m.mountId}`] || readDiskSizes()[one.postgresId] || 10 })),
+            diskSizeGB: readDiskSizes()[one.postgresId] || 10,
             environmentId: one.environmentId || null,
             containers: matchedContainers,
           },
@@ -3214,6 +3216,29 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { deletedCount: deleted });
     }
 
+    const DISK_SIZES_PATH = path.join(__dirname, '.iecloudbase-disks.json');
+    function readDiskSizes() {
+      try {
+        if (fs.existsSync(DISK_SIZES_PATH)) return JSON.parse(fs.readFileSync(DISK_SIZES_PATH, 'utf-8')) || {};
+      } catch {}
+      return {};
+    }
+    function writeDiskSizes(map) {
+      fs.writeFileSync(DISK_SIZES_PATH, JSON.stringify(map, null, 2), 'utf-8');
+    }
+
+    const paasDiskSizePut = pathname.match(/^\/paas\/services\/(web|postgres|redis)\/([^/]+)\/disk-size$/);
+    if (paasDiskSizePut && req.method === 'PUT') {
+      const id = decodeURIComponent(paasDiskSizePut[2]);
+      const body = await readBody(req);
+      const sizeGB = Math.min(1000, Math.max(1, Math.round(Number(body.sizeGB || 10))));
+      const sizes = readDiskSizes();
+      sizes[id] = sizeGB;
+      if (body.mountId) sizes[`mount:${body.mountId}`] = sizeGB;
+      writeDiskSizes(sizes);
+      return sendJson(res, 200, { saved: true, sizeGB });
+    }
+
     const paasMountCreate = pathname.match(/^\/paas\/services\/(web|postgres)\/([^/]+)\/mounts$/);
     if (paasMountCreate && req.method === 'POST') {
       const kind = paasMountCreate[1];
@@ -3221,6 +3246,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const mountPath = String(body.mountPath || '').trim();
       const volumeName = String(body.volumeName || '').trim().toLowerCase().replace(/[^a-z0-9-_]/g, '');
+      const sizeGB = Math.min(1000, Math.max(1, Math.round(Number(body.sizeGB || 10))));
       if (!mountPath || mountPath === '/' || !volumeName) {
         return sendJson(res, 400, { error: 'Valid volumeName and mountPath (not "/") are required' });
       }
@@ -3234,7 +3260,12 @@ const server = http.createServer(async (req, res) => {
           serviceId: id,
         }),
       });
-      return sendJson(res, 201, { mount: created });
+      if (created?.mountId) {
+        const sizes = readDiskSizes();
+        sizes[`mount:${created.mountId}`] = sizeGB;
+        writeDiskSizes(sizes);
+      }
+      return sendJson(res, 201, { mount: created, sizeGB });
     }
 
     const paasMountDel = pathname.match(/^\/paas\/mounts\/([^/]+)$/);

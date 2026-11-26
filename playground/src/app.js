@@ -7538,6 +7538,10 @@ $('#rec-row-modal-save')?.addEventListener('click', async () => {
 function renderRecMounts() {
   const listEl = $('#rec-mounts-list');
   const addForm = $('#rec-mount-add-form');
+  const diskInput = $('#rec-disk-size-input');
+  if (diskInput && currentServiceDetail) {
+    diskInput.value = String(currentServiceDetail.diskSizeGB || 10);
+  }
   if (!listEl || !currentServiceDetail) return;
   const canMount = currentServiceDetail.kind === 'web' || currentServiceDetail.kind === 'postgres';
   if (addForm) addForm.style.display = canMount ? 'flex' : 'none';
@@ -7550,9 +7554,10 @@ function renderRecMounts() {
   mounts.forEach((m) => {
     const row = document.createElement('div');
     row.className = 'bp-service-preview';
+    const sz = m.sizeGB || currentServiceDetail.diskSizeGB || 10;
     row.innerHTML = `
       <div>
-        <div style="font-size:13px; font-weight:600; font-family:var(--mono);">${m.mountPath || '/data'}</div>
+        <div style="font-size:13px; font-weight:600; font-family:var(--mono);">${m.mountPath || '/data'} <span class="badge badge-neutral" style="margin-left:6px; font-size:11px;">${sz} GB</span></div>
         <div style="font-size:12px; color:var(--text-secondary);">Type: ${m.type || 'volume'} · ${m.volumeName || m.filePath || m.hostPath || ''}</div>
       </div>
       <button type="button" class="btn btn-danger-ghost btn-sm">Remove</button>
@@ -7572,19 +7577,58 @@ function renderRecMounts() {
   });
 }
 
+$('#rec-disk-dec-btn')?.addEventListener('click', () => {
+  const inp = $('#rec-disk-size-input');
+  if (!inp) return;
+  const cur = Math.max(1, parseInt(inp.value || '10', 10));
+  inp.value = String(Math.max(1, cur - (cur > 10 ? 5 : 1)));
+});
+$('#rec-disk-inc-btn')?.addEventListener('click', () => {
+  const inp = $('#rec-disk-size-input');
+  if (!inp) return;
+  const cur = Math.max(1, parseInt(inp.value || '10', 10));
+  inp.value = String(Math.min(1000, cur + (cur >= 10 ? 5 : 1)));
+});
+$('#rec-disk-save-btn')?.addEventListener('click', async () => {
+  if (!currentServiceDetail) return;
+  const btn = $('#rec-disk-save-btn');
+  const inp = $('#rec-disk-size-input');
+  const sizeGB = Math.min(1000, Math.max(1, Math.round(Number(inp?.value || 10))));
+  if (inp) inp.value = String(sizeGB);
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+  try {
+    const firstMountId = currentServiceDetail.mounts?.[0]?.mountId || null;
+    await resellerFetch(`/paas/services/${encodeURIComponent(currentServiceDetail.kind)}/${encodeURIComponent(currentServiceDetail.id)}/disk-size`, {
+      method: 'PUT',
+      body: JSON.stringify({ sizeGB, mountId: firstMountId }),
+    });
+    currentServiceDetail.diskSizeGB = sizeGB;
+    if (currentServiceDetail.mounts?.[0]) currentServiceDetail.mounts[0].sizeGB = sizeGB;
+    renderRecMounts();
+    setStatus(`Saved disk space: ${sizeGB} GB`, 'connected');
+  } catch (e) {
+    setStatus(`Save disk space failed: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Save';
+  }
+});
+
 $('#rec-mount-add-btn')?.addEventListener('click', async () => {
   if (!currentServiceDetail) return;
   const volumeName = ($('#rec-mount-vol-input')?.value || '').trim();
   const mountPath = ($('#rec-mount-path-input')?.value || '').trim();
+  const sizeGB = Math.min(1000, Math.max(1, Math.round(Number($('#rec-mount-size-input')?.value || 10))));
   if (!volumeName || !mountPath) return setStatus('Enter volume name and mount path', 'error');
   try {
     await resellerFetch(`/paas/services/${encodeURIComponent(currentServiceDetail.kind)}/${encodeURIComponent(currentServiceDetail.id)}/mounts`, {
       method: 'POST',
-      body: JSON.stringify({ volumeName, mountPath }),
+      body: JSON.stringify({ volumeName, mountPath, sizeGB }),
     });
     $('#rec-mount-vol-input').value = '';
     $('#rec-mount-path-input').value = '';
-    setStatus('Persistent disk attached (redeploy service to mount)', 'connected');
+    setStatus(`Persistent disk attached (${sizeGB} GB)`, 'connected');
     await openServiceDetail(currentServiceDetail.kind, currentServiceDetail.id);
     switchServiceDetailTab('records');
     switchRecordsSubTab('storage');
