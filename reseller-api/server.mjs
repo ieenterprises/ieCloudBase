@@ -2597,11 +2597,15 @@ const server = http.createServer(async (req, res) => {
 
         // Provision web / worker services
         let primaryUrl = `https://${safeSlug}.${DOKPLOY_APPS_DOMAIN}`;
+        const existingApps = targetProj?.environments?.[0]?.applications || [];
         for (let i = 0; i < parsed.services.length; i++) {
           const svc = parsed.services[i];
           const svcName = svc.name || rawName;
           const svcSlug = (parsed.services.length === 1 ? safeSlug : svcName.toLowerCase().replace(/[^a-z0-9-]/g, '')) || safeSlug;
-          const app = await dokploy('/api/application.create', {
+          const matchedExisting = existingApps.find(
+            (a) => (a.name || '').toLowerCase() === svcName.toLowerCase() || (a.appName || '').toLowerCase() === svcSlug.toLowerCase(),
+          );
+          const app = matchedExisting || await dokploy('/api/application.create', {
             method: 'POST',
             body: JSON.stringify({
               name: svcName,
@@ -2610,6 +2614,18 @@ const server = http.createServer(async (req, res) => {
             }),
           });
           const applicationId = app.applicationId;
+          const existingEnvMap = {};
+          try {
+            const currentApp = await dokploy(`/api/application.one?applicationId=${encodeURIComponent(applicationId)}`);
+            for (const line of String(currentApp?.env || '').split(/\r?\n/)) {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) continue;
+              const eqIdx = trimmed.indexOf('=');
+              const k = trimmed.slice(0, eqIdx).trim();
+              const v = trimmed.slice(eqIdx + 1);
+              if (k) existingEnvMap[k] = v;
+            }
+          } catch {}
 
           if (svc.runtime === 'image' || svc.image) {
             await dokploy('/api/application.saveDockerProvider', {
@@ -2670,8 +2686,12 @@ const server = http.createServer(async (req, res) => {
             } else if (ev.generateValue) {
               const rand = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
               envLines.push(`${ev.key}=${rand}`);
-            } else if (ev.sync === false && body.envOverrides?.[ev.key] !== undefined) {
-              envLines.push(`${ev.key}=${body.envOverrides[ev.key]}`);
+            } else if (ev.sync === false) {
+              if (body.envOverrides?.[ev.key] !== undefined) {
+                envLines.push(`${ev.key}=${body.envOverrides[ev.key]}`);
+              } else if (existingEnvMap[ev.key] !== undefined) {
+                envLines.push(`${ev.key}=${existingEnvMap[ev.key]}`);
+              }
             } else if (ev.value !== undefined) {
               const overrideVal = body.envOverrides?.[ev.key];
               envLines.push(`${ev.key}=${overrideVal !== undefined ? overrideVal : ev.value}`);
@@ -2680,7 +2700,17 @@ const server = http.createServer(async (req, res) => {
           // Apply any additional user-supplied envOverrides not already in render.yaml
           const existingKeys = new Set(envLines.map((l) => l.split('=')[0]));
           for (const [k, v] of Object.entries(body.envOverrides || {})) {
-            if (k && !existingKeys.has(k)) envLines.push(`${k}=${v}`);
+            if (k && !existingKeys.has(k)) {
+              envLines.push(`${k}=${v}`);
+              existingKeys.add(k);
+            }
+          }
+          // Preserve any existing custom / secret env vars on the service not overwritten above
+          for (const [k, v] of Object.entries(existingEnvMap)) {
+            if (k && !existingKeys.has(k)) {
+              envLines.push(`${k}=${v}`);
+              existingKeys.add(k);
+            }
           }
           if (!hasPort) envLines.push(`PORT=${port}`);
 

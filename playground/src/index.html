@@ -2570,7 +2570,10 @@
                   <h3 style="margin:0; font-size:14.5px;">Environment Variables</h3>
                   <p style="margin:4px 0 0; font-size:12.5px; color:var(--text-secondary);">Edit runtime environment variables. Changes take effect on Save &amp; Redeploy.</p>
                 </div>
-                <div style="display:flex; gap:8px;">
+                <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                  <button class="btn btn-secondary btn-sm" id="sd-env-export-btn" title="Download environment variables as .env file">Export .env</button>
+                  <button class="btn btn-secondary btn-sm" id="sd-env-import-btn" title="Import environment variables from a .env or .txt file">Import .env</button>
+                  <input type="file" id="sd-env-import-file" accept=".env,.txt,text/plain" style="display:none;" />
                   <button class="btn btn-secondary btn-sm" id="sd-env-toggle-mask">Reveal Values</button>
                   <button class="btn btn-secondary btn-sm" id="sd-env-add-btn">+ Add Variable</button>
                 </div>

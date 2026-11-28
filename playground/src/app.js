@@ -5049,6 +5049,58 @@ function renderSdEnvRows() {
   });
 }
 
+$('#sd-env-export-btn')?.addEventListener('click', () => {
+  const valid = sdEnvItems.filter((item) => item && (item.key || '').trim());
+  const lines = valid.map((item) => `${item.key.trim()}=${String(item.value ?? '').replace(/\r?\n/g, '\\n')}`);
+  const blob = new Blob([lines.join('\n') + (lines.length ? '\n' : '')], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const svcName = (currentServiceDetail?.name || 'service').replace(/[^a-zA-Z0-9._-]/g, '-');
+  a.href = url;
+  a.download = `${svcName}.env`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+  setStatus(`Exported ${lines.length} variable(s) to ${svcName}.env`, 'connected');
+});
+
+$('#sd-env-import-btn')?.addEventListener('click', () => {
+  $('#sd-env-import-file')?.click();
+});
+
+$('#sd-env-import-file')?.addEventListener('change', async (e) => {
+  const file = e.target?.files?.[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    let count = 0;
+    for (const rawLine of text.split(/\r?\n/)) {
+      let line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      if (line.startsWith('export ')) line = line.slice(7).trim();
+      const eqIdx = line.indexOf('=');
+      if (eqIdx <= 0) continue;
+      const key = line.slice(0, eqIdx).trim();
+      let value = line.slice(eqIdx + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      if (!key) continue;
+      const existing = sdEnvItems.find((item) => (item.key || '').trim() === key);
+      if (existing) existing.value = value;
+      else sdEnvItems.push({ key, value });
+      count++;
+    }
+    renderSdEnvRows();
+    setStatus(`Imported ${count} variable(s) from ${file.name}. Click Save Changes & Redeploy (or Save Only) to apply.`, 'connected');
+  } catch (err) {
+    setStatus(`Import failed: ${err.message}`, 'error');
+  } finally {
+    e.target.value = '';
+  }
+});
+
 $('#sd-env-toggle-mask')?.addEventListener('click', () => {
   sdEnvMasked = !sdEnvMasked;
   $('#sd-env-toggle-mask').textContent = sdEnvMasked ? 'Reveal Values' : 'Hide Values';
